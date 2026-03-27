@@ -1,6 +1,7 @@
 mod config;
 mod crypto;
 mod db;
+mod feeds;
 mod telegram;
 mod types;
 
