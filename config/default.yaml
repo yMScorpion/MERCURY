@@ -1,0 +1,51 @@
+trading:
+  kelly_fraction_multiplier: 0.25
+  min_net_spread_threshold: 0.02
+  max_single_trade_pct: 0.05
+  max_daily_loss_pct: 0.03
+  max_drawdown_pct: 0.10
+  max_platform_exposure_pct: 0.40
+  stale_data_timeout_ms: 5000
+  max_concurrent_arbs: 3
+  gas_price_max_gwei: 50
+  rebalance_threshold_pct: 0.15
+  max_open_positions: 20
+  initial_bankroll: "10000.00"
+
+platforms:
+  polymarket:
+    enabled: true
+    rest_url: "https://clob.polymarket.com"
+    ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  kalshi:
+    enabled: true
+    rest_url: "https://trading-api.kalshi.com/trade-api/v2"
+    ws_url: "wss://trading-api.kalshi.com/trade-api/ws/v2"
+  cdna:
+    enabled: false
+    rest_url: ""
+    ws_url: ""
+  forecastex:
+    enabled: false
+    rest_url: ""
+    ws_url: ""
+
+database:
+  path: "mercury.db"
+  pool_size: 4
+  busy_timeout_ms: 5000
+
+telegram:
+  enabled: false
+  daily_report_hour_utc: 21
+
+polygon_rpc:
+  url: "https://polygon-rpc.com"
+  gas_poll_interval_secs: 15
+
+logging:
+  level: "info"
+  file: "logs/mercury.log"
+
+health:
+  port: 9090
