@@ -4,42 +4,30 @@ mod types;
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::info;
 
-#[derive(Parser, Debug)]
-#[command(name = "mercury", about = "Cross-market prediction arbitrage engine")]
+#[derive(Parser)]
+#[command(name = "mercury", about = "MERCURY - Cross-Market Prediction Arbitrage Engine")]
 struct Cli {
     /// Path to configuration file
     #[arg(short, long, default_value = "config/default.yaml")]
-    config: PathBuf,
+    config: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse CLI
-    let cli = Cli::parse();
-
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("mercury=info".parse()?),
         )
-        .with_target(true)
         .init();
 
-    info!("Mercury starting up");
+    let cli = Cli::parse();
+    info!("MERCURY starting...");
+    info!(config_path = %cli.config, "Loading configuration");
 
-    // Load configuration
-    let cfg_manager = config::ConfigManager::new(&cli.config)?;
-    let cfg = cfg_manager.get().await;
-
-    info!(
-        config_path = %cli.config.display(),
-        db_path = %cfg.database.path,
-        "configuration loaded"
-    );
+    let cfg = config::MercuryConfig::load(&cli.config)?;
 
     // Initialize database
     let db = db::SqliteDb::new(
@@ -48,31 +36,9 @@ async fn main() -> Result<()> {
         cfg.database.busy_timeout_ms,
     )?;
 
-    let size = db::Database::db_size_bytes(&db).await?;
-    info!(db_size_bytes = size, "database initialized");
+    let size = db::traits::Database::db_size_bytes(&db).await?;
+    info!(db_size_bytes = size, "Database initialized");
 
-    // Startup summary
-    let enabled_platforms: Vec<&str> = [
-        cfg.platforms.polymarket.enabled.then_some("polymarket"),
-        cfg.platforms.kalshi.enabled.then_some("kalshi"),
-        cfg.platforms.cdna.enabled.then_some("cdna"),
-        cfg.platforms.forecastex.enabled.then_some("forecastex"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    info!(
-        platforms = ?enabled_platforms,
-        initial_bankroll = %cfg.trading.initial_bankroll,
-        max_concurrent_arbs = cfg.trading.max_concurrent_arbs,
-        "Mercury Phase 1 foundation ready"
-    );
-
-    if enabled_platforms.is_empty() {
-        warn!("no platforms enabled -- nothing to do");
-    }
-
-    info!("Phase 1 init complete. Exiting.");
+    info!("MERCURY Phase 1 foundation ready");
     Ok(())
 }
