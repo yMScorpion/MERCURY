@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod telegram;
 mod types;
 
 use anyhow::Result;
