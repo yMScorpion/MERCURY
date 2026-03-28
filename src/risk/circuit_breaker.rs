@@ -56,12 +56,14 @@ impl CircuitBreakers {
         }
     }
 
-    pub fn is_trading_halted(&self) -> bool {
+    pub fn is_trading_halted(&mut self) -> bool {
         if !self.trading_halted {
             return false;
         }
         if let Some(resume) = self.halt_resume_at {
             if Utc::now() >= resume {
+                self.trading_halted = false;
+                self.halt_resume_at = None;
                 return false;
             }
         }
@@ -88,6 +90,22 @@ impl CircuitBreakers {
         }
     }
 
+    /// Check all circuit breakers and return any tripped breakers.
+    ///
+    /// # Parameter scales
+    /// - `trade_size`: absolute notional value (same currency as `bankroll`)
+    /// - `bankroll`: total capital in the same currency as `trade_size`
+    /// - `daily_loss_pct`: **percent-scale** (0–100); e.g. 5.0 means 5 % loss today
+    /// - `drawdown_pct`: **percent-scale** (0–100); e.g. 12.0 means 12 % drawdown from peak
+    /// - `platform_exposure_pct`: **fraction-scale** (0–1); e.g. 0.30 means 30 % exposure
+    /// - `open_positions`: current number of open positions
+    /// - `involves_polymarket`: whether the trade touches an on-chain Polymarket leg
+    ///
+    /// Note: `max_daily_loss_pct` and `max_drawdown_pct` stored internally are
+    /// fraction-scale (0–1) and are multiplied by 100 for comparison with the
+    /// percent-scale `daily_loss_pct` / `drawdown_pct` arguments.
+    /// `max_platform_exposure_pct` is stored fraction-scale and compared directly
+    /// with the fraction-scale `platform_exposure_pct` argument.
     pub fn check_all(
         &mut self,
         trade_size: Decimal,

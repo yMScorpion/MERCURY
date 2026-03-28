@@ -61,7 +61,10 @@ async fn main() -> Result<()> {
     let (tick_tx, _) = broadcast::channel::<NormalizedTick>(10_000);
     let (opportunity_tx, opportunity_rx) = mpsc::channel::<ValidatedOpportunity>(100);
     let (trade_result_tx, trade_result_rx) = mpsc::channel::<TradeResult>(100);
-    let (trade_result_tx2, trade_result_rx2) = mpsc::channel::<TradeResult>(100);
+    // 1 000-slot buffer: each TradeResult is ~200 B; 200 KB headroom vs the
+    // 100-slot original that could drop results under burst load, leaving
+    // positions open in the DB and diverging cached_open_positions on restart.
+    let (trade_result_tx2, trade_result_rx2) = mpsc::channel::<TradeResult>(1_000);
     let (alert_tx, alert_rx) = mpsc::channel::<AlertMessage>(500);
     let (daily_report_tx, daily_report_rx) = mpsc::channel::<DailyReport>(10);
     let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
@@ -131,11 +134,10 @@ async fn main() -> Result<()> {
     );
 
     // Polymarket runs on Polygon — gas is paid in MATIC, not ETH.
-    // Set safe startup defaults; the GasOracle will push live values within
-    // the first poll interval (gas_poll_interval_secs in config).
-    // Default: 50 gwei, MATIC $0.50 — conservative enough not to miss real arbs.
+    // Set safe startup defaults; the GasOracle will overwrite these on its first
+    // fetch (which fires immediately — see gas_oracle.rs).
     spread_engine.update_gas_price(Decimal::from(50));
-    spread_engine.update_eth_price(dec!(0.50));
+    spread_engine.update_matic_price(dec!(0.50));
     let mut detector = engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,
         Decimal::from(5),
@@ -202,6 +204,11 @@ async fn main() -> Result<()> {
             warn!("Could not read open positions from DB on startup: {e}");
             0
         });
+
+    // In-flight notional: capital reserved for opportunities that have been sent
+    // to the executor but not yet settled. Deducted from available capital when
+    // sizing new trades to prevent over-leveraging while orders are pending.
+    let mut in_flight_notional = Decimal::ZERO;
 
     loop {
         tokio::select! {
@@ -276,6 +283,19 @@ async fn main() -> Result<()> {
                     }
 
                     if approved_size > Decimal::ZERO {
+                        // Reserve in-flight capital: reduce available bankroll by the
+                        // size of this opportunity so concurrent rapid detections don't
+                        // all size themselves against the full bankroll. Without this,
+                        // max_open_positions trades can each claim max_single_trade_pct
+                        // of the full bankroll, over-leveraging by a factor of N.
+                        let effective_bankroll = (bankroll_manager.total_bankroll()
+                            - in_flight_notional)
+                            .max(Decimal::ZERO);
+                        if effective_bankroll < approved_size {
+                            // Not enough un-reserved capital — skip until in-flight trades settle.
+                            continue;
+                        }
+
                         let validated = ValidatedOpportunity {
                             opportunity: opp,
                             approved_size,
@@ -286,6 +306,7 @@ async fn main() -> Result<()> {
                         if opportunity_tx.try_send(validated).is_ok() {
                             metrics.inc_executed();
                             cached_open_positions = cached_open_positions.saturating_add(1);
+                            in_flight_notional += approved_size;
                         }
                     }
                 }
@@ -300,10 +321,18 @@ async fn main() -> Result<()> {
                 bankroll_manager.remove_exposure(result.leg_b_platform, result.leg_b_size);
                 circuit_breakers.record_execution(result.status == TradeStatus::Success);
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
+                // Release the in-flight capital reservation. approved_size is the exact
+                // amount that was reserved when the opportunity was dispatched, so this
+                // correctly frees capital whether the trade succeeded, partially filled, or failed.
+                in_flight_notional = in_flight_notional.saturating_sub(result.approved_size);
                 // Decrement cached counter now that the position is settled.
                 cached_open_positions = cached_open_positions.saturating_sub(1);
                 if let Err(e) = trade_result_tx2.try_send(result.clone()) {
-                    tracing::warn!("Position tracker channel full, dropping trade result: {e}");
+                    // ERROR not warn: a dropped result means the position tracker
+                    // never closes the DB record, leaving a ghost open position that
+                    // inflates exposure and causes cached_open_positions to diverge
+                    // from the database after a restart.
+                    tracing::error!(error = %e, "Position tracker channel full — trade result dropped, open position may not be closed in DB");
                 }
                 match result.status {
                     TradeStatus::Success => metrics.inc_success(),
@@ -313,7 +342,7 @@ async fn main() -> Result<()> {
 
             Some(gas) = gas_update_rx.recv() => {
                 spread_engine.update_gas_price(Decimal::from(gas.gas_gwei));
-                spread_engine.update_eth_price(gas.matic_usd);
+                spread_engine.update_matic_price(gas.matic_usd);
                 circuit_breakers.update_gas_price(gas.gas_gwei);
                 debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated live");
             }
@@ -400,7 +429,9 @@ async fn main() -> Result<()> {
                     bankroll_manager.remove_exposure(result.leg_a_platform, result.leg_a_size);
                     bankroll_manager.remove_exposure(result.leg_b_platform, result.leg_b_size);
                     cached_open_positions = cached_open_positions.saturating_sub(1);
-                    let _ = trade_result_tx2.try_send(result);
+                    if let Err(e) = trade_result_tx2.try_send(result) {
+                        tracing::error!(error = %e, "Position tracker channel full — trade result dropped on second send path");
+                    }
                 }
                 _ => break,
             }

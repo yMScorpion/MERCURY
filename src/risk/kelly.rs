@@ -79,13 +79,26 @@ impl KellyCalculator {
         }
     }
 
+    /// Adjust the Kelly fraction in response to drawdown.
+    ///
+    /// `current_drawdown_pct` must be **percent-scale** (0–100);
+    /// e.g. pass `15.0` for a 15 % drawdown from peak.
+    ///
+    /// Drawdown tiers reduce sizing; full recovery (≤ 5 %) restores `max_fraction`
+    /// so the system does not permanently under-trade after recovering from any loss.
     pub fn adjust_for_drawdown(&mut self, current_drawdown_pct: Decimal) {
-        if current_drawdown_pct > dec!(0.15) {
-            self.fraction = dec!(0.10);
-        } else if current_drawdown_pct > dec!(0.10) {
-            self.fraction = dec!(0.15);
-        } else if current_drawdown_pct > dec!(0.05) {
-            self.fraction = dec!(0.20);
+        if current_drawdown_pct > dec!(15) {
+            self.set_fraction(dec!(0.10));
+        } else if current_drawdown_pct > dec!(10) {
+            self.set_fraction(dec!(0.15));
+        } else if current_drawdown_pct > dec!(5) {
+            self.set_fraction(dec!(0.20));
+        } else {
+            // Drawdown ≤ 5 %: fully recovered — restore to max fraction.
+            // Without this branch the fraction is a one-way ratchet: it reduces on any
+            // drawdown day but never recovers, causing permanent under-trading after
+            // any loss event.
+            self.set_fraction(self.max_fraction);
         }
     }
 }

@@ -29,16 +29,22 @@ struct CdnaOrderBook {
 
 impl CdnaOrderBook {
     fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new() } }
-    fn best_bid(&self) -> (Decimal, Decimal) {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ZERO, Decimal::ZERO))
+
+    /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
+    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
     }
-    fn best_ask(&self) -> (Decimal, Decimal) {
-        self.asks.iter().next().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ONE, Decimal::ZERO))
+
+    /// Returns best ask only if non-empty — never returns phantom (1.0, 0) fallback.
+    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(p, s)| (*p, *s))
     }
-    fn mid_price(&self) -> Decimal {
-        let (b, _) = self.best_bid();
-        let (a, _) = self.best_ask();
-        if b + a > Decimal::ZERO { (b + a) / Decimal::from(2) } else { Decimal::ZERO }
+
+    /// Returns mid-price only when both sides have real liquidity.
+    fn mid_price(&self) -> Option<Decimal> {
+        let (b, _) = self.best_bid()?;
+        let (a, _) = self.best_ask()?;
+        Some((b + a) / Decimal::from(2))
     }
     fn depth(&self) -> Vec<PriceLevel> {
         let mut levels = Vec::new();
@@ -84,18 +90,21 @@ impl CdnaFeed {
     fn emit_tick(&self, instrument: &str) -> Option<NormalizedTick> {
         let market_id = self.instrument_to_market_id(instrument)?;
         let book = self.books.get(instrument)?;
-        let (bid_price, bid_size) = book.best_bid();
-        let (ask_price, ask_size) = book.best_ask();
+        // Both sides must be present — phantom fallbacks (bid=0, ask=1) would
+        // make the spread engine see a fake ~100% arb and fire real orders.
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        let mid = book.mid_price()?;
 
         Some(NormalizedTick {
             platform: Platform::Cdna,
             market_id,
             timestamp_ns: now_ns(),
-            bid_price,
-            bid_size,
-            ask_price,
-            ask_size,
-            mid_price: book.mid_price(),
+            bid_price: bid.0,
+            bid_size: bid.1,
+            ask_price: ask.0,
+            ask_size: ask.1,
+            mid_price: mid,
             last_trade_price: Decimal::ZERO,
             last_trade_size: Decimal::ZERO,
             book_depth: book.depth(),

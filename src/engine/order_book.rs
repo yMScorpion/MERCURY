@@ -60,15 +60,31 @@ impl PlatformBook {
     }
 
     /// Update from a NormalizedTick
+    ///
+    /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
+    /// to prevent out-of-order or replayed updates (e.g. after a reconnect)
+    /// from overwriting a newer book with stale data.
+    /// Sequence-0 ticks are treated as full snapshots and always applied.
     pub fn update_from_tick(&mut self, tick: &NormalizedTick) {
+        if tick.sequence > 0 && tick.sequence <= self.sequence {
+            return;
+        }
+
         self.bids.clear();
         self.asks.clear();
 
         for level in &tick.book_depth {
-            if level.price < tick.mid_price {
+            if level.price <= tick.bid_price {
                 self.bids.insert(level.price, level.size);
-            } else {
+            } else if level.price >= tick.ask_price {
                 self.asks.insert(level.price, level.size);
+            } else {
+                // Mid-spread level: classify by which side it's closer to
+                if tick.ask_price - level.price < level.price - tick.bid_price {
+                    self.asks.insert(level.price, level.size);
+                } else {
+                    self.bids.insert(level.price, level.size);
+                }
             }
         }
 

@@ -152,6 +152,10 @@ pub struct Market {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegDetail {
     pub platform: Platform,
+    /// Platform-native market/token identifier (e.g. Polymarket token ID, Kalshi ticker).
+    /// Used by execution clients; distinct from the unified UUID `market_id` on the opportunity.
+    pub platform_market_id: String,
+    pub fee_rate_bps: u32,
     pub side: Side,
     pub price: Decimal,
     pub available_size: Decimal,
@@ -246,6 +250,11 @@ pub struct TradeResult {
     pub executed_at: DateTime<Utc>,
     pub bankroll_after: Decimal,
     pub bankroll_change_pct: Decimal,
+    /// Size that was reserved in in_flight_notional when this trade was dispatched.
+    /// Used by the event loop to release the reservation on settlement.
+    /// Not persisted to the database.
+    #[serde(default)]
+    pub approved_size: Decimal,
 }
 
 // ─── Position ───

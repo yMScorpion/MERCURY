@@ -31,16 +31,24 @@ struct FexOrderBook {
 
 impl FexOrderBook {
     fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new() } }
-    fn best_bid(&self) -> (Decimal, Decimal) {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ZERO, Decimal::ZERO))
+
+    /// Returns the best bid (price, size) only if the bid side is non-empty.
+    /// Never returns a phantom (0, 0) fallback — callers must handle None.
+    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
     }
-    fn best_ask(&self) -> (Decimal, Decimal) {
-        self.asks.iter().next().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ONE, Decimal::ZERO))
+
+    /// Returns the best ask (price, size) only if the ask side is non-empty.
+    /// Never returns a phantom (1.0, 0) fallback — callers must handle None.
+    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(p, s)| (*p, *s))
     }
-    fn mid_price(&self) -> Decimal {
-        let (b, _) = self.best_bid();
-        let (a, _) = self.best_ask();
-        if b + a > Decimal::ZERO { (b + a) / Decimal::from(2) } else { Decimal::ZERO }
+
+    /// Returns mid-price only when both sides have real liquidity.
+    fn mid_price(&self) -> Option<Decimal> {
+        let (b, _) = self.best_bid()?;
+        let (a, _) = self.best_ask()?;
+        Some((b + a) / Decimal::from(2))
     }
     fn depth(&self) -> Vec<PriceLevel> {
         let mut levels = Vec::new();
@@ -78,18 +86,22 @@ impl ForecastExFeed {
     fn emit_tick(&self, symbol: &str) -> Option<NormalizedTick> {
         let market_id = self.symbol_to_market_id(symbol)?;
         let book = self.books.get(symbol)?;
-        let (bid_price, bid_size) = book.best_bid();
-        let (ask_price, ask_size) = book.best_ask();
+        // best_bid/best_ask return None when either side is empty.
+        // Returning None here suppresses the tick so the spread engine never
+        // sees phantom prices (bid=0 or ask=1) that would trigger fake arbs.
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        let mid = book.mid_price()?;
 
         Some(NormalizedTick {
             platform: Platform::ForecastEx,
             market_id,
             timestamp_ns: now_ns(),
-            bid_price,
-            bid_size,
-            ask_price,
-            ask_size,
-            mid_price: book.mid_price(),
+            bid_price: bid.0,
+            bid_size: bid.1,
+            ask_price: ask.0,
+            ask_size: ask.1,
+            mid_price: mid,
             last_trade_price: Decimal::ZERO,
             last_trade_size: Decimal::ZERO,
             book_depth: book.depth(),
@@ -138,7 +150,6 @@ impl FeedHandler for ForecastExFeed {
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
         if !self.config.enabled {
             info!("ForecastEx feed disabled, skipping");
-            tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
             return Ok(());
         }
 
@@ -246,12 +257,32 @@ impl ForecastExFeed {
 
         if let Some(book) = self.books.get_mut(symbol) {
             let entry_type = fields.get(&269).map(|s| s.as_str()).unwrap_or("");
-            let price = fields.get(&270)
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
-            let size = fields.get(&271)
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
+
+            // Never default price or size to 0 on parse failure — a 0-priced ask
+            // would look like a near-100% arb opportunity and fire real orders.
+            // If we can't parse the field, drop the update and log the raw value.
+            let price = match fields.get(&270).and_then(|s| Decimal::from_str(s).ok()) {
+                Some(p) => p,
+                None => {
+                    tracing::error!(
+                        symbol,
+                        raw = fields.get(&270).map(|s| s.as_str()).unwrap_or("<missing>"),
+                        "ForecastEx: failed to parse FIX tag 270 (price) — dropping update"
+                    );
+                    return;
+                }
+            };
+            let size = match fields.get(&271).and_then(|s| Decimal::from_str(s).ok()) {
+                Some(s) => s,
+                None => {
+                    tracing::error!(
+                        symbol,
+                        raw = fields.get(&271).map(|s| s.as_str()).unwrap_or("<missing>"),
+                        "ForecastEx: failed to parse FIX tag 271 (size) — dropping update"
+                    );
+                    return;
+                }
+            };
 
             match entry_type {
                 "0" => {

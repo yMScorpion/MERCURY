@@ -32,6 +32,7 @@ pub trait PlatformOrderClient: Send + Sync {
         side: Side,
         price: Decimal,
         size: Decimal,
+        fee_rate_bps: u32,
     ) -> Result<OrderResult>;
 
     async fn cancel_order(&self, order_id: &str) -> Result<()>;
@@ -101,12 +102,15 @@ impl ExecutionEngine {
 
         let (first_leg, second_leg) = self.order_legs(opp);
 
+        // Fix 4: use the platform-native token/market ID from each leg instead of
+        // the unified UUID, so execution clients receive a parseable instrument ID.
         let first_result = self.execute_leg(
             &first_leg.platform,
-            &opp.market_id.to_string(),
+            &first_leg.platform_market_id,
             first_leg.side,
             first_leg.price,
             validated.approved_size,
+            first_leg.fee_rate_bps,
         ).await;
 
         let (leg_a_result, leg_b_result) = match first_result {
@@ -114,22 +118,23 @@ impl ExecutionEngine {
                 let hedge_size = first_fill.fill_size;
                 let second_result = self.execute_leg(
                     &second_leg.platform,
-                    &opp.market_id.to_string(),
+                    &second_leg.platform_market_id,
                     second_leg.side,
                     second_leg.price,
                     hedge_size,
+                    second_leg.fee_rate_bps,
                 ).await;
 
                 match second_result {
                     Ok(second_fill) if second_fill.filled => (first_fill, second_fill),
                     Ok(second_fill) => {
                         warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
-                        let _ = self.attempt_unwind(&first_leg.platform, &opp.market_id.to_string(), first_leg.side, &first_fill).await;
+                        let _ = self.attempt_unwind(&first_leg.platform, &first_leg.platform_market_id, first_leg.side, &first_fill).await;
                         (first_fill, second_fill)
                     }
                     Err(e) => {
                         error!(error = %e, "Hedge leg error, attempting unwind");
-                        let _ = self.attempt_unwind(&first_leg.platform, &opp.market_id.to_string(), first_leg.side, &first_fill).await;
+                        let _ = self.attempt_unwind(&first_leg.platform, &first_leg.platform_market_id, first_leg.side, &first_fill).await;
                         let failed = OrderResult { filled: false, fill_price: Decimal::ZERO, fill_size: Decimal::ZERO, fee: Decimal::ZERO, order_id: String::new(), error: Some(e.to_string()) };
                         (first_fill, failed)
                     }
@@ -183,11 +188,16 @@ impl ExecutionEngine {
             executed_at: Utc::now(),
             bankroll_after: self.bankroll,
             bankroll_change_pct,
+            approved_size: validated.approved_size,
         };
 
         let _ = self.db.insert_trade(&trade_result).await;
-        let _ = self.trade_result_tx.try_send(trade_result.clone());
-        let _ = self.alert_tx.try_send(AlertMessage::TradeComplete(trade_result));
+        // Fix 5: use send().await so the open-position counter is always decremented,
+        // even when the receiver is momentarily slow.
+        self.trade_result_tx.send(trade_result.clone()).await.ok();
+        if let Err(e) = self.alert_tx.try_send(AlertMessage::TradeComplete(trade_result)) {
+            tracing::warn!("Alert channel full, dropping TradeComplete: {e}");
+        }
 
         Ok(())
     }
@@ -207,32 +217,33 @@ impl ExecutionEngine {
         side: Side,
         price: Decimal,
         size: Decimal,
+        fee_rate_bps: u32,
     ) -> Result<OrderResult> {
         match platform {
             Platform::Polymarket | Platform::PolymarketUs => {
                 if let Some(client) = &self.polymarket_client {
-                    client.submit_order(market_id, side, price, size).await
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
                 } else {
                     anyhow::bail!("Polymarket client not configured")
                 }
             }
             Platform::Kalshi => {
                 if let Some(client) = &self.kalshi_client {
-                    client.submit_order(market_id, side, price, size).await
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
                 } else {
                     anyhow::bail!("Kalshi client not configured")
                 }
             }
             Platform::Cdna => {
                 if let Some(client) = &self.cdna_client {
-                    client.submit_order(market_id, side, price, size).await
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
                 } else {
                     anyhow::bail!("CDNA client not configured")
                 }
             }
             Platform::ForecastEx => {
                 if let Some(client) = &self.forecastex_client {
-                    client.submit_order(market_id, side, price, size).await
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
                 } else {
                     anyhow::bail!("ForecastEx client not configured")
                 }
@@ -241,8 +252,11 @@ impl ExecutionEngine {
     }
 
     /// Hedge an open one-sided position after the second leg fails.
-    /// Submits an aggressive contra-order (opposite outcome) so the position
-    /// is always matched: YES + NO = $1 regardless of market outcome.
+    ///
+    /// Submits a loss-limited Limit IOC contra-order capped at `max_unwind_price`
+    /// (0.70). This bounds worst-case unwind slippage to a known maximum.
+    /// A Market Order is NEVER used — it would sweep the book and incur
+    /// catastrophic slippage on thin prediction-market order books.
     async fn attempt_unwind(
         &self,
         platform: &Platform,
@@ -254,32 +268,65 @@ impl ExecutionEngine {
             return Ok(());
         }
 
-        warn!(
+        // Maximum price we will pay for the complementary outcome.
+        // Paying ≤ 0.70 means the worst-case total cost per contract is:
+        //   entry_price + 0.70 ≤ 0.70 + 0.70 = 1.40  (capped loss of $0.40/contract)
+        // This is far better than sweeping to $0.99 which could cost $1.98/contract.
+        let max_unwind_price = dec!(0.70);
+
+        let (contra_side, contra_price) = match original_side {
+            Side::Yes => (Side::No, max_unwind_price),
+            Side::No => (Side::Yes, max_unwind_price),
+        };
+
+        error!(
             platform = %platform,
             side = ?original_side,
             size = %original_fill.fill_size,
-            "Attempting position unwind via contra-order"
+            entry_order_id = %original_fill.order_id,
+            max_unwind_price = %max_unwind_price,
+            "UNWIND TRIGGERED — submitting contra-order; manual review required"
         );
 
-        // Buy the complementary outcome at an aggressive limit so the IOC order
-        // fills immediately at the current market price.
-        // Buying the complement always creates a $1 pay-off regardless of result.
-        let (contra_side, contra_price) = match original_side {
-            // Had bought YES → buy NO at up to 0.99 (fills at current NO ask ~0.50)
-            Side::Yes => (Side::No, dec!(0.99)),
-            // Had bought NO  → buy YES at up to 0.99 (fills at current YES ask ~0.50)
-            Side::No => (Side::Yes, dec!(0.99)),
-        };
+        // Alert the orchestrator immediately so it can escalate.
+        let _ = self.alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
+            severity: "critical".into(),
+            message: format!(
+                "UNWIND on {platform}: leg failed after {side:?} fill of {size} @ {price}. \
+                 Contra-order at ≤{max_unwind_price}. Order ID: {oid}",
+                platform = platform,
+                side = original_side,
+                size = original_fill.fill_size,
+                price = original_fill.fill_price,
+                oid = original_fill.order_id,
+            ),
+        });
 
-        match self.execute_leg(platform, market_id, contra_side, contra_price, original_fill.fill_size).await {
+        // Unwind orders use fee_rate_bps=0 as a best-effort hedge; the exact fee is
+        // less important than getting the position closed.
+        match self.execute_leg(platform, market_id, contra_side, contra_price, original_fill.fill_size, 0).await {
             Ok(result) if result.filled => {
                 info!(platform = %platform, "Unwind contra-order filled — position hedged");
             }
             Ok(_) => {
-                error!(platform = %platform, "Unwind contra-order did not fill — position may be unhedged, manual review required");
+                error!(platform = %platform, "Unwind contra-order did NOT fill at ≤{max_unwind_price} — position UNHEDGED; manual intervention required");
+                let _ = self.alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
+                    severity: "critical".into(),
+                    message: format!(
+                        "UNHEDGED POSITION on {platform} market {market_id}: \
+                         contra-order at {max_unwind_price} did not fill. Immediate manual close required."
+                    ),
+                });
             }
             Err(e) => {
-                error!(error = %e, platform = %platform, "Unwind contra-order failed — position may be unhedged, manual review required");
+                error!(error = %e, platform = %platform, "Unwind contra-order error — position UNHEDGED; manual intervention required");
+                let _ = self.alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
+                    severity: "critical".into(),
+                    message: format!(
+                        "UNHEDGED POSITION on {platform} market {market_id}: \
+                         contra-order errored ({e}). Immediate manual close required."
+                    ),
+                });
             }
         }
 

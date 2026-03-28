@@ -121,8 +121,14 @@ impl MercuryConfig {
             "max_drawdown_pct must be in (0, 1] (fraction scale), got {}", t.max_drawdown_pct);
         anyhow::ensure!(t.max_platform_exposure_pct > Decimal::ZERO && t.max_platform_exposure_pct <= Decimal::ONE,
             "max_platform_exposure_pct must be in (0, 1] (fraction scale), got {}", t.max_platform_exposure_pct);
-        anyhow::ensure!(t.max_single_trade_pct > Decimal::ZERO && t.max_single_trade_pct <= Decimal::ONE,
-            "max_single_trade_pct must be in (0, 1] (fraction scale), got {}", t.max_single_trade_pct);
+        // Hard ceiling: 10% per trade. This cannot be overridden by config YAML.
+        // At 100% a single bug or bad fill wipes the entire bankroll in one trade.
+        // This limit is intentionally conservative for a live trading system.
+        anyhow::ensure!(
+            t.max_single_trade_pct > Decimal::ZERO && t.max_single_trade_pct <= rust_decimal_macros::dec!(0.10),
+            "max_single_trade_pct must be in (0, 0.10] — absolute safety ceiling is 10%; got {}",
+            t.max_single_trade_pct
+        );
         anyhow::ensure!(t.max_open_positions >= 1,
             "max_open_positions must be at least 1, got {}", t.max_open_positions);
         anyhow::ensure!(t.max_concurrent_arbs >= 1,

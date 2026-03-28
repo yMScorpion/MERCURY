@@ -20,16 +20,16 @@ impl ForecastExClient {
 #[async_trait::async_trait]
 impl PlatformOrderClient for ForecastExClient {
     async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
-        info!(market_id, side = %side, price = %price, size = %size, "Submitting ForecastEx order");
-        warn!("ForecastEx order execution not yet fully implemented");
-        Ok(OrderResult {
-            filled: false,
-            fill_price: Decimal::ZERO,
-            fill_size: Decimal::ZERO,
-            fee: Decimal::ZERO,
-            order_id: String::new(),
-            error: Some("ForecastEx execution not yet implemented".into()),
-        })
+        info!(market_id, side = %side, price = %price, size = %size, "ForecastEx order rejected — FIX execution not yet implemented");
+        warn!(
+            fix_host = %self.fix_host,
+            fix_port = self.fix_port,
+            "ForecastEx FIX execution not implemented — rejecting order to prevent unhedged leg-A positions"
+        );
+        // Return Err so the executor aborts the arb opportunity BEFORE executing any
+        // counterpart leg. An Ok(filled: false) response only blocks leg-B but still
+        // allows leg-A to run, which would require an unwind trade on a real platform.
+        anyhow::bail!("ForecastEx FIX execution not yet implemented")
     }
 
     async fn cancel_order(&self, _order_id: &str) -> Result<()> {
