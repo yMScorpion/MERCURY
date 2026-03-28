@@ -195,9 +195,14 @@ async fn main() -> Result<()> {
     let daily_report_interval = tokio::time::interval(std::time::Duration::from_secs(86400));
     tokio::pin!(daily_report_interval);
 
-    // Cache open-position count; updated on each trade result to avoid a DB
-    // round-trip inside the hot tick-processing path.
-    let mut cached_open_positions: usize = 0;
+    // Seed the open-position counter from the DB so that after a crash/restart
+    // the concurrency limit is accurate from the first tick.
+    let mut cached_open_positions: usize = db.get_open_positions().await
+        .map(|v| v.len())
+        .unwrap_or_else(|e| {
+            warn!("Could not read open positions from DB on startup: {e}");
+            0
+        });
 
     loop {
         tokio::select! {
@@ -289,6 +294,11 @@ async fn main() -> Result<()> {
 
             Some(result) = trade_result_rx.recv() => {
                 bankroll_manager.record_trade(&result);
+                // Release platform exposure for both legs now that the trade is
+                // settled; without this, failed-trade exposure accumulates and
+                // the platform exposure circuit breaker trips prematurely.
+                bankroll_manager.remove_exposure(result.leg_a_platform, result.leg_a_size);
+                bankroll_manager.remove_exposure(result.leg_b_platform, result.leg_b_size);
                 circuit_breakers.record_execution(result.status == TradeStatus::Success);
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
                 // Decrement cached counter now that the position is settled.
@@ -363,6 +373,30 @@ async fn main() -> Result<()> {
                 }
                 info!("MERCURY shutdown complete");
                 break;
+            }
+        }
+    }
+
+    // Drain in-flight trades before killing subsystems. The executor task is
+    // still alive (not yet aborted); give it up to 30 s to settle open legs.
+    if cached_open_positions > 0 {
+        info!(positions = cached_open_positions, "Draining in-flight positions (up to 30s)");
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while cached_open_positions > 0 {
+            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                warn!(positions = cached_open_positions, "Shutdown drain timeout — {} position(s) may remain open", cached_open_positions);
+                break;
+            }
+            match tokio::time::timeout(remaining, trade_result_rx.recv()).await {
+                Ok(Some(result)) => {
+                    bankroll_manager.record_trade(&result);
+                    bankroll_manager.remove_exposure(result.leg_a_platform, result.leg_a_size);
+                    bankroll_manager.remove_exposure(result.leg_b_platform, result.leg_b_size);
+                    cached_open_positions = cached_open_positions.saturating_sub(1);
+                    let _ = trade_result_tx2.try_send(result);
+                }
+                _ => break,
             }
         }
     }
