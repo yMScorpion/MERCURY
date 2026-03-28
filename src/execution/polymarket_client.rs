@@ -75,10 +75,10 @@ impl PolymarketClient {
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for PolymarketClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
         let side_str = match side { Side::Yes => "BUY", Side::No => "SELL" };
         let side_u8: u8 = match side { Side::Yes => 0, Side::No => 1 };
-        info!(market_id, side = side_str, price = %price, size = %size, "Submitting Polymarket order");
+        info!(market_id, side = side_str, price = %price, size = %size, fee_rate_bps, "Submitting Polymarket order");
 
         // Scale to USDC/outcome-token base units (6 decimals)
         let scale = Decimal::from(1_000_000u64);
@@ -90,17 +90,21 @@ impl PlatformOrderClient for PolymarketClient {
         let taker_amount_u256 = U256::from_dec_str(&taker_amount_scaled.to_string())
             .unwrap_or(U256::zero());
 
-        // Polymarket token IDs are large decimal integers
-        let token_id_u256 = U256::from_dec_str(market_id).unwrap_or(U256::zero());
+        // Fix 3: reject UUIDs or non-decimal strings instead of silently using zero
+        let token_id_u256 = U256::from_dec_str(market_id)
+            .map_err(|_| anyhow::anyhow!("Invalid Polymarket token ID: {}", market_id))?;
 
         let now = chrono::Utc::now();
-        let salt = U256::from(now.timestamp_nanos_opt().unwrap_or(0) as u64);
+        // Fix 1: derive a single nonce from the nanosecond timestamp and use it
+        // consistently in both sign_order and OrderPayload so the exchange
+        // can verify the signature against the REST payload nonce.
+        let nonce = U256::from(now.timestamp_nanos_opt().unwrap_or(0) as u64);
         let expiration_u256 = U256::from((now.timestamp() + 300) as u64);
 
         let maker_addr = self.signer.address();
 
         let signature = self.signer.sign_order(
-            salt,
+            nonce,
             maker_addr,
             maker_addr,
             Address::zero(),
@@ -108,7 +112,7 @@ impl PlatformOrderClient for PolymarketClient {
             maker_amount_u256,
             taker_amount_u256,
             expiration_u256,
-            U256::zero(),
+            nonce,   // Fix 1: pass the same nonce (was U256::zero())
             U256::zero(),
             side_u8,
             0,
@@ -121,8 +125,8 @@ impl PlatformOrderClient for PolymarketClient {
             maker_amount: maker_amount_scaled.to_string(),
             taker_amount: taker_amount_scaled.to_string(),
             side: side_str.to_string(),
-            fee_rate_bps: "0".to_string(),
-            nonce: salt.to_string(),
+            fee_rate_bps: fee_rate_bps.to_string(), // Fix 2: use caller-supplied fee rate
+            nonce: nonce.to_string(),               // Fix 1: matches the signed nonce
             expiration: expiration_u256.to_string(),
             signature,
             signature_type: 0,
@@ -149,7 +153,8 @@ impl PlatformOrderClient for PolymarketClient {
         // Actual fill_price comes from exchange; use requested price as approximation
         if body.success {
             let fill_size = taker_amount_scaled / scale;
-            let fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, 0);
+            // Fix 2: use the actual fee_rate_bps instead of hardcoded 0
+            let fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, fee_rate_bps as u16);
             Ok(OrderResult {
                 filled: true,
                 fill_price: price,

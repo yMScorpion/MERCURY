@@ -21,8 +21,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         .unwrap_or(0);
 
     if version < 1 {
-        conn.execute_batch(MIGRATION_V1)?;
-        conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [1u32])?;
+        // Wrap DDL + version row in an explicit transaction so a partial
+        // failure leaves the schema in a clean state for the next startup.
+        conn.execute_batch(&format!(
+            "BEGIN;\n{}\nINSERT INTO schema_version (version) VALUES (1);\nCOMMIT;",
+            MIGRATION_V1
+        ))?;
     }
 
     Ok(())

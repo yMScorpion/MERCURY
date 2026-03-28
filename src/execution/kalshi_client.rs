@@ -66,7 +66,7 @@ impl KalshiClient {
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for KalshiClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
         let price_cents = (price * Decimal::from(100)).to_string().parse::<i64>().unwrap_or(50);
         let count = size.to_string().parse::<i64>().unwrap_or(1);
 
@@ -100,10 +100,25 @@ impl PlatformOrderClient for KalshiClient {
             .await
             .context("Kalshi order submission failed")?;
 
-        let status_code = resp.status();
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                tracing::warn!("Kalshi rate limited: {}", body);
+            }
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: Decimal::ZERO,
+                fill_size: Decimal::ZERO,
+                fee: Decimal::ZERO,
+                order_id: String::new(),
+                error: Some(format!("HTTP {}: {}", status, body)),
+            });
+        }
+
         let body: KalshiOrderResponse = resp.json().await.unwrap_or(KalshiOrderResponse {
             order: None,
-            error: Some(KalshiError { message: format!("HTTP {}", status_code) }),
+            error: Some(KalshiError { message: "Failed to decode response".to_string() }),
         });
 
         if let Some(order) = body.order {
@@ -129,11 +144,15 @@ impl PlatformOrderClient for KalshiClient {
     async fn cancel_order(&self, order_id: &str) -> Result<()> {
         let url = format!("{}/portfolio/orders/{}", self.rest_url, order_id);
         let auth_header = self.auth.auth_header()?;
-        self.http.delete(&url)
+        let resp = self.http.delete(&url)
             .header("Authorization", &auth_header)
             .send()
             .await
             .context("Kalshi cancel failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!("Kalshi cancel_order failed: HTTP {}", status);
+        }
         Ok(())
     }
 }

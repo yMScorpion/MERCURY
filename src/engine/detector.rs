@@ -89,9 +89,10 @@ impl ArbitrageDetector {
                     Ok(()) => {
                         self.stats.opportunities_passed += 1;
 
-                        let market_question = registry.get_market(&pair.market_id)
-                            .map(|m| m.question.clone())
-                            .unwrap_or_default();
+                        let market = registry.get_market(&pair.market_id);
+                        let market_question = market.map(|m| m.question.clone()).unwrap_or_default();
+                        let leg_a_pmi = market.and_then(|m| m.platforms.get(&spread.leg_a_platform));
+                        let leg_b_pmi = market.and_then(|m| m.platforms.get(&spread.leg_b_platform));
 
                         let liquidity = spread.leg_a_available.min(spread.leg_b_available);
                         let log_liq = liquidity.to_f64()
@@ -107,6 +108,8 @@ impl ArbitrageDetector {
                             market_question,
                             leg_a: LegDetail {
                                 platform: spread.leg_a_platform,
+                                platform_market_id: leg_a_pmi.map(|p| p.platform_market_id.clone()).unwrap_or_default(),
+                                fee_rate_bps: leg_a_pmi.map(|p| p.fee_rate_bps as u32).unwrap_or(0),
                                 side: spread.leg_a_side,
                                 price: spread.leg_a_price,
                                 available_size: spread.leg_a_available,
@@ -114,6 +117,8 @@ impl ArbitrageDetector {
                             },
                             leg_b: LegDetail {
                                 platform: spread.leg_b_platform,
+                                platform_market_id: leg_b_pmi.map(|p| p.platform_market_id.clone()).unwrap_or_default(),
+                                fee_rate_bps: leg_b_pmi.map(|p| p.fee_rate_bps as u32).unwrap_or(0),
                                 side: spread.leg_b_side,
                                 price: spread.leg_b_price,
                                 available_size: spread.leg_b_available,

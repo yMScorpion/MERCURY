@@ -35,34 +35,63 @@ impl PositionTracker {
 
         let now = Utc::now();
 
-        if trade.leg_a_size > Decimal::ZERO {
-            let position = Position {
-                id: 0,
-                market_id: trade.market_id,
-                platform: trade.leg_a_platform,
-                side: trade.leg_a_side,
-                quantity: trade.leg_a_size,
-                avg_entry_price: trade.leg_a_fill_price,
-                unrealized_pnl: Decimal::ZERO,
-                opened_at: now,
-                updated_at: now,
-            };
-            self.db.upsert_position(&position).await?;
-        }
-
-        if trade.leg_b_size > Decimal::ZERO {
-            let position = Position {
-                id: 0,
-                market_id: trade.market_id,
-                platform: trade.leg_b_platform,
-                side: trade.leg_b_side,
-                quantity: trade.leg_b_size,
-                avg_entry_price: trade.leg_b_fill_price,
-                unrealized_pnl: Decimal::ZERO,
-                opened_at: now,
-                updated_at: now,
-            };
-            self.db.upsert_position(&position).await?;
+        // When both legs filled, write them in a single atomic transaction so the
+        // DB never reflects a partial position pair.
+        match (trade.leg_a_size > Decimal::ZERO, trade.leg_b_size > Decimal::ZERO) {
+            (true, true) => {
+                let pos_a = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_a_platform,
+                    side: trade.leg_a_side,
+                    quantity: trade.leg_a_size,
+                    avg_entry_price: trade.leg_a_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                let pos_b = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_b_platform,
+                    side: trade.leg_b_side,
+                    quantity: trade.leg_b_size,
+                    avg_entry_price: trade.leg_b_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                self.db.upsert_position_pair(&pos_a, &pos_b).await?;
+            }
+            (true, false) => {
+                let pos_a = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_a_platform,
+                    side: trade.leg_a_side,
+                    quantity: trade.leg_a_size,
+                    avg_entry_price: trade.leg_a_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                self.db.upsert_position(&pos_a).await?;
+            }
+            (false, true) => {
+                let pos_b = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_b_platform,
+                    side: trade.leg_b_side,
+                    quantity: trade.leg_b_size,
+                    avg_entry_price: trade.leg_b_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                self.db.upsert_position(&pos_b).await?;
+            }
+            (false, false) => {}
         }
 
         let leg_a_cost = trade.leg_a_fill_price * trade.leg_a_size + trade.leg_a_fee;

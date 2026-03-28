@@ -20,6 +20,8 @@ pub trait Database: Send + Sync + 'static {
 
     // Positions
     async fn upsert_position(&self, position: &Position) -> Result<()>;
+    /// Upsert two positions (both legs of an arbitrage) atomically.
+    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()>;
     async fn get_open_positions(&self) -> Result<Vec<Position>>;
     async fn close_position(&self, id: i64) -> Result<()>;
 

@@ -44,15 +44,19 @@ impl TelegramBot {
 
     /// Send a message to a specific chat, respecting rate limits
     pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
-        // Rate limiting
+        // Rate limiting: compute sleep duration while holding the lock,
+        // then release the lock before sleeping so other callers aren't blocked.
         {
-            let mut last = self.last_send.lock().await;
-            let elapsed = last.elapsed();
-            let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
-            if elapsed < min_interval {
-                tokio::time::sleep(min_interval - elapsed).await;
+            let sleep_for = {
+                let last = self.last_send.lock().await;
+                let elapsed = last.elapsed();
+                let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
+                if elapsed < min_interval { Some(min_interval - elapsed) } else { None }
+            };
+            if let Some(dur) = sleep_for {
+                tokio::time::sleep(dur).await;
             }
-            *last = Instant::now();
+            *self.last_send.lock().await = Instant::now();
         }
 
         // Truncate if too long

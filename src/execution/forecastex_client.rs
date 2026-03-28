@@ -19,7 +19,7 @@ impl ForecastExClient {
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for ForecastExClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
         info!(market_id, side = %side, price = %price, size = %size, "Submitting ForecastEx order");
         warn!("ForecastEx order execution not yet fully implemented");
         Ok(OrderResult {

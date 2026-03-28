@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use crate::db::Database;
 use crate::types::*;
+use serde_json::json;
 
 pub struct SettlementMonitor {
     db: Arc<dyn Database>,
@@ -38,6 +39,21 @@ impl SettlementMonitor {
                 match market.status {
                     MarketStatus::Resolved => {
                         info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_settled".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                                "quantity": position.quantity.to_string(),
+                                "avg_entry_price": position.avg_entry_price.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
+                        }
                         self.db.close_position(position.id).await?;
                         let _ = self.alert_tx.send(AlertMessage::SystemAlert {
                             severity: "info".into(),
@@ -50,6 +66,19 @@ impl SettlementMonitor {
                     }
                     MarketStatus::Expired => {
                         warn!(position_id = position.id, market = %market.question, "Market expired with open position");
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_expired".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write expiry audit entry");
+                        }
                         self.db.close_position(position.id).await?;
                     }
                     _ => {

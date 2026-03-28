@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 mod config;
@@ -80,10 +82,14 @@ async fn main() -> Result<()> {
         && tg_report_chat != "YOUR_CHAT_ID_HERE";
     let tg_enabled = tg_alerts_enabled || tg_reports_enabled;
 
+    // ─── Shared cancellation token & task tracker ───
+    let cancel_token = CancellationToken::new();
+    let mut join_set: JoinSet<()> = JoinSet::new();
+
     if tg_alerts_enabled {
         let bot = telegram::bot::TelegramBot::new(tg_notification_token.clone());
         let alert_service = telegram::alerts::AlertService::new(bot, tg_alerts_chat.clone(), alert_rx);
-        tokio::spawn(alert_service.run());
+        join_set.spawn(alert_service.run());
         info!("Telegram alerts enabled (MERCURY_NOTIFICATION bot)");
     } else {
         warn!("Telegram alerts disabled — set TELEGRAM_NOTIFICATION_TOKEN and TELEGRAM_ALERTS_CHAT_ID");
@@ -93,7 +99,7 @@ async fn main() -> Result<()> {
     if tg_reports_enabled {
         let bot = telegram::bot::TelegramBot::new(tg_daily_token.clone());
         let report_service = telegram::reports::ReportService::new(bot, tg_report_chat.clone(), daily_report_rx);
-        tokio::spawn(report_service.run());
+        join_set.spawn(report_service.run());
         info!("Telegram daily reports enabled (MERCURY_DAILYBOT)");
     } else {
         warn!("Telegram reports disabled — set TELEGRAM_DAILY_TOKEN and TELEGRAM_REPORT_CHAT_ID");
@@ -159,27 +165,27 @@ async fn main() -> Result<()> {
         None, None, None, None,
         initial_bankroll,
     );
-    tokio::spawn(executor.run());
+    join_set.spawn(executor.run());
 
     // ─── Position Tracker ───
     let position_tracker = inventory::positions::PositionTracker::new(db.clone(), trade_result_rx2);
-    tokio::spawn(position_tracker.run());
+    join_set.spawn(position_tracker.run());
 
     // ─── Reconciler ───
     let reconciler = inventory::reconciler::Reconciler::new(
         db.clone(), alert_tx.clone(), 60, dec!(0.10),
     );
-    tokio::spawn(reconciler.run());
+    join_set.spawn(reconciler.run());
 
     // ─── Settlement Monitor ───
     let settlement = inventory::settlement::SettlementMonitor::new(
         db.clone(), alert_tx.clone(), 300,
     );
-    tokio::spawn(settlement.run());
+    join_set.spawn(settlement.run());
 
     // ─── Health Server ───
     let health_metrics = metrics.clone();
-    tokio::spawn(monitoring::health::run_health_server(mercury_config.health.port, health_metrics));
+    join_set.spawn(monitoring::health::run_health_server(mercury_config.health.port, health_metrics));
 
     info!("All subsystems initialized. MERCURY engine running. Press Ctrl+C to shutdown.");
 
@@ -287,7 +293,9 @@ async fn main() -> Result<()> {
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
                 // Decrement cached counter now that the position is settled.
                 cached_open_positions = cached_open_positions.saturating_sub(1);
-                let _ = trade_result_tx2.try_send(result.clone());
+                if let Err(e) = trade_result_tx2.try_send(result.clone()) {
+                    tracing::warn!("Position tracker channel full, dropping trade result: {e}");
+                }
                 match result.status {
                     TradeStatus::Success => metrics.inc_success(),
                     _ => metrics.inc_failed(),
@@ -338,8 +346,17 @@ async fn main() -> Result<()> {
                 bankroll_manager.reset_daily();
             }
 
+            // Warn if any background task exits unexpectedly during the main loop.
+            Some(task_result) = join_set.join_next() => {
+                match task_result {
+                    Ok(()) => warn!("A background task exited cleanly but unexpectedly"),
+                    Err(e) => warn!("A background task was cancelled or panicked: {e}"),
+                }
+            }
+
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutdown signal received");
+                cancel_token.cancel();
                 if tg_alerts_enabled {
                     let bot = telegram::bot::TelegramBot::new(tg_notification_token.clone());
                     let _ = bot.send_message(&tg_alerts_chat, "MERCURY SHUTTING DOWN - Graceful shutdown initiated.").await;
@@ -349,6 +366,10 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // Abort all remaining tasks and wait for them to finish.
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
 
     Ok(())
 }

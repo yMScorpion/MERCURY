@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rust_decimal::Decimal;
@@ -29,21 +29,26 @@ impl SqliteDb {
             }
         }
 
-        let manager = SqliteConnectionManager::file(path);
+        // Apply PRAGMAs on every connection created by the pool via with_init.
+        // WAL mode is file-level (persistent) but is idempotent to set again.
+        // synchronous, busy_timeout, and foreign_keys are connection-level and
+        // must be set on each connection, not just a single borrowed one.
+        let manager = SqliteConnectionManager::file(path).with_init(move |conn| {
+            conn.execute_batch(&format!(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA busy_timeout={busy_timeout_ms};
+                 PRAGMA foreign_keys=ON;"
+            ))
+        });
         let pool = Pool::builder()
             .max_size(pool_size)
             .build(manager)
             .context("failed to build SQLite connection pool")?;
 
-        // Configure pragmas on a connection and run migrations
+        // Run migrations on first connection
         {
             let conn = pool.get().context("failed to get connection from pool")?;
-            conn.execute_batch(&format!(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = NORMAL;
-                 PRAGMA busy_timeout = {busy_timeout_ms};
-                 PRAGMA foreign_keys = ON;"
-            ))?;
             migrations::run_migrations(&conn)?;
         }
 
@@ -59,8 +64,14 @@ impl SqliteDb {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn dec(s: &str) -> Decimal {
-    Decimal::from_str(s).unwrap_or_default()
+fn dec(s: &str) -> rusqlite::Result<Decimal> {
+    Decimal::from_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(e),
+        )
+    })
 }
 
 fn dec_to_string(d: &Decimal) -> String {
@@ -84,6 +95,48 @@ fn side_from_db(s: &str) -> Side {
         "NO" => Side::No,
         _ => Side::Yes,
     }
+}
+
+/// Shared upsert logic used by both `upsert_position` and `upsert_position_pair`.
+fn upsert_position_on(conn: &rusqlite::Connection, pos: &Position) -> Result<()> {
+    if pos.id == 0 {
+        conn.execute(
+            "INSERT INTO positions (market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                pos.market_id.to_string(),
+                pos.platform.to_string(),
+                pos.side.to_string(),
+                dec_to_string(&pos.quantity),
+                dec_to_string(&pos.avg_entry_price),
+                dec_to_string(&pos.unrealized_pnl),
+                dt_to_str(&pos.opened_at),
+                dt_to_str(&pos.updated_at),
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO positions (id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET
+               quantity = excluded.quantity,
+               avg_entry_price = excluded.avg_entry_price,
+               unrealized_pnl = excluded.unrealized_pnl,
+               updated_at = excluded.updated_at",
+            rusqlite::params![
+                pos.id,
+                pos.market_id.to_string(),
+                pos.platform.to_string(),
+                pos.side.to_string(),
+                dec_to_string(&pos.quantity),
+                dec_to_string(&pos.avg_entry_price),
+                dec_to_string(&pos.unrealized_pnl),
+                dt_to_str(&pos.opened_at),
+                dt_to_str(&pos.updated_at),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn trade_status_from_db(s: &str) -> TradeStatus {
@@ -293,10 +346,12 @@ impl Database for SqliteDb {
     async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>> {
         let conn = self.conn()?;
         let start = format!("{}T00:00:00+00:00", date);
-        let end = format!("{}T23:59:59+00:00", date);
+        // Use the next day as an exclusive upper bound to capture all sub-second
+        // trades on `date` (23:59:59+00:00 would miss trades after that second).
+        let end = format!("{}T00:00:00+00:00", date + Days::new(1));
         let mut stmt = conn.prepare(
             "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
-             FROM trades WHERE executed_at >= ?1 AND executed_at <= ?2 ORDER BY executed_at ASC",
+             FROM trades WHERE executed_at >= ?1 AND executed_at < ?2 ORDER BY executed_at ASC",
         )?;
         let mut rows = stmt.query(rusqlite::params![start, end])?;
         let mut trades = Vec::new();
@@ -316,45 +371,15 @@ impl Database for SqliteDb {
 
     async fn upsert_position(&self, pos: &Position) -> Result<()> {
         let conn = self.conn()?;
-        if pos.id == 0 {
-            // New position (no id yet), insert
-            conn.execute(
-                "INSERT INTO positions (market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                rusqlite::params![
-                    pos.market_id.to_string(),
-                    pos.platform.to_string(),
-                    pos.side.to_string(),
-                    dec_to_string(&pos.quantity),
-                    dec_to_string(&pos.avg_entry_price),
-                    dec_to_string(&pos.unrealized_pnl),
-                    dt_to_str(&pos.opened_at),
-                    dt_to_str(&pos.updated_at),
-                ],
-            )?;
-        } else {
-            // Existing position, upsert by id
-            conn.execute(
-                "INSERT INTO positions (id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-                 ON CONFLICT(id) DO UPDATE SET
-                   quantity = excluded.quantity,
-                   avg_entry_price = excluded.avg_entry_price,
-                   unrealized_pnl = excluded.unrealized_pnl,
-                   updated_at = excluded.updated_at",
-                rusqlite::params![
-                    pos.id,
-                    pos.market_id.to_string(),
-                    pos.platform.to_string(),
-                    pos.side.to_string(),
-                    dec_to_string(&pos.quantity),
-                    dec_to_string(&pos.avg_entry_price),
-                    dec_to_string(&pos.unrealized_pnl),
-                    dt_to_str(&pos.opened_at),
-                    dt_to_str(&pos.updated_at),
-                ],
-            )?;
-        }
+        upsert_position_on(&conn, pos)
+    }
+
+    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        upsert_position_on(&tx, pos_a)?;
+        upsert_position_on(&tx, pos_b)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -416,10 +441,10 @@ impl Database for SqliteDb {
         match rows.next()? {
             Some(row) => Ok(Some(PlatformBalance {
                 platform: platform_from_db(&row.get::<_, String>(0)?),
-                available: dec(&row.get::<_, String>(1)?),
-                reserved: dec(&row.get::<_, String>(2)?),
-                pending_settlement: dec(&row.get::<_, String>(3)?),
-                total: dec(&row.get::<_, String>(4)?),
+                available: dec(&row.get::<_, String>(1)?)?,
+                reserved: dec(&row.get::<_, String>(2)?)?,
+                pending_settlement: dec(&row.get::<_, String>(3)?)?,
+                total: dec(&row.get::<_, String>(4)?)?,
                 updated_at: parse_dt(&row.get::<_, String>(5)?),
             })),
             None => Ok(None),
@@ -437,10 +462,10 @@ impl Database for SqliteDb {
         while let Some(row) = rows.next()? {
             balances.push(PlatformBalance {
                 platform: platform_from_db(&row.get::<_, String>(0)?),
-                available: dec(&row.get::<_, String>(1)?),
-                reserved: dec(&row.get::<_, String>(2)?),
-                pending_settlement: dec(&row.get::<_, String>(3)?),
-                total: dec(&row.get::<_, String>(4)?),
+                available: dec(&row.get::<_, String>(1)?)?,
+                reserved: dec(&row.get::<_, String>(2)?)?,
+                pending_settlement: dec(&row.get::<_, String>(3)?)?,
+                total: dec(&row.get::<_, String>(4)?)?,
                 updated_at: parse_dt(&row.get::<_, String>(5)?),
             });
         }
@@ -451,9 +476,11 @@ impl Database for SqliteDb {
 
     async fn insert_daily_snapshot(&self, snap: &DailySnapshot) -> Result<()> {
         let conn = self.conn()?;
+        // report_sent intentionally excluded: it defaults to 0 on insert and
+        // ON CONFLICT must not reset it (mark_report_sent owns that flag).
         conn.execute(
-            "INSERT INTO daily_snapshots (date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization, report_sent)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+            "INSERT INTO daily_snapshots (date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
              ON CONFLICT(date) DO UPDATE SET
                bankroll = excluded.bankroll,
                gross_pnl = excluded.gross_pnl,
@@ -479,7 +506,6 @@ impl Database for SqliteDb {
                 dec_to_string(&snap.peak_bankroll),
                 dec_to_string(&snap.drawdown_pct),
                 dec_to_string(&snap.kelly_utilization),
-                snap.report_sent as i32,
             ],
         )?;
         Ok(())
@@ -496,17 +522,17 @@ impl Database for SqliteDb {
             Some(row) => {
                 Ok(Some(DailySnapshot {
                     date: parse_naive_date(&row.get::<_, String>(0)?),
-                    bankroll: dec(&row.get::<_, String>(1)?),
-                    gross_pnl: dec(&row.get::<_, String>(2)?),
-                    fees_paid: dec(&row.get::<_, String>(3)?),
-                    net_pnl: dec(&row.get::<_, String>(4)?),
+                    bankroll: dec(&row.get::<_, String>(1)?)?,
+                    gross_pnl: dec(&row.get::<_, String>(2)?)?,
+                    fees_paid: dec(&row.get::<_, String>(3)?)?,
+                    net_pnl: dec(&row.get::<_, String>(4)?)?,
                     trades_count: row.get(5)?,
                     success_count: row.get(6)?,
                     fail_count: row.get(7)?,
-                    success_rate: dec(&row.get::<_, String>(8)?),
-                    peak_bankroll: dec(&row.get::<_, String>(9)?),
-                    drawdown_pct: dec(&row.get::<_, String>(10)?),
-                    kelly_utilization: dec(&row.get::<_, String>(11)?),
+                    success_rate: dec(&row.get::<_, String>(8)?)?,
+                    peak_bankroll: dec(&row.get::<_, String>(9)?)?,
+                    drawdown_pct: dec(&row.get::<_, String>(10)?)?,
+                    kelly_utilization: dec(&row.get::<_, String>(11)?)?,
                     report_sent: row.get::<_, i32>(12)? != 0,
                 }))
             }
@@ -574,25 +600,25 @@ fn row_to_trade(row: &rusqlite::Row) -> Result<TradeResult> {
         market_question: row.get(3)?,
         leg_a_platform: platform_from_db(&row.get::<_, String>(4)?),
         leg_a_side: side_from_db(&row.get::<_, String>(5)?),
-        leg_a_price: dec(&row.get::<_, String>(6)?),
-        leg_a_size: dec(&row.get::<_, String>(7)?),
-        leg_a_fill_price: dec(&row.get::<_, String>(8)?),
-        leg_a_fee: dec(&row.get::<_, String>(9)?),
+        leg_a_price: dec(&row.get::<_, String>(6)?)?,
+        leg_a_size: dec(&row.get::<_, String>(7)?)?,
+        leg_a_fill_price: dec(&row.get::<_, String>(8)?)?,
+        leg_a_fee: dec(&row.get::<_, String>(9)?)?,
         leg_b_platform: platform_from_db(&row.get::<_, String>(10)?),
         leg_b_side: side_from_db(&row.get::<_, String>(11)?),
-        leg_b_price: dec(&row.get::<_, String>(12)?),
-        leg_b_size: dec(&row.get::<_, String>(13)?),
-        leg_b_fill_price: dec(&row.get::<_, String>(14)?),
-        leg_b_fee: dec(&row.get::<_, String>(15)?),
-        raw_spread: dec(&row.get::<_, String>(16)?),
-        net_spread: dec(&row.get::<_, String>(17)?),
-        profit: dec(&row.get::<_, String>(18)?),
+        leg_b_price: dec(&row.get::<_, String>(12)?)?,
+        leg_b_size: dec(&row.get::<_, String>(13)?)?,
+        leg_b_fill_price: dec(&row.get::<_, String>(14)?)?,
+        leg_b_fee: dec(&row.get::<_, String>(15)?)?,
+        raw_spread: dec(&row.get::<_, String>(16)?)?,
+        net_spread: dec(&row.get::<_, String>(17)?)?,
+        profit: dec(&row.get::<_, String>(18)?)?,
         status: trade_status_from_db(&row.get::<_, String>(19)?),
         failure_reason: row.get(20)?,
         execution_ms: row.get::<_, i64>(21)? as u64,
         executed_at: parse_dt(&row.get::<_, String>(22)?),
-        bankroll_after: dec(&row.get::<_, String>(23)?),
-        bankroll_change_pct: dec(&row.get::<_, String>(24)?),
+        bankroll_after: dec(&row.get::<_, String>(23)?)?,
+        bankroll_change_pct: dec(&row.get::<_, String>(24)?)?,
     })
 }
 
@@ -602,9 +628,9 @@ fn row_to_position(row: &rusqlite::Row) -> Result<Position> {
         market_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::new_v4()),
         platform: platform_from_db(&row.get::<_, String>(2)?),
         side: side_from_db(&row.get::<_, String>(3)?),
-        quantity: dec(&row.get::<_, String>(4)?),
-        avg_entry_price: dec(&row.get::<_, String>(5)?),
-        unrealized_pnl: dec(&row.get::<_, String>(6)?),
+        quantity: dec(&row.get::<_, String>(4)?)?,
+        avg_entry_price: dec(&row.get::<_, String>(5)?)?,
+        unrealized_pnl: dec(&row.get::<_, String>(6)?)?,
         opened_at: parse_dt(&row.get::<_, String>(7)?),
         updated_at: parse_dt(&row.get::<_, String>(8)?),
     })
