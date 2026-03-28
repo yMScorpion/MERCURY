@@ -147,6 +147,13 @@ impl FeedHandler for ForecastExFeed {
         Platform::ForecastEx
     }
 
+    fn clear_books(&mut self) {
+        for book in self.books.values_mut() {
+            book.bids.clear();
+            book.asks.clear();
+        }
+    }
+
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
         if !self.config.enabled {
             info!("ForecastEx feed disabled, skipping");

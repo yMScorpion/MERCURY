@@ -120,6 +120,13 @@ impl FeedHandler for CdnaFeed {
         Platform::Cdna
     }
 
+    fn clear_books(&mut self) {
+        for book in self.books.values_mut() {
+            book.bids.clear();
+            book.asks.clear();
+        }
+    }
+
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
         let url = &self.config.ws_url;
         info!(url, "Connecting to CDNA WebSocket");

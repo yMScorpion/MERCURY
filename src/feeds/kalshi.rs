@@ -35,18 +35,21 @@ impl KalshiOrderBook {
         Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_seq: 0 }
     }
 
-    fn best_bid(&self) -> (Decimal, Decimal) {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ZERO, Decimal::ZERO))
+    /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
+    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
     }
 
-    fn best_ask(&self) -> (Decimal, Decimal) {
-        self.asks.iter().next().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ONE, Decimal::ZERO))
+    /// Returns best ask only if non-empty — never returns phantom (1.0, 0) fallback.
+    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(p, s)| (*p, *s))
     }
 
-    fn mid_price(&self) -> Decimal {
-        let (b, _) = self.best_bid();
-        let (a, _) = self.best_ask();
-        (b + a) / Decimal::from(2)
+    /// Returns mid-price only when both sides have real liquidity.
+    fn mid_price(&self) -> Option<Decimal> {
+        let (b, _) = self.best_bid()?;
+        let (a, _) = self.best_ask()?;
+        Some((b + a) / Decimal::from(2))
     }
 
     fn depth(&self) -> Vec<PriceLevel> {
@@ -102,16 +105,16 @@ impl KalshiFeed {
     fn emit_tick(&self, ticker: &str) -> Option<NormalizedTick> {
         let market_id = self.ticker_to_market_id(ticker)?;
         let book = self.books.get(ticker)?;
-        let (bid_price, bid_size) = book.best_bid();
-        let (ask_price, ask_size) = book.best_ask();
+        // Both sides must be present — phantom fallbacks (bid=0, ask=1) would
+        // make the spread engine see a fake ~100% arb and fire real orders.
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        let mid = book.mid_price()?;
 
-        let mid = book.mid_price();
         let fee_per_contract = dec!(0.07) * mid * (Decimal::ONE - mid);
         let fee_bps = if mid > Decimal::ZERO {
-            {
-                let bps = (fee_per_contract / mid) * Decimal::from(10000);
-                bps.try_into().unwrap_or(175u16)
-            }
+            let bps = (fee_per_contract / mid) * Decimal::from(10000);
+            bps.try_into().unwrap_or(175u16)
         } else {
             175
         };
@@ -120,10 +123,10 @@ impl KalshiFeed {
             platform: Platform::Kalshi,
             market_id,
             timestamp_ns: now_ns(),
-            bid_price,
-            bid_size,
-            ask_price,
-            ask_size,
+            bid_price: bid.0,
+            bid_size: bid.1,
+            ask_price: ask.0,
+            ask_size: ask.1,
             mid_price: mid,
             last_trade_price: Decimal::ZERO,
             last_trade_size: Decimal::ZERO,
@@ -138,6 +141,13 @@ impl KalshiFeed {
 impl FeedHandler for KalshiFeed {
     fn platform(&self) -> Platform {
         Platform::Kalshi
+    }
+
+    fn clear_books(&mut self) {
+        for book in self.books.values_mut() {
+            book.bids.clear();
+            book.asks.clear();
+        }
     }
 
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
@@ -252,14 +262,15 @@ impl KalshiFeed {
             book.bids.clear();
             book.asks.clear();
 
+            // Kalshi API v2 sends prices as dollar-formatted strings ("0.4200"),
+            // NOT cent integers. Parse directly — no /100 conversion.
             if let Some(yes_bids) = data.get("yes").and_then(|v| v.as_array()) {
                 for level in yes_bids {
                     if let (Some(p), Some(s)) = (
                         level.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                         level.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                     ) {
-                        let price = p / Decimal::from(100);
-                        book.bids.insert(price, s);
+                        book.bids.insert(p, s);
                     }
                 }
             }
@@ -270,8 +281,7 @@ impl KalshiFeed {
                         level.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                         level.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                     ) {
-                        let price = p / Decimal::from(100);
-                        book.asks.insert(price, s);
+                        book.asks.insert(p, s);
                     }
                 }
             }
@@ -309,9 +319,8 @@ impl KalshiFeed {
                         delta.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                         delta.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                     ) {
-                        let price = p / Decimal::from(100);
-                        if s == Decimal::ZERO { book.bids.remove(&price); }
-                        else { book.bids.insert(price, s); }
+                        if s == Decimal::ZERO { book.bids.remove(&p); }
+                        else { book.bids.insert(p, s); }
                     }
                 }
             }
@@ -322,9 +331,8 @@ impl KalshiFeed {
                         delta.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                         delta.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
                     ) {
-                        let price = p / Decimal::from(100);
-                        if s == Decimal::ZERO { book.asks.remove(&price); }
-                        else { book.asks.insert(price, s); }
+                        if s == Decimal::ZERO { book.asks.remove(&p); }
+                        else { book.asks.insert(p, s); }
                     }
                 }
             }

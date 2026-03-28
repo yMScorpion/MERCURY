@@ -14,6 +14,14 @@ pub trait FeedHandler: Send + Sync + 'static {
     /// Connect and start processing. Should run until disconnected.
     /// Returns Err on fatal error, Ok(()) on clean disconnect.
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()>;
+
+    /// Clear all local order book state.
+    ///
+    /// Called immediately on every disconnect (clean or error) before the reconnect
+    /// backoff begins. This prevents stale book data from being visible to the spread
+    /// engine during the reconnect window. The first snapshot received after reconnect
+    /// will repopulate the books from authoritative exchange state.
+    fn clear_books(&mut self);
 }
 
 /// Run a feed handler with automatic reconnection.
@@ -40,13 +48,17 @@ pub async fn run_with_reconnect(
                 break;
             }
             result = handler.connect_and_run(tick_tx.clone()) => {
+                // Immediately discard all book state so no stale prices are visible
+                // to the spread engine during the reconnect window. The first snapshot
+                // after reconnect will rebuild from authoritative exchange data.
+                handler.clear_books();
                 match result {
                     Ok(()) => {
-                        info!(%platform, "Feed handler disconnected cleanly");
+                        info!(%platform, "Feed handler disconnected cleanly — books cleared");
                         backoff_secs = 1;
                     }
                     Err(e) => {
-                        error!(%platform, error = %e, "Feed handler error");
+                        error!(%platform, error = %e, "Feed handler error — books cleared");
                         // Alert IMMEDIATELY on disconnect — the orchestrator must
                         // halt trading on this platform until the book is rebuilt.
                         // Use try_send (non-blocking) to avoid blocking the reconnect loop.
