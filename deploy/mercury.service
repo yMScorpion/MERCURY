@@ -1,0 +1,27 @@
+[Unit]
+Description=MERCURY Arbitrage Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mercury
+Group=mercury
+WorkingDirectory=/opt/mercury
+ExecStart=/opt/mercury/mercury --config /opt/mercury/config/default.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mercury
+EnvironmentFile=-/opt/mercury/.env
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/mercury/data /opt/mercury/logs
+PrivateTmp=yes
+LimitNOFILE=65536
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target
