@@ -104,8 +104,30 @@ impl MercuryConfig {
             .with_context(|| format!("Failed to read config file: {}", path))?;
         let config: MercuryConfig = serde_yaml::from_str(&contents)
             .with_context(|| "Failed to parse config YAML")?;
+        config.validate()?;
         info!("Configuration loaded from {}", path);
         Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let t = &self.trading;
+        anyhow::ensure!(t.initial_bankroll > Decimal::ZERO,
+            "initial_bankroll must be positive, got {}", t.initial_bankroll);
+        anyhow::ensure!(t.kelly_fraction_multiplier > 0.0 && t.kelly_fraction_multiplier <= 1.0,
+            "kelly_fraction_multiplier must be in (0, 1], got {}", t.kelly_fraction_multiplier);
+        anyhow::ensure!(t.max_daily_loss_pct > Decimal::ZERO && t.max_daily_loss_pct <= Decimal::ONE,
+            "max_daily_loss_pct must be in (0, 1] (fraction scale), got {}", t.max_daily_loss_pct);
+        anyhow::ensure!(t.max_drawdown_pct > Decimal::ZERO && t.max_drawdown_pct <= Decimal::ONE,
+            "max_drawdown_pct must be in (0, 1] (fraction scale), got {}", t.max_drawdown_pct);
+        anyhow::ensure!(t.max_platform_exposure_pct > Decimal::ZERO && t.max_platform_exposure_pct <= Decimal::ONE,
+            "max_platform_exposure_pct must be in (0, 1] (fraction scale), got {}", t.max_platform_exposure_pct);
+        anyhow::ensure!(t.max_single_trade_pct > Decimal::ZERO && t.max_single_trade_pct <= Decimal::ONE,
+            "max_single_trade_pct must be in (0, 1] (fraction scale), got {}", t.max_single_trade_pct);
+        anyhow::ensure!(t.max_open_positions >= 1,
+            "max_open_positions must be at least 1, got {}", t.max_open_positions);
+        anyhow::ensure!(t.max_concurrent_arbs >= 1,
+            "max_concurrent_arbs must be at least 1, got {}", t.max_concurrent_arbs);
+        Ok(())
     }
 }
 

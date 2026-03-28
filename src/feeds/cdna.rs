@@ -172,11 +172,9 @@ impl CdnaFeed {
     ) -> Result<()> {
         let v: serde_json::Value = serde_json::from_str(text)?;
 
-        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        if method != "subscribe" {
-            return Ok(());
-        }
-
+        // Accept both the initial subscription confirmation and subsequent push
+        // updates. Push updates have a different (or absent) "method" value;
+        // the reliable discriminator is the channel name in result.channel.
         let channel = v.get("result")
             .and_then(|r| r.get("channel"))
             .and_then(|c| c.as_str())

@@ -25,11 +25,12 @@ pub struct PolymarketFeed {
 struct LocalOrderBook {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
+    last_trade_price: Decimal,
 }
 
 impl LocalOrderBook {
     fn new() -> Self {
-        Self { bids: BTreeMap::new(), asks: BTreeMap::new() }
+        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_trade_price: Decimal::ZERO }
     }
 
     fn best_bid(&self) -> (Decimal, Decimal) {
@@ -149,7 +150,7 @@ impl PolymarketFeed {
             ask_price,
             ask_size,
             mid_price: book.mid_price(),
-            last_trade_price: Decimal::ZERO,
+            last_trade_price: book.last_trade_price,
             last_trade_size: Decimal::ZERO,
             book_depth: book.depth(),
             fee_rate_bps: fee_bps,
@@ -292,7 +293,11 @@ impl PolymarketFeed {
             }
             "last_trade_price" => {
                 if let Some(price_str) = &msg.price {
-                    let _ = Decimal::from_str(price_str);
+                    if let Ok(price) = Decimal::from_str(price_str) {
+                        if let Some(book) = self.books.get_mut(asset_id) {
+                            book.last_trade_price = price;
+                        }
+                    }
                 }
             }
             _ => {

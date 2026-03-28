@@ -225,7 +225,9 @@ impl KalshiFeed {
             }
             "orderbook_delta" => {
                 if let Some(data) = msg.msg {
-                    self.handle_orderbook_delta(&data, tick_tx);
+                    if self.handle_orderbook_delta(&data, tick_tx) {
+                        return Err(anyhow::anyhow!("Sequence gap — reconnecting for fresh snapshot"));
+                    }
                 }
             }
             "trade" => {}
@@ -286,13 +288,15 @@ impl KalshiFeed {
         &mut self,
         data: &serde_json::Value,
         tick_tx: &broadcast::Sender<NormalizedTick>,
-    ) {
+    ) -> bool {
         let ticker = data.get("market_ticker").and_then(|v| v.as_str()).unwrap_or("");
 
         let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
         if let Some(book) = self.books.get(ticker) {
             if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
-                warn!(ticker, expected = book.last_seq + 1, got = seq, "Kalshi sequence gap");
+                warn!(ticker, expected = book.last_seq + 1, got = seq,
+                    "Kalshi sequence gap — reconnecting to get fresh snapshot");
+                return true; // signal caller to reconnect
             }
         }
 
@@ -331,5 +335,7 @@ impl KalshiFeed {
                 let _ = tick_tx.send(tick);
             }
         }
+
+        false // no reconnect needed
     }
 }

@@ -66,7 +66,7 @@ impl KalshiClient {
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for KalshiClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
         let price_cents = (price * Decimal::from(100)).to_string().parse::<i64>().unwrap_or(50);
         let count = size.to_string().parse::<i64>().unwrap_or(1);
 
@@ -125,8 +125,11 @@ impl PlatformOrderClient for KalshiClient {
             let filled_count = order.count - order.remaining_count;
             let filled = filled_count > 0;
             let fill_price = Decimal::from(order.yes_price.max(order.no_price)) / Decimal::from(100);
-            let fee_per = Decimal::from(7) / Decimal::from(100) * fill_price * (Decimal::ONE - fill_price);
-            let total_fee = fee_per * Decimal::from(filled_count);
+            // Use the fee_rate_bps supplied by the caller (derived from the live tick)
+            // instead of recomputing with a hardcoded 7% formula.
+            let total_fee = Decimal::from(fee_rate_bps) / Decimal::from(10_000)
+                * fill_price
+                * Decimal::from(filled_count);
             Ok(OrderResult {
                 filled,
                 fill_price,

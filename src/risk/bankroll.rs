@@ -142,6 +142,10 @@ impl BankrollManager {
         self.success_today = 0;
         self.fail_today = 0;
         self.day_start = Utc::now();
+        // Reset the peak so drawdown is measured within the current day only.
+        // Without this, a single historical loss permanently suppresses Kelly
+        // sizing even after recovery ("fear lock").
+        self.peak_bankroll = self.total_bankroll;
         info!(bankroll = %self.total_bankroll, "Daily counters reset");
     }
 
