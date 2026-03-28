@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod config;
 mod crypto;
@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
     let (trade_result_tx2, trade_result_rx2) = mpsc::channel::<TradeResult>(100);
     let (alert_tx, alert_rx) = mpsc::channel::<AlertMessage>(500);
     let (daily_report_tx, daily_report_rx) = mpsc::channel::<DailyReport>(10);
+    let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
 
     // ─── Telegram ───
     // Two separate bots: MERCURY_NOTIFICATION (real-time alerts) and MERCURY_DAILYBOT (daily reports)
@@ -130,24 +131,11 @@ async fn main() -> Result<()> {
     );
 
     // Polymarket runs on Polygon — gas is paid in MATIC, not ETH.
-    // Default MATIC price is ~$0.50, not $2000 (ETH).  Without this fix,
-    // the hardcoded eth_price_usd=$2000 inflates gas cost to ~$20/trade
-    // and makes every Polymarket arb appear unprofitable.
-    {
-        let gas_gwei = std::env::var("POLYGON_GAS_GWEI")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Decimal::from)
-            .unwrap_or(Decimal::from(50));
-        let matic_price = std::env::var("MATIC_PRICE_USD")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .and_then(|f| rust_decimal::Decimal::from_f64_retain(f))
-            .unwrap_or(rust_decimal_macros::dec!(0.50));
-        spread_engine.update_gas_price(gas_gwei);
-        spread_engine.update_eth_price(matic_price);
-        info!(gas_gwei = %gas_gwei, matic_usd = %matic_price, "Gas cost parameters set (Polygon/MATIC)");
-    }
+    // Set safe startup defaults; the GasOracle will push live values within
+    // the first poll interval (gas_poll_interval_secs in config).
+    // Default: 50 gwei, MATIC $0.50 — conservative enough not to miss real arbs.
+    spread_engine.update_gas_price(Decimal::from(50));
+    spread_engine.update_eth_price(dec!(0.50));
     let mut detector = engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,
         Decimal::from(5),
@@ -186,6 +174,17 @@ async fn main() -> Result<()> {
     // ─── Health Server ───
     let health_metrics = metrics.clone();
     join_set.spawn(monitoring::health::run_health_server(mercury_config.health.port, health_metrics));
+
+    // ─── Gas Oracle ───
+    // Polls live Polygon gas price (eth_gasPrice) and MATIC/USD spot price.
+    // Updates are delivered via gas_update_rx into the main event loop so
+    // spread_engine and circuit_breakers always reflect current network costs.
+    let gas_oracle = monitoring::gas_oracle::GasOracle::new(
+        mercury_config.polygon_rpc.url.clone(),
+        mercury_config.polygon_rpc.gas_poll_interval_secs,
+        gas_update_tx,
+    );
+    join_set.spawn(gas_oracle.run());
 
     info!("All subsystems initialized. MERCURY engine running. Press Ctrl+C to shutdown.");
 
@@ -310,6 +309,13 @@ async fn main() -> Result<()> {
                     TradeStatus::Success => metrics.inc_success(),
                     _ => metrics.inc_failed(),
                 }
+            }
+
+            Some(gas) = gas_update_rx.recv() => {
+                spread_engine.update_gas_price(Decimal::from(gas.gas_gwei));
+                spread_engine.update_eth_price(gas.matic_usd);
+                circuit_breakers.update_gas_price(gas.gas_gwei);
+                debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated live");
             }
 
             _ = daily_report_interval.tick() => {
