@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -123,12 +124,12 @@ impl ExecutionEngine {
                     Ok(second_fill) if second_fill.filled => (first_fill, second_fill),
                     Ok(second_fill) => {
                         warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
-                        let _ = self.attempt_unwind(&first_leg.platform, &opp.market_id.to_string(), &first_fill).await;
+                        let _ = self.attempt_unwind(&first_leg.platform, &opp.market_id.to_string(), first_leg.side, &first_fill).await;
                         (first_fill, second_fill)
                     }
                     Err(e) => {
                         error!(error = %e, "Hedge leg error, attempting unwind");
-                        let _ = self.attempt_unwind(&first_leg.platform, &opp.market_id.to_string(), &first_fill).await;
+                        let _ = self.attempt_unwind(&first_leg.platform, &opp.market_id.to_string(), first_leg.side, &first_fill).await;
                         let failed = OrderResult { filled: false, fill_price: Decimal::ZERO, fill_size: Decimal::ZERO, fee: Decimal::ZERO, order_id: String::new(), error: Some(e.to_string()) };
                         (first_fill, failed)
                     }
@@ -185,8 +186,8 @@ impl ExecutionEngine {
         };
 
         let _ = self.db.insert_trade(&trade_result).await;
-        let _ = self.trade_result_tx.send(trade_result.clone()).await;
-        let _ = self.alert_tx.send(AlertMessage::TradeComplete(trade_result)).await;
+        let _ = self.trade_result_tx.try_send(trade_result.clone());
+        let _ = self.alert_tx.try_send(AlertMessage::TradeComplete(trade_result));
 
         Ok(())
     }
@@ -239,8 +240,49 @@ impl ExecutionEngine {
         }
     }
 
-    async fn attempt_unwind(&self, platform: &Platform, _market_id: &str, original_fill: &OrderResult) -> Result<()> {
-        warn!(platform = %platform, size = %original_fill.fill_size, "Attempting position unwind");
+    /// Hedge an open one-sided position after the second leg fails.
+    /// Submits an aggressive contra-order (opposite outcome) so the position
+    /// is always matched: YES + NO = $1 regardless of market outcome.
+    async fn attempt_unwind(
+        &self,
+        platform: &Platform,
+        market_id: &str,
+        original_side: Side,
+        original_fill: &OrderResult,
+    ) -> Result<()> {
+        if !original_fill.filled || original_fill.fill_size == Decimal::ZERO {
+            return Ok(());
+        }
+
+        warn!(
+            platform = %platform,
+            side = ?original_side,
+            size = %original_fill.fill_size,
+            "Attempting position unwind via contra-order"
+        );
+
+        // Buy the complementary outcome at an aggressive limit so the IOC order
+        // fills immediately at the current market price.
+        // Buying the complement always creates a $1 pay-off regardless of result.
+        let (contra_side, contra_price) = match original_side {
+            // Had bought YES → buy NO at up to 0.99 (fills at current NO ask ~0.50)
+            Side::Yes => (Side::No, dec!(0.99)),
+            // Had bought NO  → buy YES at up to 0.99 (fills at current YES ask ~0.50)
+            Side::No => (Side::Yes, dec!(0.99)),
+        };
+
+        match self.execute_leg(platform, market_id, contra_side, contra_price, original_fill.fill_size).await {
+            Ok(result) if result.filled => {
+                info!(platform = %platform, "Unwind contra-order filled — position hedged");
+            }
+            Ok(_) => {
+                error!(platform = %platform, "Unwind contra-order did not fill — position may be unhedged, manual review required");
+            }
+            Err(e) => {
+                error!(error = %e, platform = %platform, "Unwind contra-order failed — position may be unhedged, manual review required");
+            }
+        }
+
         Ok(())
     }
 

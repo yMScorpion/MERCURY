@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use ethers::core::types::{Address, U256};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -75,23 +77,54 @@ impl PolymarketClient {
 impl PlatformOrderClient for PolymarketClient {
     async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal) -> Result<OrderResult> {
         let side_str = match side { Side::Yes => "BUY", Side::No => "SELL" };
+        let side_u8: u8 = match side { Side::Yes => 0, Side::No => 1 };
         info!(market_id, side = side_str, price = %price, size = %size, "Submitting Polymarket order");
 
-        let nonce = format!("{}", chrono::Utc::now().timestamp_millis());
-        let expiration = format!("{}", chrono::Utc::now().timestamp() + 300);
-        let maker_amount = (size * price).to_string();
-        let taker_amount = size.to_string();
+        // Scale to USDC/outcome-token base units (6 decimals)
+        let scale = Decimal::from(1_000_000u64);
+        let maker_amount_scaled = (size * price * scale).floor();
+        let taker_amount_scaled = (size * scale).floor();
+
+        let maker_amount_u256 = U256::from_dec_str(&maker_amount_scaled.to_string())
+            .unwrap_or(U256::zero());
+        let taker_amount_u256 = U256::from_dec_str(&taker_amount_scaled.to_string())
+            .unwrap_or(U256::zero());
+
+        // Polymarket token IDs are large decimal integers
+        let token_id_u256 = U256::from_dec_str(market_id).unwrap_or(U256::zero());
+
+        let now = chrono::Utc::now();
+        let salt = U256::from(now.timestamp_nanos_opt().unwrap_or(0) as u64);
+        let expiration_u256 = U256::from((now.timestamp() + 300) as u64);
+
+        let maker_addr = self.signer.address();
+
+        let signature = self.signer.sign_order(
+            salt,
+            maker_addr,
+            maker_addr,
+            Address::zero(),
+            token_id_u256,
+            maker_amount_u256,
+            taker_amount_u256,
+            expiration_u256,
+            U256::zero(),
+            U256::zero(),
+            side_u8,
+            0,
+        ).await.context("EIP-712 order signing failed")?;
+
         let url = format!("{}/order", self.rest_url);
 
         let payload = OrderPayload {
             token_id: market_id.to_string(),
-            maker_amount,
-            taker_amount,
+            maker_amount: maker_amount_scaled.to_string(),
+            taker_amount: taker_amount_scaled.to_string(),
             side: side_str.to_string(),
             fee_rate_bps: "0".to_string(),
-            nonce,
-            expiration,
-            signature: "0x".to_string(),
+            nonce: salt.to_string(),
+            expiration: expiration_u256.to_string(),
+            signature,
             signature_type: 0,
             order_type: "IOC".to_string(),
         };
@@ -113,12 +146,15 @@ impl PlatformOrderClient for PolymarketClient {
             error_msg: Some(format!("HTTP {}", status_code)),
         });
 
+        // Actual fill_price comes from exchange; use requested price as approximation
         if body.success {
+            let fill_size = taker_amount_scaled / scale;
+            let fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, 0);
             Ok(OrderResult {
                 filled: true,
                 fill_price: price,
-                fill_size: size,
-                fee: Decimal::ZERO,
+                fill_size,
+                fee,
                 order_id: body.order_id.unwrap_or_default(),
                 error: None,
             })
@@ -136,13 +172,18 @@ impl PlatformOrderClient for PolymarketClient {
 
     async fn cancel_order(&self, order_id: &str) -> Result<()> {
         let url = format!("{}/order/{}", self.rest_url, order_id);
-        self.http.delete(&url)
+        let resp = self.http.delete(&url)
             .header("POLY_API_KEY", &self.api_key)
             .header("POLY_SECRET", &self.api_secret)
             .header("POLY_PASSPHRASE", &self.api_passphrase)
             .send()
             .await
             .context("Polymarket cancel failed")?;
+        if !resp.status().is_success() {
+            tracing::warn!(order_id, status = %resp.status(), "Polymarket cancel returned non-2xx");
+        }
+        // IOC orders are already settled; cancel is best-effort only
+        let _ = dec!(0); // suppress unused import warning
         Ok(())
     }
 }

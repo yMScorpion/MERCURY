@@ -122,6 +122,26 @@ async fn main() -> Result<()> {
     let mut spread_engine = engine::spread::NetSpreadEngine::new(
         mercury_config.trading.min_net_spread_threshold,
     );
+
+    // Polymarket runs on Polygon — gas is paid in MATIC, not ETH.
+    // Default MATIC price is ~$0.50, not $2000 (ETH).  Without this fix,
+    // the hardcoded eth_price_usd=$2000 inflates gas cost to ~$20/trade
+    // and makes every Polymarket arb appear unprofitable.
+    {
+        let gas_gwei = std::env::var("POLYGON_GAS_GWEI")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Decimal::from)
+            .unwrap_or(Decimal::from(50));
+        let matic_price = std::env::var("MATIC_PRICE_USD")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .and_then(|f| rust_decimal::Decimal::from_f64_retain(f))
+            .unwrap_or(rust_decimal_macros::dec!(0.50));
+        spread_engine.update_gas_price(gas_gwei);
+        spread_engine.update_eth_price(matic_price);
+        info!(gas_gwei = %gas_gwei, matic_usd = %matic_price, "Gas cost parameters set (Polygon/MATIC)");
+    }
     let mut detector = engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,
         Decimal::from(5),

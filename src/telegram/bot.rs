@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::warn;
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
 const MAX_MESSAGE_LENGTH: usize = 4096;

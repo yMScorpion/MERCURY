@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -105,7 +106,7 @@ impl KalshiFeed {
         let (ask_price, ask_size) = book.best_ask();
 
         let mid = book.mid_price();
-        let fee_per_contract = Decimal::from_str("0.07").unwrap() * mid * (Decimal::ONE - mid);
+        let fee_per_contract = dec!(0.07) * mid * (Decimal::ONE - mid);
         let fee_bps = if mid > Decimal::ZERO {
             {
                 let bps = (fee_per_contract / mid) * Decimal::from(10000);
@@ -140,17 +141,27 @@ impl FeedHandler for KalshiFeed {
     }
 
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
-        let mut url = self.config.ws_url.clone();
-
-        if let Some(auth) = &self.auth {
-            let token = auth.generate_token()?;
-            url = format!("{}?token={}", url, token);
-        }
-
         info!("Connecting to Kalshi WebSocket");
-        let (ws_stream, _) = connect_async(&url)
-            .await
-            .context("Failed to connect to Kalshi WebSocket")?;
+
+        // Send JWT in Authorization header — never in the URL where it can be
+        // logged by proxies, CDNs, or the server's access log (CRIT-2 fix).
+        let (ws_stream, _) = if let Some(auth) = &self.auth {
+            let token = auth.generate_token()?;
+            let mut request = self.config.ws_url.as_str()
+                .into_client_request()
+                .context("Invalid Kalshi WebSocket URL")?;
+            request.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+                format!("Bearer {}", token)
+                    .try_into()
+                    .context("Failed to build Kalshi auth header")?,
+            );
+            connect_async(request).await.context("Failed to connect to Kalshi WebSocket")?
+        } else {
+            connect_async(self.config.ws_url.as_str())
+                .await
+                .context("Failed to connect to Kalshi WebSocket")?
+        };
 
         let (mut write, mut read) = ws_stream.split();
 
