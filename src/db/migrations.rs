@@ -31,34 +31,48 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 const MIGRATION_V1: &str = r#"
 -- Markets
 CREATE TABLE IF NOT EXISTS markets (
-    id              TEXT PRIMARY KEY,
-    question        TEXT NOT NULL,
-    category        TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'active',
-    resolution_date TEXT,
-    platforms_json  TEXT NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    unified_id          TEXT UNIQUE NOT NULL,
+    question            TEXT NOT NULL,
+    resolution_source   TEXT,
+    expiration          TEXT,
+    platforms           TEXT NOT NULL DEFAULT '{}',
+    category            TEXT,
+    confidence          REAL NOT NULL DEFAULT 1.0,
+    status              TEXT NOT NULL DEFAULT 'active',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_markets_unified ON markets(unified_id);
 CREATE INDEX IF NOT EXISTS idx_markets_status ON markets(status);
 
 -- Trades
 CREATE TABLE IF NOT EXISTS trades (
-    id                  TEXT PRIMARY KEY,
-    opportunity_id      TEXT NOT NULL,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    opp_id              TEXT NOT NULL,
     market_id           TEXT NOT NULL,
-    legs_json           TEXT NOT NULL DEFAULT '[]',
-    gross_spread        TEXT NOT NULL,
+    market_question     TEXT NOT NULL DEFAULT '',
+    leg_a_platform      TEXT NOT NULL,
+    leg_a_side          TEXT NOT NULL,
+    leg_a_price         TEXT NOT NULL,
+    leg_a_size          TEXT NOT NULL,
+    leg_a_fill_price    TEXT NOT NULL DEFAULT '0',
+    leg_a_fee           TEXT NOT NULL DEFAULT '0',
+    leg_b_platform      TEXT NOT NULL,
+    leg_b_side          TEXT NOT NULL,
+    leg_b_price         TEXT NOT NULL,
+    leg_b_size          TEXT NOT NULL,
+    leg_b_fill_price    TEXT NOT NULL DEFAULT '0',
+    leg_b_fee           TEXT NOT NULL DEFAULT '0',
+    raw_spread          TEXT NOT NULL,
     net_spread          TEXT NOT NULL,
-    total_fees          TEXT NOT NULL,
-    gas_cost            TEXT NOT NULL,
     profit              TEXT NOT NULL,
     status              TEXT NOT NULL,
     failure_reason      TEXT,
-    execution_ms        INTEGER NOT NULL,
+    execution_ms        INTEGER NOT NULL DEFAULT 0,
+    executed_at         TEXT NOT NULL,
     bankroll_after      TEXT NOT NULL,
-    bankroll_change_pct TEXT NOT NULL,
-    executed_at         TEXT NOT NULL
+    bankroll_change_pct TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_id);
 CREATE INDEX IF NOT EXISTS idx_trades_executed ON trades(executed_at);
@@ -66,62 +80,64 @@ CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 
 -- Positions
 CREATE TABLE IF NOT EXISTS positions (
-    id            TEXT PRIMARY KEY,
-    market_id     TEXT NOT NULL,
-    platform      TEXT NOT NULL,
-    side          TEXT NOT NULL,
-    size          TEXT NOT NULL,
-    entry_price   TEXT NOT NULL,
-    current_price TEXT,
-    unrealized_pnl TEXT NOT NULL DEFAULT '0',
-    opened_at     TEXT NOT NULL,
-    closed_at     TEXT
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id       TEXT NOT NULL,
+    platform        TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    quantity        TEXT NOT NULL,
+    avg_entry_price TEXT NOT NULL,
+    unrealized_pnl  TEXT NOT NULL DEFAULT '0',
+    opened_at       TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    closed          INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(closed_at) WHERE closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(closed) WHERE closed = 0;
 CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);
 
--- Balances
-CREATE TABLE IF NOT EXISTS balances (
-    platform   TEXT PRIMARY KEY,
-    balance    TEXT NOT NULL,
-    reserved   TEXT NOT NULL DEFAULT '0',
-    available  TEXT NOT NULL DEFAULT '0',
-    updated_at TEXT NOT NULL
+-- Platform balances
+CREATE TABLE IF NOT EXISTS platform_balances (
+    platform            TEXT PRIMARY KEY,
+    available           TEXT NOT NULL DEFAULT '0',
+    reserved            TEXT NOT NULL DEFAULT '0',
+    pending_settlement  TEXT NOT NULL DEFAULT '0',
+    total               TEXT NOT NULL DEFAULT '0',
+    updated_at          TEXT NOT NULL
 );
 
 -- Daily snapshots
 CREATE TABLE IF NOT EXISTS daily_snapshots (
     date                TEXT PRIMARY KEY,
-    total_bankroll      TEXT NOT NULL,
-    total_pnl           TEXT NOT NULL,
-    trade_count         INTEGER NOT NULL DEFAULT 0,
-    win_count           INTEGER NOT NULL DEFAULT 0,
-    loss_count          INTEGER NOT NULL DEFAULT 0,
-    best_trade_pnl      TEXT NOT NULL DEFAULT '0',
-    worst_trade_pnl     TEXT NOT NULL DEFAULT '0',
-    avg_spread_captured TEXT NOT NULL DEFAULT '0',
-    max_drawdown_pct    TEXT NOT NULL DEFAULT '0',
-    platform_balances   TEXT NOT NULL DEFAULT '{}',
-    report_sent         INTEGER NOT NULL DEFAULT 0,
-    created_at          TEXT NOT NULL
+    bankroll            TEXT NOT NULL,
+    gross_pnl           TEXT NOT NULL DEFAULT '0',
+    fees_paid           TEXT NOT NULL DEFAULT '0',
+    net_pnl             TEXT NOT NULL DEFAULT '0',
+    trades_count        INTEGER NOT NULL DEFAULT 0,
+    success_count       INTEGER NOT NULL DEFAULT 0,
+    fail_count          INTEGER NOT NULL DEFAULT 0,
+    success_rate        TEXT NOT NULL DEFAULT '0',
+    peak_bankroll       TEXT NOT NULL DEFAULT '0',
+    drawdown_pct        TEXT NOT NULL DEFAULT '0',
+    kelly_utilization   TEXT NOT NULL DEFAULT '0',
+    report_sent         INTEGER NOT NULL DEFAULT 0
 );
 
 -- Audit log
 CREATE TABLE IF NOT EXISTS audit_log (
-    id        TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    action    TEXT NOT NULL,
-    details   TEXT NOT NULL DEFAULT ''
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_ns INTEGER NOT NULL,
+    module       TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    data         TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ns);
 
 -- Config history
 CREATE TABLE IF NOT EXISTS config_history (
-    id        TEXT PRIMARY KEY,
-    timestamp TEXT NOT NULL,
-    field     TEXT NOT NULL,
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    changed_at TEXT NOT NULL,
+    key       TEXT NOT NULL,
     old_value TEXT NOT NULL,
     new_value TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_config_hist_ts ON config_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_config_hist_ts ON config_history(changed_at);
 "#;

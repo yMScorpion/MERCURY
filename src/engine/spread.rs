@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use std::str::FromStr;
+use rust_decimal_macros::dec;
 use uuid::Uuid;
 
 use crate::engine::order_book::PlatformBook;
@@ -159,7 +159,7 @@ impl NetSpreadEngine {
         }
 
         let gas_units = Decimal::from(200_000);
-        let gwei_to_eth = Decimal::from_str("0.000000001").unwrap();
+        let gwei_to_eth = dec!(0.000000001);
         self.gas_price_gwei * gas_units * gwei_to_eth * self.eth_price_usd
     }
 }

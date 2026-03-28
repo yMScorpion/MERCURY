@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use std::str::FromStr;
+use rust_decimal_macros::dec;
 use uuid::Uuid;
 
 use crate::types::*;
@@ -23,13 +23,12 @@ pub fn compute_unified_market_id(question: &str, resolution_source: &str, expiry
 
 /// Calculate Kalshi taker fee for a given contract price (0.01-0.99)
 pub fn kalshi_taker_fee(contract_price: Decimal) -> Decimal {
-    let seven_cents = Decimal::from_str("0.07").unwrap();
-    seven_cents * contract_price * (Decimal::ONE - contract_price)
+    dec!(0.07) * contract_price * (Decimal::ONE - contract_price)
 }
 
 /// Calculate Kalshi maker fee (25% of taker fee)
 pub fn kalshi_maker_fee(contract_price: Decimal) -> Decimal {
-    kalshi_taker_fee(contract_price) * Decimal::from_str("0.25").unwrap()
+    kalshi_taker_fee(contract_price) * dec!(0.25)
 }
 
 /// Calculate Polymarket fee for given price and fee_rate_bps
@@ -65,7 +64,7 @@ pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel], _is_buy: bo
     }
 
     if remaining > Decimal::ZERO {
-        return Decimal::from_str("999").unwrap();
+        return dec!(999);
     }
 
     let vwap = total_cost / target_size;

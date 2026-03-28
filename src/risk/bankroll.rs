@@ -60,7 +60,9 @@ impl BankrollManager {
 
     pub fn daily_loss_pct(&self) -> Decimal {
         if self.daily_start_bankroll > Decimal::ZERO {
-            (self.daily_pnl / self.daily_start_bankroll).abs() * Decimal::from(100)
+            // Only report a loss percentage when daily_pnl is negative; profitable
+            // days must return 0 so the circuit breaker never trips on good days.
+            (-self.daily_pnl / self.daily_start_bankroll * Decimal::from(100)).max(Decimal::ZERO)
         } else {
             Decimal::ZERO
         }

@@ -64,21 +64,39 @@ async fn main() -> Result<()> {
     let (daily_report_tx, daily_report_rx) = mpsc::channel::<DailyReport>(10);
 
     // ─── Telegram ───
-    let tg_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    // Two separate bots: MERCURY_NOTIFICATION (real-time alerts) and MERCURY_DAILYBOT (daily reports)
+    let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
+    let tg_daily_token = std::env::var("TELEGRAM_DAILY_TOKEN").unwrap_or_default();
     let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_default();
     let tg_report_chat = std::env::var("TELEGRAM_REPORT_CHAT_ID").unwrap_or_default();
-    let tg_enabled = mercury_config.telegram.enabled && !tg_bot_token.is_empty();
 
-    if tg_enabled {
-        let bot = telegram::bot::TelegramBot::new(tg_bot_token.clone());
-        let alert_service = telegram::alerts::AlertService::new(bot.clone(), tg_alerts_chat.clone(), alert_rx);
+    let tg_alerts_enabled = mercury_config.telegram.enabled
+        && !tg_notification_token.is_empty()
+        && !tg_alerts_chat.is_empty()
+        && tg_alerts_chat != "YOUR_CHAT_ID_HERE";
+    let tg_reports_enabled = mercury_config.telegram.enabled
+        && !tg_daily_token.is_empty()
+        && !tg_report_chat.is_empty()
+        && tg_report_chat != "YOUR_CHAT_ID_HERE";
+    let tg_enabled = tg_alerts_enabled || tg_reports_enabled;
+
+    if tg_alerts_enabled {
+        let bot = telegram::bot::TelegramBot::new(tg_notification_token.clone());
+        let alert_service = telegram::alerts::AlertService::new(bot, tg_alerts_chat.clone(), alert_rx);
         tokio::spawn(alert_service.run());
+        info!("Telegram alerts enabled (MERCURY_NOTIFICATION bot)");
+    } else {
+        warn!("Telegram alerts disabled — set TELEGRAM_NOTIFICATION_TOKEN and TELEGRAM_ALERTS_CHAT_ID");
+        drop(alert_rx);
+    }
+
+    if tg_reports_enabled {
+        let bot = telegram::bot::TelegramBot::new(tg_daily_token.clone());
         let report_service = telegram::reports::ReportService::new(bot, tg_report_chat.clone(), daily_report_rx);
         tokio::spawn(report_service.run());
-        info!("Telegram notifications enabled");
+        info!("Telegram daily reports enabled (MERCURY_DAILYBOT)");
     } else {
-        warn!("Telegram notifications disabled (set TELEGRAM_BOT_TOKEN env var to enable)");
-        drop(alert_rx);
+        warn!("Telegram reports disabled — set TELEGRAM_DAILY_TOKEN and TELEGRAM_REPORT_CHAT_ID");
         drop(daily_report_rx);
     }
 
@@ -151,23 +169,34 @@ async fn main() -> Result<()> {
     let daily_report_interval = tokio::time::interval(std::time::Duration::from_secs(86400));
     tokio::pin!(daily_report_interval);
 
+    // Cache open-position count; updated on each trade result to avoid a DB
+    // round-trip inside the hot tick-processing path.
+    let mut cached_open_positions: usize = 0;
+
     loop {
         tokio::select! {
-            Ok(tick) = tick_rx.recv() => {
+            tick_result = tick_rx.recv() => {
+                let tick = match tick_result {
+                    Ok(t) => t,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Broadcast channel lagged by {} ticks — consider increasing buffer", n);
+                        metrics.ws_reconnects.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+
                 metrics.inc_ticks();
                 uob.update(&tick);
 
-                for pair in registry.get_arb_pairs() {
-                    if let (Some(book_a), Some(book_b)) = (
-                        uob.get_book(&pair.market_id, &pair.platform_a),
-                        uob.get_book(&pair.market_id, &pair.platform_b),
-                    ) {
-                        let spreads = spread_engine.compute_spreads(book_a, book_b, Decimal::from(10));
-                        metrics.spreads_evaluated.fetch_add(spreads.len() as u64, Ordering::Relaxed);
-                    }
-                }
+                // Sync concurrency cap with the cached position count so the
+                // detector's slot guard actually works (BUG-3 fix).
+                detector.set_active_arbs(cached_open_positions);
 
+                // detector.detect() calls compute_spreads internally; the extra
+                // loop here was a 100 % duplicate that has been removed (CRITICAL-2).
                 let opps = detector.detect(&registry, &uob, &spread_engine, Decimal::from(10));
+                metrics.spreads_evaluated.fetch_add(opps.len() as u64, Ordering::Relaxed);
 
                 for opp in opps {
                     metrics.inc_detected();
@@ -185,7 +214,7 @@ async fn main() -> Result<()> {
                         mercury_config.trading.max_single_trade_pct,
                     );
 
-                    let open_positions = db.get_open_positions().await.map(|p| p.len()).unwrap_or(0);
+                    // Use the per-tick cached count — no DB round-trip per opportunity.
                     let involves_poly = matches!(opp.leg_a.platform, Platform::Polymarket | Platform::PolymarketUs)
                         || matches!(opp.leg_b.platform, Platform::Polymarket | Platform::PolymarketUs);
 
@@ -196,19 +225,21 @@ async fn main() -> Result<()> {
                         bankroll_manager.drawdown_pct(),
                         bankroll_manager.platform_exposure_pct(&opp.leg_a.platform)
                             .max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)),
-                        open_positions,
+                        cached_open_positions,
                         involves_poly,
                     );
 
                     if !trips.is_empty() {
                         if tg_enabled {
                             for trip in &trips {
-                                let _ = alert_tx.send(AlertMessage::CircuitBreaker {
+                                // Non-blocking send: the alert channel has a 500-slot
+                                // buffer; dropping one alert on overflow is acceptable.
+                                let _ = alert_tx.try_send(AlertMessage::CircuitBreaker {
                                     breaker_type: trip.breaker_type.clone(),
                                     details: trip.details.clone(),
                                     action: trip.action.clone(),
                                     resume_at: trip.resume_at,
-                                }).await;
+                                });
                             }
                         }
                         continue;
@@ -220,8 +251,12 @@ async fn main() -> Result<()> {
                             approved_size,
                             risk_score: kelly_frac,
                         };
-                        let _ = opportunity_tx.send(validated).await;
-                        metrics.inc_executed();
+                        // Non-blocking send: if the executor queue is full we skip
+                        // this opportunity rather than blocking the event loop.
+                        if opportunity_tx.try_send(validated).is_ok() {
+                            metrics.inc_executed();
+                            cached_open_positions = cached_open_positions.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -230,7 +265,9 @@ async fn main() -> Result<()> {
                 bankroll_manager.record_trade(&result);
                 circuit_breakers.record_execution(result.status == TradeStatus::Success);
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
-                let _ = trade_result_tx2.send(result.clone()).await;
+                // Decrement cached counter now that the position is settled.
+                cached_open_positions = cached_open_positions.saturating_sub(1);
+                let _ = trade_result_tx2.try_send(result.clone());
                 match result.status {
                     TradeStatus::Success => metrics.inc_success(),
                     _ => metrics.inc_failed(),
@@ -272,16 +309,19 @@ async fn main() -> Result<()> {
                     db_size_bytes: db_size,
                 };
 
-                if tg_enabled {
-                    let _ = daily_report_tx.send(report).await;
+                // Persist snapshot before resetting counters (BUG-13 fix).
+                let _ = db.insert_daily_snapshot(&report.snapshot).await;
+
+                if tg_reports_enabled {
+                    let _ = daily_report_tx.try_send(report);
                 }
                 bankroll_manager.reset_daily();
             }
 
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutdown signal received");
-                if tg_enabled {
-                    let bot = telegram::bot::TelegramBot::new(tg_bot_token.clone());
+                if tg_alerts_enabled {
+                    let bot = telegram::bot::TelegramBot::new(tg_notification_token.clone());
                     let _ = bot.send_message(&tg_alerts_chat, "MERCURY SHUTTING DOWN - Graceful shutdown initiated.").await;
                 }
                 info!("MERCURY shutdown complete");

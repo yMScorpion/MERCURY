@@ -65,7 +65,7 @@ impl PlatformBook {
         self.asks.clear();
 
         for level in &tick.book_depth {
-            if level.price <= tick.mid_price {
+            if level.price < tick.mid_price {
                 self.bids.insert(level.price, level.size);
             } else {
                 self.asks.insert(level.price, level.size);

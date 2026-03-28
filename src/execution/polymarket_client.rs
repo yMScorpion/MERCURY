@@ -55,8 +55,13 @@ impl PolymarketClient {
         api_secret: String,
         api_passphrase: String,
     ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build Polymarket HTTP client");
         Self {
-            http: reqwest::Client::new(),
+            http,
             rest_url,
             signer,
             api_key,

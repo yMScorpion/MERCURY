@@ -31,8 +31,12 @@ impl KellyCalculator {
         }
         let p = exec_probability;
         let q = Decimal::ONE - p;
-        let b = net_spread;
-        let full_kelly = (p * b - q) / b;
+        // Arb-aware Kelly: on execution failure we lose only the fees paid on the
+        // failed leg (~0.5% of notional), not the full notional.  Using net_spread
+        // as `b` in the standard formula (which assumes full-notional loss) produces
+        // near-zero fractions for any realistic spread and kills all trading.
+        let arb_loss_fraction = dec!(0.005); // 0.5 % max loss on execution failure
+        let full_kelly = (p * net_spread - q * arb_loss_fraction) / (net_spread + arb_loss_fraction);
         if full_kelly <= Decimal::ZERO {
             return Decimal::ZERO;
         }

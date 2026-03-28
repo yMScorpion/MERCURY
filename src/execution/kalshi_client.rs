@@ -55,7 +55,12 @@ struct KalshiError {
 
 impl KalshiClient {
     pub fn new(rest_url: String, auth: KalshiAuth) -> Self {
-        Self { http: reqwest::Client::new(), rest_url, auth }
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build Kalshi HTTP client");
+        Self { http, rest_url, auth }
     }
 }
 
