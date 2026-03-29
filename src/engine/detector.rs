@@ -99,11 +99,13 @@ impl ArbitrageDetector {
                         let log_liq = if liquidity > Decimal::ZERO {
                             // Add 1.0 to the natural log so a liquidity of 1.0 yields a multiplier of 1.0 (ln(1) = 0 + 1 = 1)
                             let val = liquidity.to_f64().unwrap_or(1.0).ln() + 1.0;
-                            Decimal::from_str(&format!("{:.4}", val.max(0.1))).unwrap_or(Decimal::ONE)
+                            // Natively cast f64 to Decimal to eliminate string allocation in the hot path
+                            Decimal::try_from(val.max(0.1)).unwrap_or(Decimal::ONE)
                         } else {
                             Decimal::ONE
                         };
-                        let score = spread.net_spread * log_liq * Decimal::from_str(&format!("{:.4}", pair.confidence)).unwrap_or(Decimal::ONE);
+                        let confidence_dec = Decimal::try_from(pair.confidence).unwrap_or(Decimal::ONE);
+                        let score = spread.net_spread * log_liq * confidence_dec;
 
                         opportunities.push(ArbitrageOpportunity {
                             opp_id: Uuid::new_v4(),

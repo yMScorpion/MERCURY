@@ -688,9 +688,17 @@ loop {
             match tokio::time::timeout(remaining, trade_result_rx.recv()).await {
                 Ok(Some(result)) => {
                     bankroll_manager.record_trade(&result);
-                    bankroll_manager.remove_exposure(result.leg_a_platform, result.leg_a_size);
-                    bankroll_manager.remove_exposure(result.leg_b_platform, result.leg_b_size);
-                    cached_open_positions = cached_open_positions.saturating_sub(1);
+                    
+                    // Fix: Use the originally reserved size for exposure removal
+                    let reserved_per_leg = result.approved_size / rust_decimal_macros::dec!(2.0);
+                    bankroll_manager.remove_exposure(result.leg_a_platform, reserved_per_leg);
+                    bankroll_manager.remove_exposure(result.leg_b_platform, reserved_per_leg);
+                    
+                    // Fix: Only decrement open positions if the trade completely failed
+                    if result.status == TradeStatus::Fail {
+                        cached_open_positions = cached_open_positions.saturating_sub(1);
+                    }
+                    
                     if let Err(e) = trade_result_tx2.try_send(result) {
                         error!(error = %e, "Position tracker channel full during drain");
                     }
