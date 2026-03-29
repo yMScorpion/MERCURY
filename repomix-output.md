@@ -568,329 +568,6 @@ pub mod cdna_client;
 pub mod forecastex_client;
 ````
 
-## File: src/feeds/discovery.rs
-````rust
-//! Market discovery: polls platform REST APIs, matches equivalent markets
-//! cross-platform, and registers them in the MarketRegistry.
-
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use std::collections::HashMap;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-
-use crate::config::PlatformsConfig;
-use crate::feeds::normalizer::compute_unified_market_id;
-use crate::types::*;
-
-/// Discovered market from a single platform before cross-matching.
-#[derive(Debug, Clone)]
-struct DiscoveredMarket {
-    platform: Platform,
-    platform_market_id: String,
-    question: String,
-    /// Normalized question for fuzzy matching (lowercase, trimmed, stripped punctuation).
-    question_normalized: String,
-    resolution_source: String,
-    expiration: DateTime<Utc>,
-    category: MarketCategory,
-    fee_rate_bps: u16,
-    min_order_size: Decimal,
-    tick_size: Decimal,
-}
-
-/// Result of the discovery cycle: a fully matched cross-platform market.
-#[derive(Debug, Clone)]
-pub struct MatchedMarket {
-    pub market: Market,
-}
-
-pub struct MarketDiscovery {
-    platforms_config: PlatformsConfig,
-    http: reqwest::Client,
-    poll_interval: Duration,
-}
-
-impl MarketDiscovery {
-    pub fn new(platforms_config: PlatformsConfig, poll_interval_secs: u64) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("mercury-discovery/1.0")
-            .build()
-            .expect("failed to build discovery HTTP client");
-        Self {
-            platforms_config,
-            http,
-            poll_interval: Duration::from_secs(poll_interval_secs),
-        }
-    }
-
-    /// Run the discovery loop, sending matched markets to the registry channel.
-    pub async fn run(self, matched_tx: mpsc::Sender<MatchedMarket>) {
-        info!(
-            interval_secs = self.poll_interval.as_secs(),
-            "Market discovery started"
-        );
-
-        // First fetch is immediate.
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now(),
-            self.poll_interval,
-        );
-
-        loop {
-            ticker.tick().await;
-
-            match self.discover_and_match().await {
-                Ok(matched) => {
-                    info!(count = matched.len(), "Discovery cycle complete");
-                    for m in matched {
-                        if matched_tx.try_send(m).is_err() {
-                            warn!("Matched market channel full — skipping");
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "Market discovery cycle failed");
-                }
-            }
-        }
-    }
-
-    async fn discover_and_match(&self) -> Result<Vec<MatchedMarket>> {
-        let mut all_discovered: Vec<DiscoveredMarket> = Vec::new();
-
-        if self.platforms_config.polymarket.enabled {
-            match self.fetch_polymarket_markets().await {
-                Ok(markets) => {
-                    info!(count = markets.len(), "Polymarket markets fetched");
-                    all_discovered.extend(markets);
-                }
-                Err(e) => warn!(error = %e, "Failed to fetch Polymarket markets"),
-            }
-        }
-
-        if self.platforms_config.kalshi.enabled {
-            match self.fetch_kalshi_markets().await {
-                Ok(markets) => {
-                    info!(count = markets.len(), "Kalshi markets fetched");
-                    all_discovered.extend(markets);
-                }
-                Err(e) => warn!(error = %e, "Failed to fetch Kalshi markets"),
-            }
-        }
-
-        // Group by normalized question for cross-platform matching.
-        let mut by_question: HashMap<String, Vec<DiscoveredMarket>> = HashMap::new();
-        for dm in &all_discovered {
-            by_question
-                .entry(dm.question_normalized.clone())
-                .or_default()
-                .push(dm.clone());
-        }
-
-        let mut matched = Vec::new();
-        for (_norm_q, group) in &by_question {
-            // Only create an arb-eligible market if ≥2 platforms carry it.
-            let platforms_present: Vec<Platform> =
-                group.iter().map(|g| g.platform).collect::<std::collections::HashSet<_>>()
-                    .into_iter().collect();
-            if platforms_present.len() < 2 {
-                continue;
-            }
-
-            let first = &group[0];
-            let unified_id = compute_unified_market_id(
-                &first.question,
-                &first.resolution_source,
-                &first.expiration.to_rfc3339(),
-            );
-
-            let mut platform_infos: HashMap<Platform, PlatformMarketInfo> = HashMap::new();
-            for dm in group {
-                platform_infos.insert(
-                    dm.platform,
-                    PlatformMarketInfo {
-                        platform: dm.platform,
-                        platform_market_id: dm.platform_market_id.clone(),
-                        fee_rate_bps: dm.fee_rate_bps,
-                        min_order_size: dm.min_order_size,
-                        tick_size: dm.tick_size,
-                    },
-                );
-            }
-
-            // Verify expirations are within 48 hours of each other.
-            // Two markets with the same question but different expiry dates
-            // are NOT the same event — trading them as an arb pair guarantees losses.
-            let expirations: Vec<DateTime<Utc>> = group.iter().map(|dm| dm.expiration).collect();
-            let min_exp = expirations.iter().min().copied().unwrap_or(first.expiration);
-            let max_exp = expirations.iter().max().copied().unwrap_or(first.expiration);
-            let exp_diff_hours = (max_exp - min_exp).num_hours().abs();
-            if exp_diff_hours > 48 {
-                warn!(
-                    question = %first.question,
-                    exp_diff_hours,
-                    "Skipping cross-platform match — expiration mismatch ({} hours apart)",
-                    exp_diff_hours
-                );
-                continue;
-            }
-
-            // Scale confidence by how close the expirations are
-            let confidence = if exp_diff_hours == 0 { 0.98 } else { 0.95 };
-
-            let market = Market {
-                unified_id,
-                question: first.question.clone(),
-                resolution_source: first.resolution_source.clone(),
-                expiration: first.expiration,
-                platforms: platform_infos,
-                category: first.category,
-                confidence,
-                status: MarketStatus::Active,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
-
-            matched.push(MatchedMarket { market });
-        }
-
-        Ok(matched)
-    }
-
-    fn normalize_question(q: &str) -> String {
-        q.to_lowercase()
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<&str>>()
-            .join(" ")
-    }
-
-    async fn fetch_polymarket_markets(&self) -> Result<Vec<DiscoveredMarket>> {
-        // Polymarket CLOB API: GET /markets
-        let url = format!("{}/markets", self.platforms_config.polymarket.rest_url);
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .query(&[("active", "true"), ("limit", "100")])
-            .send()
-            .await
-            .context("Polymarket markets fetch failed")?
-            .json()
-            .await
-            .context("Polymarket markets parse failed")?;
-
-        let mut markets = Vec::new();
-        if let Some(arr) = resp.as_array() {
-            for item in arr {
-                let question = item
-                    .get("question")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if question.is_empty() {
-                    continue;
-                }
-                let token_id = item
-                    .get("condition_id")
-                    .or_else(|| item.get("token_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if token_id.is_empty() {
-                    continue;
-                }
-                let end_date = item
-                    .get("end_date_iso")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
-
-                markets.push(DiscoveredMarket {
-                    platform: Platform::Polymarket,
-                    platform_market_id: token_id,
-                    question_normalized: Self::normalize_question(&question),
-                    question,
-                    resolution_source: "polymarket".into(),
-                    expiration: end_date,
-                    category: MarketCategory::Other,
-                    fee_rate_bps: 200,
-                    min_order_size: Decimal::ONE,
-                    tick_size: Decimal::new(1, 2), // 0.01
-                });
-            }
-        }
-        Ok(markets)
-    }
-
-    async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {
-        let url = format!("{}/markets", self.platforms_config.kalshi.rest_url);
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .query(&[("status", "open"), ("limit", "100")])
-            .send()
-            .await
-            .context("Kalshi markets fetch failed")?
-            .json()
-            .await
-            .context("Kalshi markets parse failed")?;
-
-        let mut markets = Vec::new();
-        if let Some(arr) = resp
-            .get("markets")
-            .and_then(|v| v.as_array())
-        {
-            for item in arr {
-                let title = item
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if title.is_empty() {
-                    continue;
-                }
-                let ticker = item
-                    .get("ticker")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if ticker.is_empty() {
-                    continue;
-                }
-                let close_time = item
-                    .get("close_time")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
-
-                markets.push(DiscoveredMarket {
-                    platform: Platform::Kalshi,
-                    platform_market_id: ticker,
-                    question_normalized: Self::normalize_question(&title),
-                    question: title,
-                    resolution_source: "kalshi".into(),
-                    expiration: close_time,
-                    category: MarketCategory::Other,
-                    fee_rate_bps: 175,
-                    min_order_size: Decimal::ONE,
-                    tick_size: Decimal::new(1, 2),
-                });
-            }
-        }
-        Ok(markets)
-    }
-}
-````
-
 ## File: src/inventory/reconciler.rs
 ````rust
 use anyhow::Result;
@@ -1781,6 +1458,329 @@ impl MarketRegistry {
 }
 ````
 
+## File: src/feeds/discovery.rs
+````rust
+//! Market discovery: polls platform REST APIs, matches equivalent markets
+//! cross-platform, and registers them in the MarketRegistry.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+
+use crate::config::PlatformsConfig;
+use crate::feeds::normalizer::compute_unified_market_id;
+use crate::types::*;
+
+/// Discovered market from a single platform before cross-matching.
+#[derive(Debug, Clone)]
+struct DiscoveredMarket {
+    platform: Platform,
+    platform_market_id: String,
+    question: String,
+    /// Normalized question for fuzzy matching (lowercase, trimmed, stripped punctuation).
+    question_normalized: String,
+    resolution_source: String,
+    expiration: DateTime<Utc>,
+    category: MarketCategory,
+    fee_rate_bps: u16,
+    min_order_size: Decimal,
+    tick_size: Decimal,
+}
+
+/// Result of the discovery cycle: a fully matched cross-platform market.
+#[derive(Debug, Clone)]
+pub struct MatchedMarket {
+    pub market: Market,
+}
+
+pub struct MarketDiscovery {
+    platforms_config: PlatformsConfig,
+    http: reqwest::Client,
+    poll_interval: Duration,
+}
+
+impl MarketDiscovery {
+    pub fn new(platforms_config: PlatformsConfig, poll_interval_secs: u64) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .user_agent("mercury-discovery/1.0")
+            .build()
+            .expect("failed to build discovery HTTP client");
+        Self {
+            platforms_config,
+            http,
+            poll_interval: Duration::from_secs(poll_interval_secs),
+        }
+    }
+
+    /// Run the discovery loop, sending matched markets to the registry channel.
+    pub async fn run(self, matched_tx: mpsc::Sender<MatchedMarket>) {
+        info!(
+            interval_secs = self.poll_interval.as_secs(),
+            "Market discovery started"
+        );
+
+        // First fetch is immediate.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now(),
+            self.poll_interval,
+        );
+
+        loop {
+            ticker.tick().await;
+
+            match self.discover_and_match().await {
+                Ok(matched) => {
+                    info!(count = matched.len(), "Discovery cycle complete");
+                    for m in matched {
+                        if matched_tx.try_send(m).is_err() {
+                            warn!("Matched market channel full — skipping");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Market discovery cycle failed");
+                }
+            }
+        }
+    }
+
+    async fn discover_and_match(&self) -> Result<Vec<MatchedMarket>> {
+        let mut all_discovered: Vec<DiscoveredMarket> = Vec::new();
+
+        if self.platforms_config.polymarket.enabled {
+            match self.fetch_polymarket_markets().await {
+                Ok(markets) => {
+                    info!(count = markets.len(), "Polymarket markets fetched");
+                    all_discovered.extend(markets);
+                }
+                Err(e) => warn!(error = %e, "Failed to fetch Polymarket markets"),
+            }
+        }
+
+        if self.platforms_config.kalshi.enabled {
+            match self.fetch_kalshi_markets().await {
+                Ok(markets) => {
+                    info!(count = markets.len(), "Kalshi markets fetched");
+                    all_discovered.extend(markets);
+                }
+                Err(e) => warn!(error = %e, "Failed to fetch Kalshi markets"),
+            }
+        }
+
+        // Group by normalized question for cross-platform matching.
+        let mut by_question: HashMap<String, Vec<DiscoveredMarket>> = HashMap::new();
+        for dm in &all_discovered {
+            by_question
+                .entry(dm.question_normalized.clone())
+                .or_default()
+                .push(dm.clone());
+        }
+
+        let mut matched = Vec::new();
+        for (_norm_q, group) in &by_question {
+            // Only create an arb-eligible market if ≥2 platforms carry it.
+            let platforms_present: Vec<Platform> =
+                group.iter().map(|g| g.platform).collect::<std::collections::HashSet<_>>()
+                    .into_iter().collect();
+            if platforms_present.len() < 2 {
+                continue;
+            }
+
+            let first = &group[0];
+            let unified_id = compute_unified_market_id(
+                &first.question,
+                &first.resolution_source,
+                &first.expiration.to_rfc3339(),
+            );
+
+            let mut platform_infos: HashMap<Platform, PlatformMarketInfo> = HashMap::new();
+            for dm in group {
+                platform_infos.insert(
+                    dm.platform,
+                    PlatformMarketInfo {
+                        platform: dm.platform,
+                        platform_market_id: dm.platform_market_id.clone(),
+                        fee_rate_bps: dm.fee_rate_bps,
+                        min_order_size: dm.min_order_size,
+                        tick_size: dm.tick_size,
+                    },
+                );
+            }
+
+            // Verify expirations are within 48 hours of each other.
+            // Two markets with the same question but different expiry dates
+            // are NOT the same event — trading them as an arb pair guarantees losses.
+            let expirations: Vec<DateTime<Utc>> = group.iter().map(|dm| dm.expiration).collect();
+            let min_exp = expirations.iter().min().copied().unwrap_or(first.expiration);
+            let max_exp = expirations.iter().max().copied().unwrap_or(first.expiration);
+            let exp_diff_hours = (max_exp - min_exp).num_hours().abs();
+            if exp_diff_hours > 48 {
+                warn!(
+                    question = %first.question,
+                    exp_diff_hours,
+                    "Skipping cross-platform match — expiration mismatch ({} hours apart)",
+                    exp_diff_hours
+                );
+                continue;
+            }
+
+            // Scale confidence by how close the expirations are
+            let confidence = if exp_diff_hours == 0 { 0.98 } else { 0.95 };
+
+            let market = Market {
+                unified_id,
+                question: first.question.clone(),
+                resolution_source: first.resolution_source.clone(),
+                expiration: first.expiration,
+                platforms: platform_infos,
+                category: first.category,
+                confidence,
+                status: MarketStatus::Active,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+
+            matched.push(MatchedMarket { market });
+        }
+
+        Ok(matched)
+    }
+
+    fn normalize_question(q: &str) -> String {
+        q.to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ")
+    }
+
+    async fn fetch_polymarket_markets(&self) -> Result<Vec<DiscoveredMarket>> {
+        // Polymarket CLOB API: GET /markets
+        let url = format!("{}/markets", self.platforms_config.polymarket.rest_url);
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[("active", "true"), ("limit", "1000")])
+            .send()
+            .await
+            .context("Polymarket markets fetch failed")?
+            .json()
+            .await
+            .context("Polymarket markets parse failed")?;
+
+        let mut markets = Vec::new();
+        if let Some(arr) = resp.as_array() {
+            for item in arr {
+                let question = item
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if question.is_empty() {
+                    continue;
+                }
+                let token_id = item
+                    .get("condition_id")
+                    .or_else(|| item.get("token_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if token_id.is_empty() {
+                    continue;
+                }
+                let end_date = item
+                    .get("end_date_iso")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
+
+                markets.push(DiscoveredMarket {
+                    platform: Platform::Polymarket,
+                    platform_market_id: token_id,
+                    question_normalized: Self::normalize_question(&question),
+                    question,
+                    resolution_source: "polymarket".into(),
+                    expiration: end_date,
+                    category: MarketCategory::Other,
+                    fee_rate_bps: 200,
+                    min_order_size: Decimal::ONE,
+                    tick_size: Decimal::new(1, 2), // 0.01
+                });
+            }
+        }
+        Ok(markets)
+    }
+
+    async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {
+        let url = format!("{}/markets", self.platforms_config.kalshi.rest_url);
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            .query(&[("status", "open"), ("limit", "1000")])
+            .send()
+            .await
+            .context("Kalshi markets fetch failed")?
+            .json()
+            .await
+            .context("Kalshi markets parse failed")?;
+
+        let mut markets = Vec::new();
+        if let Some(arr) = resp
+            .get("markets")
+            .and_then(|v| v.as_array())
+        {
+            for item in arr {
+                let title = item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if title.is_empty() {
+                    continue;
+                }
+                let ticker = item
+                    .get("ticker")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if ticker.is_empty() {
+                    continue;
+                }
+                let close_time = item
+                    .get("close_time")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
+
+                markets.push(DiscoveredMarket {
+                    platform: Platform::Kalshi,
+                    platform_market_id: ticker,
+                    question_normalized: Self::normalize_question(&title),
+                    question: title,
+                    resolution_source: "kalshi".into(),
+                    expiration: close_time,
+                    category: MarketCategory::Other,
+                    fee_rate_bps: 175,
+                    min_order_size: Decimal::ONE,
+                    tick_size: Decimal::new(1, 2),
+                });
+            }
+        }
+        Ok(markets)
+    }
+}
+````
+
 ## File: src/feeds/mod.rs
 ````rust
 pub mod base;
@@ -2149,60 +2149,6 @@ impl Metrics {
         now.saturating_sub(last) / 1_000_000
     }
 }
-````
-
-## File: Cargo.toml
-````toml
-[package]
-name = "mercury"
-version = "0.1.0"
-edition = "2021"
-description = "Cross-market prediction arbitrage engine"
-
-[dependencies]
-native-tls = "0.2"
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-rusqlite = { version = "0.31", features = ["bundled", "serde_json", "backup"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.24"
-ethers = { version = "2", features = ["legacy"] }
-jsonwebtoken = "9"
-rsa = { version = "0.9", features = ["pem"] }
-ring = "0.17"
-aes-gcm = "0.10"
-rust_decimal = { version = "1", features = ["serde-with-str"] }
-rust_decimal_macros = "1"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-notify = "6"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-anyhow = "1"
-thiserror = "1"
-async-trait = "0.1"
-futures-util = "0.3"
-url = "2"
-hex = "0.4"
-base64 = "0.22"
-rand = "0.8"
-sha2 = "0.10"
-argon2 = "0.5"
-zeroize = { version = "1", features = ["derive"] }
-secrecy = "0.8"
-tokio-util = "0.7"
-clap = { version = "4", features = ["derive"] }
-tracing-appender = "0.2.4"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
 ````
 
 ## File: config/default.yaml
@@ -3142,184 +3088,6 @@ pub mod gas_oracle;
 pub mod backup;
 ````
 
-## File: src/risk/bankroll.rs
-````rust
-use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-use std::collections::HashMap;
-use tracing::info;
-
-use crate::types::*;
-
-pub struct BankrollManager {
-    total_bankroll: Decimal,
-    peak_bankroll: Decimal,
-    platform_balances: HashMap<Platform, Decimal>,
-    platform_exposure: HashMap<Platform, Decimal>,
-    daily_pnl: Decimal,
-    daily_start_bankroll: Decimal,
-    daily_fees: Decimal,
-    day_start: DateTime<Utc>,
-    trades_today: i32,
-    success_today: i32,
-    fail_today: i32,
-    exec_success_rate: Decimal,
-    exec_history: Vec<bool>,
-}
-
-impl BankrollManager {
-    pub fn new(initial_bankroll: Decimal) -> Self {
-        Self {
-            total_bankroll: initial_bankroll,
-            peak_bankroll: initial_bankroll,
-            platform_balances: HashMap::new(),
-            platform_exposure: HashMap::new(),
-            daily_pnl: Decimal::ZERO,
-            daily_start_bankroll: initial_bankroll,
-            daily_fees: Decimal::ZERO,
-            day_start: Utc::now(),
-            trades_today: 0,
-            success_today: 0,
-            fail_today: 0,
-            exec_success_rate: dec!(0.90),
-            exec_history: Vec::new(),
-        }
-    }
-
-    pub fn total_bankroll(&self) -> Decimal { self.total_bankroll }
-    pub fn peak_bankroll(&self) -> Decimal { self.peak_bankroll }
-    pub fn daily_pnl(&self) -> Decimal { self.daily_pnl }
-    pub fn daily_fees(&self) -> Decimal { self.daily_fees }
-    pub fn trades_today(&self) -> i32 { self.trades_today }
-    pub fn success_today(&self) -> i32 { self.success_today }
-    pub fn fail_today(&self) -> i32 { self.fail_today }
-    pub fn exec_success_rate(&self) -> Decimal { self.exec_success_rate }
-
-    pub fn drawdown_pct(&self) -> Decimal {
-        if self.peak_bankroll > Decimal::ZERO {
-            (self.peak_bankroll - self.total_bankroll) / self.peak_bankroll * Decimal::from(100)
-        } else {
-            Decimal::ZERO
-        }
-    }
-
-    pub fn daily_loss_pct(&self) -> Decimal {
-        // Only trigger the loss percentage calculation if PnL is actually negative
-        if self.daily_start_bankroll > Decimal::ZERO && self.daily_pnl < Decimal::ZERO {
-            (self.daily_pnl.abs() / self.daily_start_bankroll) * Decimal::from(100)
-        } else {
-            Decimal::ZERO
-        }
-    }
-
-    pub fn platform_exposure(&self, platform: &Platform) -> Decimal {
-        self.platform_exposure.get(platform).copied().unwrap_or(Decimal::ZERO)
-    }
-
-    pub fn platform_exposure_pct(&self, platform: &Platform) -> Decimal {
-        if self.total_bankroll > Decimal::ZERO {
-            self.platform_exposure(platform) / self.total_bankroll
-        } else {
-            Decimal::ZERO
-        }
-    }
-
-    pub fn total_exposure(&self) -> Decimal {
-        self.platform_exposure.values().sum()
-    }
-
-    pub fn total_exposure_pct(&self) -> Decimal {
-        if self.total_bankroll > Decimal::ZERO {
-            self.total_exposure() / self.total_bankroll
-        } else {
-            Decimal::ZERO
-        }
-    }
-
-    pub fn record_trade(&mut self, result: &TradeResult) {
-        self.daily_pnl += result.profit;
-        self.daily_fees += result.leg_a_fee + result.leg_b_fee;
-        self.total_bankroll += result.profit;
-        self.trades_today += 1;
-
-        match result.status {
-            TradeStatus::Success => {
-                self.success_today += 1;
-                self.exec_history.push(true);
-            }
-            TradeStatus::Fail | TradeStatus::Partial => {
-                self.fail_today += 1;
-                self.exec_history.push(false);
-            }
-        }
-
-        if self.total_bankroll > self.peak_bankroll {
-            self.peak_bankroll = self.total_bankroll;
-        }
-
-        if self.exec_history.len() > 100 {
-            self.exec_history.drain(0..self.exec_history.len() - 100);
-        }
-        if !self.exec_history.is_empty() {
-            let successes = self.exec_history.iter().filter(|&&s| s).count();
-            self.exec_success_rate = Decimal::from(successes as u64) / Decimal::from(self.exec_history.len() as u64);
-        }
-
-        info!(profit = %result.profit, bankroll = %self.total_bankroll, daily_pnl = %self.daily_pnl, "Trade recorded");
-    }
-
-    pub fn add_exposure(&mut self, platform: Platform, amount: Decimal) {
-        *self.platform_exposure.entry(platform).or_insert(Decimal::ZERO) += amount;
-    }
-
-    pub fn remove_exposure(&mut self, platform: Platform, amount: Decimal) {
-        if let Some(exp) = self.platform_exposure.get_mut(&platform) {
-            *exp = (*exp - amount).max(Decimal::ZERO);
-        }
-    }
-
-    pub fn reset_daily(&mut self) {
-        self.daily_pnl = Decimal::ZERO;
-        self.daily_fees = Decimal::ZERO;
-        self.daily_start_bankroll = self.total_bankroll;
-        self.trades_today = 0;
-        self.success_today = 0;
-        self.fail_today = 0;
-        self.day_start = Utc::now();
-        // Reset the peak so drawdown is measured within the current day only.
-        // Without this, a single historical loss permanently suppresses Kelly
-        // sizing even after recovery ("fear lock").
-        self.peak_bankroll = self.total_bankroll;
-        info!(bankroll = %self.total_bankroll, "Daily counters reset");
-    }
-
-    pub fn daily_snapshot(&self, kelly_utilization: Decimal) -> DailySnapshot {
-        let success_rate = if self.trades_today > 0 {
-            Decimal::from(self.success_today) / Decimal::from(self.trades_today)
-        } else {
-            Decimal::ZERO
-        };
-
-        DailySnapshot {
-            date: Utc::now().date_naive(),
-            bankroll: self.total_bankroll,
-            gross_pnl: self.daily_pnl + self.daily_fees,
-            fees_paid: self.daily_fees,
-            net_pnl: self.daily_pnl,
-            trades_count: self.trades_today,
-            success_count: self.success_today,
-            fail_count: self.fail_today,
-            success_rate,
-            peak_bankroll: self.peak_bankroll,
-            drawdown_pct: self.drawdown_pct(),
-            kelly_utilization,
-            report_sent: false,
-        }
-    }
-}
-````
-
 ## File: src/risk/circuit_breaker.rs
 ````rust
 use chrono::{DateTime, Duration, Utc};
@@ -3756,15 +3524,22 @@ impl TelegramBot {
         // then release the lock before sleeping so other callers aren't blocked.
         {
             let sleep_for = {
-                let last = self.last_send.lock().await;
+                let mut last = self.last_send.lock().await;
                 let elapsed = last.elapsed();
                 let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
-                if elapsed < min_interval { Some(min_interval - elapsed) } else { None }
+                if elapsed < min_interval {
+                    let wait = min_interval - elapsed;
+                    // Pre-emptively advance the timer for the NEXT concurrent caller
+                    *last += min_interval;
+                    Some(wait)
+                } else {
+                    *last = Instant::now();
+                    None
+                }
             };
             if let Some(dur) = sleep_for {
                 tokio::time::sleep(dur).await;
             }
-            *self.last_send.lock().await = Instant::now();
         }
 
         // Truncate if too long
@@ -4194,6 +3969,60 @@ pub fn now_ns() -> u64 {
 }
 ````
 
+## File: Cargo.toml
+````toml
+[package]
+name = "mercury"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-market prediction arbitrage engine"
+
+[dependencies]
+native-tls = "0.2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rusqlite = { version = "0.31", features = ["bundled", "serde_json", "backup"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+ethers = { version = "2", features = ["legacy"] }
+jsonwebtoken = "9"
+rsa = { version = "0.9", features = ["pem"] }
+ring = "0.17"
+aes-gcm = "0.10"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+notify = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+url = "2"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.8"
+tokio-util = "0.7"
+clap = { version = "4", features = ["derive"] }
+tracing-appender = "0.2.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+````
+
 ## File: src/db/traits.rs
 ````rust
 use anyhow::Result;
@@ -4247,222 +4076,6 @@ pub trait Database: Send + Sync + 'static {
     async fn db_size_bytes(&self) -> Result<u64>;
     /// Create an atomic backup of the database to the given file path.
     async fn backup_to_file(&self, dest_path: &str) -> Result<()>;
-}
-````
-
-## File: src/engine/detector.rs
-````rust
-use rust_decimal::Decimal;
-use std::str::FromStr;
-use tracing::{debug};
-use uuid::Uuid;
-use rust_decimal::prelude::ToPrimitive;
-
-use crate::engine::market_registry::MarketRegistry;
-use crate::engine::order_book::UnifiedOrderBook;
-use crate::engine::spread::{NetSpreadEngine, SpreadResult};
-use crate::types::*;
-
-/// Rejection reason for the 5-gate pipeline
-#[derive(Debug, Clone)]
-pub enum RejectionReason {
-    BelowSpreadThreshold(Decimal),
-    InsufficientLiquidity { available: Decimal, required: Decimal },
-    StaleData { age_ms: u64, max_ms: u64 },
-    CorrelationExposure { current: Decimal, max: Decimal },
-    RiskBudgetExceeded { reason: String },
-}
-
-/// Detection statistics
-#[derive(Debug, Default)]
-pub struct DetectorStats {
-    pub opportunities_detected: u64,
-    pub gate1_rejected: u64,
-    pub gate2_rejected: u64,
-    pub gate3_rejected: u64,
-    pub gate4_rejected: u64,
-    pub gate5_rejected: u64,
-    pub opportunities_passed: u64,
-}
-
-pub struct ArbitrageDetector {
-    min_spread: Decimal,
-    min_order_size: Decimal,
-    stale_timeout_ms: u64,
-    max_concurrent: usize,
-    active_arbs: usize,
-    pub stats: DetectorStats,
-}
-
-impl ArbitrageDetector {
-    pub fn new(
-        min_spread: Decimal,
-        min_order_size: Decimal,
-        stale_timeout_ms: u64,
-        max_concurrent: usize,
-    ) -> Self {
-        Self {
-            min_spread,
-            min_order_size,
-            stale_timeout_ms,
-            max_concurrent,
-            active_arbs: 0,
-            stats: DetectorStats::default(),
-        }
-    }
-
-    pub fn set_active_arbs(&mut self, count: usize) {
-        self.active_arbs = count;
-    }
-
-    /// Evaluates spreads ONLY for the specific market that just updated.
-    pub fn detect_for_market(
-        &mut self,
-        market_id: &Uuid,
-        registry: &MarketRegistry,
-        uob: &UnifiedOrderBook,
-        spread_engine: &NetSpreadEngine,
-        target_size: Decimal,
-    ) -> Vec<ArbitrageOpportunity> {
-        let mut opportunities = Vec::new();
-
-        for pair in registry.get_arb_pairs().iter().filter(|p| p.market_id == *market_id) {
-            let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
-                Some(b) => b,
-                None => continue,
-            };
-            let book_b = match uob.get_book(&pair.market_id, &pair.platform_b) {
-                Some(b) => b,
-                None => continue,
-            };
-
-            let spreads = spread_engine.compute_spreads(book_a, book_b, target_size);
-
-            for spread in spreads {
-                self.stats.opportunities_detected += 1;
-
-                match self.run_gates(&spread, book_a, book_b, pair.confidence) {
-                    Ok(()) => {
-                        self.stats.opportunities_passed += 1;
-
-                        let market_question = registry.get_market(&pair.market_id)
-                            .map(|m| m.question.clone())
-                            .unwrap_or_default();
-
-                        let liquidity = spread.leg_a_available.min(spread.leg_b_available);
-                        let log_liq = if liquidity > Decimal::ZERO {
-                            Decimal::from_str(&format!("{:.4}", (liquidity.to_f64().unwrap_or(1.0)).ln())).unwrap_or(Decimal::ONE)
-                        } else {
-                            Decimal::ONE
-                        };
-                        let score = spread.net_spread * log_liq * Decimal::from_str(&format!("{:.4}", pair.confidence)).unwrap_or(Decimal::ONE);
-
-                        opportunities.push(ArbitrageOpportunity {
-                            opp_id: Uuid::new_v4(),
-                            market_id: spread.market_id,
-                            market_question,
-                            leg_a: LegDetail {
-                                platform: spread.leg_a_platform,
-                                side: spread.leg_a_side,
-                                price: spread.leg_a_price,
-                                available_size: spread.leg_a_available,
-                                fee_estimate: spread.leg_a_fee,
-                                fee_rate_bps: 0, 
-                                // NOTE: Replace this with the actual exchange token ID from the registry when available
-                                platform_market_id: spread.market_id.to_string(), 
-                            },
-                            leg_b: LegDetail {
-                                platform: spread.leg_b_platform,
-                                side: spread.leg_b_side,
-                                price: spread.leg_b_price,
-                                available_size: spread.leg_b_available,
-                                fee_estimate: spread.leg_b_fee,
-                                fee_rate_bps: 0,
-                                // NOTE: Replace this with the actual exchange token ID from the registry when available
-                                platform_market_id: spread.market_id.to_string(), 
-                            },
-                            raw_spread: spread.raw_spread,
-                            net_spread: spread.net_spread,
-                            kelly_fraction: Decimal::ZERO, 
-                            recommended_size: Decimal::ZERO, 
-                            score,
-                            detected_at: now_ns(),
-                            ttl_ms: 5000,
-                        });
-                    }
-                    Err(reason) => {
-                        debug!(?reason, market_id = %spread.market_id, "Opportunity rejected");
-                    }
-                }
-            }
-        }
-
-        opportunities.sort_by(|a, b| b.score.cmp(&a.score));
-        let slots = self.max_concurrent.saturating_sub(self.active_arbs);
-        opportunities.truncate(slots);
-
-        opportunities
-    }
-
-    fn run_gates(
-        &mut self,
-        spread: &SpreadResult,
-        book_a: &crate::engine::order_book::PlatformBook,
-        book_b: &crate::engine::order_book::PlatformBook,
-        confidence: f64,
-    ) -> Result<(), RejectionReason> {
-        if spread.net_spread < self.min_spread {
-            self.stats.gate1_rejected += 1;
-            return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
-        }
-
-        let min_available = spread.leg_a_available.min(spread.leg_b_available);
-        if min_available < self.min_order_size {
-            self.stats.gate2_rejected += 1;
-            return Err(RejectionReason::InsufficientLiquidity {
-                available: min_available,
-                required: self.min_order_size,
-            });
-        }
-
-        let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
-        let now = now_ns();
-
-        let age_a = now.saturating_sub(book_a.last_update_ns);
-        if age_a > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
-            return Err(RejectionReason::StaleData {
-                age_ms: age_a / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
-        }
-
-        let age_b = now.saturating_sub(book_b.last_update_ns);
-        if age_b > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
-            return Err(RejectionReason::StaleData {
-                age_ms: age_b / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
-        }
-
-        if confidence < 0.95 {
-            self.stats.gate4_rejected += 1;
-            return Err(RejectionReason::CorrelationExposure {
-                current: Decimal::ZERO,
-                max: Decimal::ZERO,
-            });
-        }
-
-        if self.active_arbs >= self.max_concurrent {
-            self.stats.gate5_rejected += 1;
-            return Err(RejectionReason::RiskBudgetExceeded {
-                reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
-            });
-        }
-
-        Ok(())
-    }
 }
 ````
 
@@ -4658,347 +4271,6 @@ impl NetSpreadEngine {
         let gas_units = Decimal::from(200_000);
         let gwei_to_matic = dec!(0.000000001); // 1 gwei = 10^-9 MATIC
         self.gas_price_gwei * gas_units * gwei_to_matic * self.matic_price_usd
-    }
-}
-````
-
-## File: src/execution/executor.rs
-````rust
-use anyhow::Result;
-use chrono::Utc;
-use rust_decimal::Decimal;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-use rust_decimal::prelude::ToPrimitive;
-
-use crate::db::Database;
-use crate::types::*;
-use super::polymarket_client::PolymarketClient;
-use super::kalshi_client::KalshiClient;
-use super::cdna_client::CdnaClient;
-use super::forecastex_client::ForecastExClient;
-
-#[derive(Debug, Clone)]
-pub struct OrderResult {
-    pub filled: bool,
-    pub fill_price: Decimal,
-    pub fill_size: Decimal,
-    pub fee: Decimal,
-    pub order_id: String,
-    pub error: Option<String>,
-}
-
-#[async_trait::async_trait]
-pub trait PlatformOrderClient: Send + Sync {
-    async fn submit_order(
-        &self,
-        market_id: &str,
-        side: Side,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: u32,
-    ) -> Result<OrderResult>;
-
-    async fn cancel_order(&self, order_id: &str) -> Result<()>;
-}
-
-pub struct ExecutionEngine {
-    rx: mpsc::Receiver<ValidatedOpportunity>,
-    trade_result_tx: mpsc::Sender<TradeResult>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    db: Arc<dyn Database>,
-    polymarket_client: Option<PolymarketClient>,
-    kalshi_client: Option<KalshiClient>,
-    cdna_client: Option<CdnaClient>,
-    forecastex_client: Option<ForecastExClient>,
-    trade_counter: i64,
-    bankroll: Decimal,
-}
-
-impl ExecutionEngine {
-    pub fn new(
-        rx: mpsc::Receiver<ValidatedOpportunity>,
-        trade_result_tx: mpsc::Sender<TradeResult>,
-        alert_tx: mpsc::Sender<AlertMessage>,
-        db: Arc<dyn Database>,
-        polymarket_client: Option<PolymarketClient>,
-        kalshi_client: Option<KalshiClient>,
-        cdna_client: Option<CdnaClient>,
-        forecastex_client: Option<ForecastExClient>,
-        initial_bankroll: Decimal,
-        initial_trade_count: i64,
-    ) -> Self {
-        Self {
-            rx,
-            trade_result_tx,
-            alert_tx,
-            db,
-            polymarket_client,
-            kalshi_client,
-            cdna_client,
-            forecastex_client,
-            trade_counter: initial_trade_count,
-            bankroll: initial_bankroll,
-        }
-    }
-
-    pub async fn run(mut self) {
-        info!("Execution engine started");
-        while let Some(opp) = self.rx.recv().await {
-            if let Err(e) = self.execute_arbitrage(opp).await {
-                error!(error = %e, "Arbitrage execution error");
-            }
-        }
-        info!("Execution engine stopped");
-    }
-
-    async fn execute_arbitrage(&mut self, validated: ValidatedOpportunity) -> Result<()> {
-        let opp = &validated.opportunity;
-        let start = Instant::now();
-        self.trade_counter += 1;
-
-        info!(
-            opp_id = %opp.opp_id,
-            market = %opp.market_question,
-            net_spread = %opp.net_spread,
-            size = %validated.approved_size,
-            "Executing arbitrage"
-        );
-
-        let (first_leg, second_leg) = self.order_legs(opp);
-
-        let first_result = self.execute_leg(
-            &first_leg.platform,
-            &first_leg.platform_market_id,
-            first_leg.side,
-            first_leg.price,
-            validated.approved_size,
-            first_leg.fee_rate_bps, // Pass actual BPS rate
-        ).await;
-
-        let (leg_a_result, leg_b_result) = match first_result {
-            Ok(first_fill) if first_fill.filled => {
-                let hedge_size = first_fill.fill_size; 
-                let second_result = self.execute_leg(
-                    &second_leg.platform,
-                    &second_leg.platform_market_id,
-                    second_leg.side,
-                    second_leg.price,
-                    hedge_size,
-                    second_leg.fee_rate_bps, // Pass actual BPS rate
-                ).await;
-
-                match second_result {
-                    Ok(second_fill) if second_fill.filled => {
-                        (first_fill, second_fill)
-                    }
-                    Ok(second_fill) => {
-                        warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
-                        let _ = self.attempt_unwind(
-                            &first_leg.platform,
-                            &opp.market_id.to_string(),
-                            &first_fill,
-                        ).await;
-                        (first_fill, second_fill)
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Hedge leg error, attempting unwind");
-                        let _ = self.attempt_unwind(
-                            &first_leg.platform,
-                            &opp.market_id.to_string(),
-                            &first_fill,
-                        ).await;
-                    let err_str = e.to_string();
-                    let failed = OrderResult {
-                        filled: false,
-                        fill_price: Decimal::ZERO,
-                        fill_size: Decimal::ZERO,
-                        fee: Decimal::ZERO,
-                        order_id: String::new(),
-                        error: Some(err_str.clone()),
-                    };
-                    let failed2 = OrderResult {
-                        filled: false,
-                        fill_price: Decimal::ZERO,
-                        fill_size: Decimal::ZERO,
-                        fee: Decimal::ZERO,
-                        order_id: String::new(),
-                        error: Some(err_str),
-                    };
-                    (failed, failed2)
-                    }
-                }
-            }
-            Ok(first_fill) => {
-                let failed = OrderResult {
-                    filled: false,
-                    fill_price: Decimal::ZERO,
-                    fill_size: Decimal::ZERO,
-                    fee: Decimal::ZERO,
-                    order_id: String::new(),
-                    error: None,
-                };
-                (first_fill, failed)
-            }
-            Err(e) => {
-                error!(error = %e, "First leg execution error");
-                let failed = OrderResult {
-                    filled: false,
-                    fill_price: Decimal::ZERO,
-                    fill_size: Decimal::ZERO,
-                    fee: Decimal::ZERO,
-                    order_id: String::new(),
-                    error: Some(e.to_string()),
-                };
-                let failed2 = failed.clone();
-                (failed, failed2)
-            }
-        };
-
-        let execution_ms = start.elapsed().as_millis() as u64;
-
-        let (status, profit, failure_reason) = self.compute_result(
-            &leg_a_result, &leg_b_result, opp,
-        );
-
-        self.bankroll += profit;
-        let bankroll_change_pct = if self.bankroll > Decimal::ZERO {
-            profit / self.bankroll * Decimal::from(100)
-        } else {
-            Decimal::ZERO
-        };
-
-        let trade_result = TradeResult {
-            trade_id: self.trade_counter,
-            opp_id: opp.opp_id,
-            market_id: opp.market_id,
-            market_question: opp.market_question.clone(),
-            approved_size: validated.approved_size,
-            leg_a_platform: first_leg.platform,
-            leg_a_side: first_leg.side,
-            leg_a_price: first_leg.price,
-            leg_a_size: leg_a_result.fill_size,
-            leg_a_fill_price: leg_a_result.fill_price,
-            leg_a_fee: leg_a_result.fee,
-            leg_b_platform: second_leg.platform,
-            leg_b_side: second_leg.side,
-            leg_b_price: second_leg.price,
-            leg_b_size: leg_b_result.fill_size,
-            leg_b_fill_price: leg_b_result.fill_price,
-            leg_b_fee: leg_b_result.fee,
-            raw_spread: opp.raw_spread,
-            net_spread: opp.net_spread,
-            profit,
-            status,
-            failure_reason,
-            execution_ms,
-            executed_at: Utc::now(),
-            bankroll_after: self.bankroll,
-            bankroll_change_pct,
-        };
-
-        // NOTIFY IMMEDIATELY so we do not block for IO
-        let _ = self.trade_result_tx.send(trade_result.clone()).await;
-        let _ = self.alert_tx.send(AlertMessage::TradeComplete(trade_result.clone())).await;
-
-        // NON-BLOCKING SQL DB INSERT
-        let db_clone = self.db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = db_clone.insert_trade(&trade_result).await {
-                tracing::error!(error = %e, "Failed to persist trade result to database");
-            }
-        });
-
-        Ok(())
-    }
-
-    fn order_legs<'a>(&self, opp: &'a ArbitrageOpportunity) -> (&'a LegDetail, &'a LegDetail) {
-        let a_liquidity = opp.leg_a.available_size;
-        let b_liquidity = opp.leg_b.available_size;
-
-        if a_liquidity <= b_liquidity {
-            (&opp.leg_a, &opp.leg_b) 
-        } else {
-            (&opp.leg_b, &opp.leg_a)
-        }
-    }
-
-    async fn execute_leg(
-        &self,
-        platform: &Platform,
-        market_id: &str,
-        side: Side,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: u32,
-    ) -> Result<OrderResult> {
-        match platform {
-            Platform::Polymarket | Platform::PolymarketUs => {
-                if let Some(client) = &self.polymarket_client {
-                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Polymarket client not configured")
-                }
-            }
-            Platform::Kalshi => {
-                if let Some(client) = &self.kalshi_client {
-                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Kalshi client not configured")
-                }
-            }
-            Platform::Cdna => {
-                if let Some(client) = &self.cdna_client {
-                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("CDNA client not configured")
-                }
-            }
-            Platform::ForecastEx => {
-                if let Some(client) = &self.forecastex_client {
-                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("ForecastEx client not configured")
-                }
-            }
-        }
-    }
-
-    async fn attempt_unwind(
-        &self,
-        platform: &Platform,
-        _market_id: &str,
-        original_fill: &OrderResult,
-    ) -> Result<()> {
-        warn!(
-            platform = %platform,
-            size = %original_fill.fill_size,
-            "Attempting position unwind"
-        );
-        Ok(())
-    }
-
-    fn compute_result(
-        &self,
-        leg_a: &OrderResult,
-        leg_b: &OrderResult,
-        _opp: &ArbitrageOpportunity,
-    ) -> (TradeStatus, Decimal, Option<String>) {
-        if leg_a.filled && leg_b.filled {
-            let total_cost = leg_a.fill_price + leg_b.fill_price;
-            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.min(leg_b.fill_size);
-            let net_profit = gross_profit - leg_a.fee - leg_b.fee;
-            (TradeStatus::Success, net_profit, None)
-        } else if leg_a.filled && !leg_b.filled {
-            let loss = leg_a.fee; 
-            let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
-            (TradeStatus::Fail, -loss, Some(reason))
-        } else {
-            let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
-            (TradeStatus::Fail, Decimal::ZERO, Some(reason))
-        }
     }
 }
 ````
@@ -5359,423 +4631,179 @@ impl ForecastExFeed {
 }
 ````
 
-## File: src/feeds/normalizer.rs
+## File: src/risk/bankroll.rs
 ````rust
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use uuid::Uuid;
+use std::collections::HashMap;
+use tracing::info;
 
 use crate::types::*;
 
-/// Compute a deterministic unified market ID from question + resolution + expiry
-pub fn compute_unified_market_id(question: &str, resolution_source: &str, expiry: &str) -> Uuid {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(question.to_lowercase().as_bytes());
-    hasher.update(b"|");
-    hasher.update(resolution_source.to_lowercase().as_bytes());
-    hasher.update(b"|");
-    hasher.update(expiry.as_bytes());
-    let hash = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
+pub struct BankrollManager {
+    total_bankroll: Decimal,
+    peak_bankroll: Decimal,
+    platform_balances: HashMap<Platform, Decimal>,
+    platform_exposure: HashMap<Platform, Decimal>,
+    daily_pnl: Decimal,
+    daily_start_bankroll: Decimal,
+    daily_fees: Decimal,
+    day_start: DateTime<Utc>,
+    trades_today: i32,
+    success_today: i32,
+    fail_today: i32,
+    exec_success_rate: Decimal,
+    exec_history: Vec<bool>,
 }
 
-/// Calculate Kalshi taker fee for a given contract price (0.01-0.99)
-pub fn kalshi_taker_fee(contract_price: Decimal) -> Decimal {
-    dec!(0.07) * contract_price * (Decimal::ONE - contract_price)
-}
-
-/// Calculate Kalshi maker fee (25% of taker fee)
-pub fn kalshi_maker_fee(contract_price: Decimal) -> Decimal {
-    kalshi_taker_fee(contract_price) * dec!(0.25)
-}
-
-/// Calculate Polymarket fee for given price and fee_rate_bps
-pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
-    let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-    let max_side = price.max(Decimal::ONE - price);
-    rate * quantity * max_side
-}
-
-/// Calculate VWAP slippage for a target order size against order book depth.
-///
-/// `depth` **must** be pre-sorted in fill-walk order by the caller:
-///   - For buys against asks: ascending price (`PlatformBook::ask_depth()`)
-///   - For sells into bids: descending price (`PlatformBook::bid_depth()`)
-///
-/// Returns `None` when the available depth is insufficient to fill `target_size`.
-/// Returns `Some(slippage)` — the absolute VWAP deviation from best quoted price.
-pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<Decimal> {
-    if depth.is_empty() || target_size <= Decimal::ZERO {
-        return Some(Decimal::ZERO);
-    }
-
-    let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();
-    if levels.is_empty() {
-        // Return None to explicitly signal a complete lack of liquidity
-        return None;
-    }
-
-    let best_price = levels[0].price;
-    let mut remaining = target_size;
-    let mut total_cost = Decimal::ZERO;
-
-    for level in &levels {
-        let fill_qty = remaining.min(level.size);
-        total_cost += fill_qty * level.price;
-        remaining -= fill_qty;
-        if remaining <= Decimal::ZERO {
-            break;
-        }
-    }
-
-    if remaining > Decimal::ZERO {
-        return None;
-    }
-
-    let vwap = total_cost / target_size;
-    Some((vwap - best_price).abs())
-}
-````
-
-## File: src/feeds/polymarket.rs
-````rust
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::str::FromStr;
-use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
-use tokio_tungstenite::Connector;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
-
-use super::base::FeedHandler;
-use crate::config::PolymarketConfig;
-use crate::types::*;
-
-pub struct PolymarketFeed {
-    config: PolymarketConfig,
-    subscriptions: Vec<(String, Uuid)>,
-    books: std::collections::HashMap<String, LocalOrderBook>,
-    fee_rates: std::collections::HashMap<String, u16>,
-    sequence: u64,
-}
-
-struct LocalOrderBook {
-    bids: BTreeMap<Decimal, Decimal>,
-    asks: BTreeMap<Decimal, Decimal>,
-    last_trade_price: Decimal,
-}
-
-impl LocalOrderBook {
-    fn new() -> Self {
-        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_trade_price: Decimal::ZERO }
-    }
-
-    /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
-    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
-    }
-
-    /// Returns best ask only if non-empty — never returns phantom (1.0, 0) fallback.
-    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(p, s)| (*p, *s))
-    }
-
-    /// Returns mid-price only when both sides have real liquidity.
-    fn mid_price(&self) -> Option<Decimal> {
-        let (bid, _) = self.best_bid()?;
-        let (ask, _) = self.best_ask()?;
-        Some((bid + ask) / Decimal::from(2))
-    }
-
-    fn depth(&self) -> Vec<PriceLevel> {
-        let mut levels = Vec::with_capacity(20);
-        for (price, size) in self.bids.iter().rev().take(10) {
-            levels.push(PriceLevel { price: *price, size: *size });
-        }
-        for (price, size) in self.asks.iter().take(10) {
-            levels.push(PriceLevel { price: *price, size: *size });
-        }
-        levels
-    }
-
-    fn apply_update(&mut self, side: &str, price: Decimal, size: Decimal) {
-        let book = if side == "BUY" || side == "bid" { &mut self.bids } else { &mut self.asks };
-        if size == Decimal::ZERO {
-            book.remove(&price);
-        } else {
-            book.insert(price, size);
-        }
-    }
-
-    fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
-        self.bids.clear();
-        self.asks.clear();
-        for (p, s) in bids { self.bids.insert(*p, *s); }
-        for (p, s) in asks { self.asks.insert(*p, *s); }
-    }
-}
-
-#[derive(Deserialize)]
-struct WsMessage {
-    #[serde(default)]
-    event_type: String,
-    #[serde(default)]
-    asset_id: String,
-    #[serde(default)]
-    market: String,
-    #[serde(default)]
-    price: Option<String>,
-    #[serde(default)]
-    bids: Option<Vec<PriceSizeEntry>>,
-    #[serde(default)]
-    asks: Option<Vec<PriceSizeEntry>>,
-    #[serde(default)]
-    changes: Option<Vec<BookChange>>,
-}
-
-#[derive(Deserialize)]
-struct PriceSizeEntry {
-    price: String,
-    size: String,
-}
-
-#[derive(Deserialize)]
-struct BookChange {
-    side: String,
-    price: String,
-    size: String,
-}
-
-#[derive(Serialize)]
-struct SubscribeMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    assets_ids: Vec<String>,
-}
-
-impl PolymarketFeed {
-    pub fn new(config: PolymarketConfig, subscriptions: Vec<(String, Uuid)>) -> Self {
+impl BankrollManager {
+    pub fn new(initial_bankroll: Decimal) -> Self {
         Self {
-            config,
-            subscriptions,
-            books: std::collections::HashMap::new(),
-            fee_rates: std::collections::HashMap::new(),
-            sequence: 0,
+            total_bankroll: initial_bankroll,
+            peak_bankroll: initial_bankroll,
+            platform_balances: HashMap::new(),
+            platform_exposure: HashMap::new(),
+            daily_pnl: Decimal::ZERO,
+            daily_start_bankroll: initial_bankroll,
+            daily_fees: Decimal::ZERO,
+            day_start: Utc::now(),
+            trades_today: 0,
+            success_today: 0,
+            fail_today: 0,
+            exec_success_rate: dec!(0.90),
+            exec_history: Vec::new(),
         }
     }
 
-    fn asset_to_market_id(&self, asset_id: &str) -> Option<Uuid> {
-        self.subscriptions.iter()
-            .find(|(a, _)| a == asset_id)
-            .map(|(_, id)| *id)
-    }
+    pub fn total_bankroll(&self) -> Decimal { self.total_bankroll }
+    pub fn peak_bankroll(&self) -> Decimal { self.peak_bankroll }
+    pub fn daily_pnl(&self) -> Decimal { self.daily_pnl }
+    pub fn daily_fees(&self) -> Decimal { self.daily_fees }
+    pub fn trades_today(&self) -> i32 { self.trades_today }
+    pub fn success_today(&self) -> i32 { self.success_today }
+    pub fn fail_today(&self) -> i32 { self.fail_today }
+    pub fn exec_success_rate(&self) -> Decimal { self.exec_success_rate }
 
-    fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
-        let market_id = self.asset_to_market_id(asset_id)?;
-        let book = self.books.get(asset_id)?;
-        // Both sides must be present — phantom fallbacks (bid=0, ask=1) would
-        // make the spread engine see a fake ~100% arb and fire real orders.
-        let bid = book.best_bid()?;
-        let ask = book.best_ask()?;
-        let mid = book.mid_price()?;
-        let fee_bps = self.fee_rates.get(asset_id).copied().unwrap_or(200);
-
-        Some(NormalizedTick {
-            platform: Platform::Polymarket,
-            market_id,
-            timestamp_ns: now_ns(),
-            bid_price: bid.0,
-            bid_size: bid.1,
-            ask_price: ask.0,
-            ask_size: ask.1,
-            mid_price: mid,
-            last_trade_price: book.last_trade_price,
-            last_trade_size: Decimal::ZERO,
-            book_depth: book.depth(),
-            fee_rate_bps: fee_bps,
-            sequence: 0,
-        })
-    }
-}
-
-#[async_trait]
-impl FeedHandler for PolymarketFeed {
-    fn platform(&self) -> Platform {
-        Platform::Polymarket
-    }
-
-    fn clear_books(&mut self) {
-        for book in self.books.values_mut() {
-            book.bids.clear();
-            book.asks.clear();
-        }
-    }
-
-    async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
-        let url = &self.config.ws_url;
-        info!(url, "Connecting to Polymarket WebSocket");
-
-        let tls_connector = native_tls::TlsConnector::builder()
-            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-            .build()
-            .context("Failed to build TLS connector")?;
-        let connector = Connector::NativeTls(tls_connector);
-        let (ws_stream, _) = connect_async_tls_with_config(
-            url,
-            None, // WebSocket config
-            false, // disable_nagle
-            Some(connector),
-        )
-            .await
-            .context("Failed to connect to Polymarket WebSocket")?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        let asset_ids: Vec<String> = self.subscriptions.iter().map(|(a, _)| a.clone()).collect();
-        if !asset_ids.is_empty() {
-            let sub_msg = SubscribeMessage {
-                msg_type: "subscribe".into(),
-                assets_ids: asset_ids.clone(),
-            };
-            let msg_text = serde_json::to_string(&sub_msg)?;
-            write.send(Message::Text(msg_text.into())).await?;
-            info!(count = asset_ids.len(), "Subscribed to Polymarket markets");
-        }
-
-        for (asset_id, _) in &self.subscriptions {
-            self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
-        }
-
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Err(e) = self.handle_message(&text, &tick_tx) {
-                        warn!(error = %e, "Failed to process Polymarket message");
-                    }
-                }
-                Ok(Message::Ping(data)) => {
-                    let _ = write.send(Message::Pong(data)).await;
-                }
-                Ok(Message::Close(_)) => {
-                    info!("Polymarket WebSocket closed by server");
-                    return Ok(());
-                }
-                Err(e) => {
-                    return Err(e).context("Polymarket WebSocket error");
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum PolymarketPayload {
-    Array(Vec<WsMessage>),
-    Single(WsMessage),
-}
-
-impl PolymarketFeed {
-    fn handle_message(
-        &mut self,
-        text: &str,
-        tick_tx: &broadcast::Sender<NormalizedTick>,
-    ) -> Result<()> {
-        match serde_json::from_str::<PolymarketPayload>(text) {
-            Ok(PolymarketPayload::Array(messages)) => {
-                for msg in messages {
-                    self.process_event(&msg, tick_tx);
-                }
-            }
-            Ok(PolymarketPayload::Single(msg)) => {
-                self.process_event(&msg, tick_tx);
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to parse Polymarket WS message");
-            }
-        }
-        Ok(())
-    }
-
-    fn process_event(&mut self, msg: &WsMessage, tick_tx: &broadcast::Sender<NormalizedTick>) {
-        let asset_id = if !msg.asset_id.is_empty() {
-            &msg.asset_id
-        } else if !msg.market.is_empty() {
-            &msg.market
+    pub fn drawdown_pct(&self) -> Decimal {
+        if self.peak_bankroll > Decimal::ZERO {
+            (self.peak_bankroll - self.total_bankroll) / self.peak_bankroll * Decimal::from(100)
         } else {
-            return;
+            Decimal::ZERO
+        }
+    }
+
+    pub fn daily_loss_pct(&self) -> Decimal {
+        // Only trigger the loss percentage calculation if PnL is actually negative
+        if self.daily_start_bankroll > Decimal::ZERO && self.daily_pnl < Decimal::ZERO {
+            (self.daily_pnl.abs() / self.daily_start_bankroll) * Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    pub fn platform_exposure(&self, platform: &Platform) -> Decimal {
+        self.platform_exposure.get(platform).copied().unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn platform_exposure_pct(&self, platform: &Platform) -> Decimal {
+        if self.total_bankroll > Decimal::ZERO {
+            self.platform_exposure(platform) / self.total_bankroll
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    pub fn total_exposure(&self) -> Decimal {
+        self.platform_exposure.values().sum()
+    }
+
+    pub fn total_exposure_pct(&self) -> Decimal {
+        if self.total_bankroll > Decimal::ZERO {
+            self.total_exposure() / self.total_bankroll
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    pub fn record_trade(&mut self, result: &TradeResult) {
+        self.daily_pnl += result.profit;
+        self.daily_fees += result.leg_a_fee + result.leg_b_fee;
+        self.total_bankroll += result.profit;
+        self.trades_today += 1;
+
+        match result.status {
+            TradeStatus::Success => {
+                self.success_today += 1;
+                self.exec_history.push(true);
+            }
+            TradeStatus::Fail | TradeStatus::Partial => {
+                self.fail_today += 1;
+                self.exec_history.push(false);
+            }
+        }
+
+        if self.total_bankroll > self.peak_bankroll {
+            self.peak_bankroll = self.total_bankroll;
+        }
+
+        if self.exec_history.len() > 100 {
+            self.exec_history.drain(0..self.exec_history.len() - 100);
+        }
+        if !self.exec_history.is_empty() {
+            let successes = self.exec_history.iter().filter(|&&s| s).count();
+            self.exec_success_rate = Decimal::from(successes as u64) / Decimal::from(self.exec_history.len() as u64);
+        }
+
+        info!(profit = %result.profit, bankroll = %self.total_bankroll, daily_pnl = %self.daily_pnl, "Trade recorded");
+    }
+
+    pub fn add_exposure(&mut self, platform: Platform, amount: Decimal) {
+        *self.platform_exposure.entry(platform).or_insert(Decimal::ZERO) += amount;
+    }
+
+    pub fn remove_exposure(&mut self, platform: Platform, amount: Decimal) {
+        if let Some(exp) = self.platform_exposure.get_mut(&platform) {
+            *exp = (*exp - amount).max(Decimal::ZERO);
+        }
+    }
+
+    pub fn reset_daily(&mut self) {
+        self.daily_pnl = Decimal::ZERO;
+        self.daily_fees = Decimal::ZERO;
+        self.daily_start_bankroll = self.total_bankroll;
+        self.trades_today = 0;
+        self.success_today = 0;
+        self.fail_today = 0;
+        self.day_start = Utc::now();
+        // REMOVED: peak_bankroll reset. 
+        // The Kelly calculator in src/risk/kelly.rs already handles recovery 
+        // smoothly by restoring the fraction when drawdown < 5%. Resetting peak 
+        // here causes lethal over-sizing during multi-day losing streaks.
+        info!(bankroll = %self.total_bankroll, "Daily counters reset");
+    }
+
+    pub fn daily_snapshot(&self, kelly_utilization: Decimal) -> DailySnapshot {
+        let success_rate = if self.trades_today > 0 {
+            Decimal::from(self.success_today) / Decimal::from(self.trades_today)
+        } else {
+            Decimal::ZERO
         };
 
-        match msg.event_type.as_str() {
-            "book" => {
-                if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
-                    if let Some(book) = self.books.get_mut(asset_id) {
-                        book.bids.clear();
-                        book.asks.clear();
-                        
-                        for e in bids {
-                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
-                                book.bids.insert(p, s);
-                            }
-                        }
-                        for e in asks {
-                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
-                                book.asks.insert(p, s);
-                            }
-                        }
-                        
-                        self.sequence += 1;
-                        if let Some(mut tick) = self.emit_tick(asset_id) {
-                            tick.sequence = self.sequence;
-                            let _ = tick_tx.send(tick);
-                        }
-                    }
-                }
-            }
-            "price_change" | "book_update" => {
-                if let Some(changes) = &msg.changes {
-                    if let Some(book) = self.books.get_mut(asset_id) {
-                        for change in changes {
-                            if let (Ok(p), Ok(s)) = (
-                                Decimal::from_str(&change.price),
-                                Decimal::from_str(&change.size),
-                            ) {
-                                book.apply_update(&change.side, p, s);
-                            }
-                        }
-                        self.sequence += 1;
-                        if let Some(mut tick) = self.emit_tick(asset_id) {
-                            tick.sequence = self.sequence;
-                            let _ = tick_tx.send(tick);
-                        }
-                    }
-                }
-            }
-            "last_trade_price" => {
-                if let Some(price_str) = &msg.price {
-                    if let Ok(price) = Decimal::from_str(price_str) {
-                        if let Some(book) = self.books.get_mut(asset_id) {
-                            book.last_trade_price = price;
-                        }
-                    }
-                }
-            }
-            _ => {
-                debug!(event_type = %msg.event_type, "Unknown Polymarket event type");
-            }
+        DailySnapshot {
+            date: Utc::now().date_naive(),
+            bankroll: self.total_bankroll,
+            gross_pnl: self.daily_pnl + self.daily_fees,
+            fees_paid: self.daily_fees,
+            net_pnl: self.daily_pnl,
+            trades_count: self.trades_today,
+            success_count: self.success_today,
+            fail_count: self.fail_today,
+            success_rate,
+            peak_bankroll: self.peak_bankroll,
+            drawdown_pct: self.drawdown_pct(),
+            kelly_utilization,
+            report_sent: false,
         }
     }
 }
@@ -6801,241 +5829,568 @@ fn row_to_position(row: &rusqlite::Row) -> Result<Position> {
 }
 ````
 
-## File: src/execution/polymarket_client.rs
+## File: src/engine/detector.rs
 ````rust
-use anyhow::{Context, Result};
-use ethers::core::types::{Address, U256};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-use serde::{Deserialize, Serialize};
-use tracing::info;
+use std::str::FromStr;
+use tracing::{debug};
+use uuid::Uuid;
+use rust_decimal::prelude::ToPrimitive;
 
-use super::executor::{OrderResult, PlatformOrderClient};
-use crate::crypto::eip712::PolymarketSigner;
-use crate::types::Side;
+use crate::engine::market_registry::MarketRegistry;
+use crate::engine::order_book::UnifiedOrderBook;
+use crate::engine::spread::{NetSpreadEngine, SpreadResult};
+use crate::types::*;
 
-#[derive(Clone)]
-pub struct PolymarketClient {
-    http: reqwest::Client,
-    rest_url: String,
-    signer: PolymarketSigner,
-    api_key: String,
-    api_secret: String,
-    api_passphrase: String,
+/// Rejection reason for the 5-gate pipeline
+#[derive(Debug, Clone)]
+pub enum RejectionReason {
+    BelowSpreadThreshold(Decimal),
+    InsufficientLiquidity { available: Decimal, required: Decimal },
+    StaleData { age_ms: u64, max_ms: u64 },
+    CorrelationExposure { current: Decimal, max: Decimal },
+    RiskBudgetExceeded { reason: String },
 }
 
-#[derive(Serialize)]
-struct CreateOrderRequest {
-    order: OrderPayload,
+/// Detection statistics
+#[derive(Debug, Default)]
+pub struct DetectorStats {
+    pub opportunities_detected: u64,
+    pub gate1_rejected: u64,
+    pub gate2_rejected: u64,
+    pub gate3_rejected: u64,
+    pub gate4_rejected: u64,
+    pub gate5_rejected: u64,
+    pub opportunities_passed: u64,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OrderPayload {
-    token_id: String,
-    maker_amount: String,
-    taker_amount: String,
-    side: String,
-    fee_rate_bps: String,
-    nonce: String,
-    expiration: String,
-    signature: String,
-    signature_type: u8,
-    order_type: String,
+pub struct ArbitrageDetector {
+    min_spread: Decimal,
+    min_order_size: Decimal,
+    stale_timeout_ms: u64,
+    max_concurrent: usize,
+    active_arbs: usize,
+    pub stats: DetectorStats,
 }
 
-#[derive(Deserialize)]
-struct OrderResponse {
-    #[serde(default)]
-    success: bool,
-    #[serde(default)]
-    order_id: Option<String>,
-    #[serde(default)]
-    error_msg: Option<String>,
-}
-
-impl PolymarketClient {
+impl ArbitrageDetector {
     pub fn new(
-        rest_url: String,
-        signer: PolymarketSigner,
-        api_key: String,
-        api_secret: String,
-        api_passphrase: String,
+        min_spread: Decimal,
+        min_order_size: Decimal,
+        stale_timeout_ms: u64,
+        max_concurrent: usize,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .expect("failed to build Polymarket HTTP client");
         Self {
-            http,
-            rest_url,
-            signer,
-            api_key,
-            api_secret,
-            api_passphrase,
+            min_spread,
+            min_order_size,
+            stale_timeout_ms,
+            max_concurrent,
+            active_arbs: 0,
+            stats: DetectorStats::default(),
         }
     }
-    /// Poll the order status endpoint to get actual fill details.
-    /// Returns (actual_fill_price, actual_fill_size, fee) if filled.
-    async fn poll_fill(&self, order_id: &str) -> Option<(Decimal, Decimal, Decimal)> {
-        let url = format!("{}/order/{}", self.rest_url, order_id);
-        for attempt in 0..3 {
-            tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
-            let resp = match self.http
-                .get(&url)
-                .header("POLY_API_KEY", &self.api_key)
-                .header("POLY_SECRET", &self.api_secret)
-                .header("POLY_PASSPHRASE", &self.api_passphrase)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => continue,
+
+    pub fn set_active_arbs(&mut self, count: usize) {
+        self.active_arbs = count;
+    }
+
+    /// Evaluates spreads ONLY for the specific market that just updated.
+    pub fn detect_for_market(
+        &mut self,
+        market_id: &Uuid,
+        registry: &MarketRegistry,
+        uob: &UnifiedOrderBook,
+        spread_engine: &NetSpreadEngine,
+        target_size: Decimal,
+    ) -> Vec<ArbitrageOpportunity> {
+        let mut opportunities = Vec::new();
+
+        for pair in registry.get_arb_pairs().iter().filter(|p| p.market_id == *market_id) {
+            let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
+                Some(b) => b,
+                None => continue,
             };
-            let body: serde_json::Value = match resp.json().await {
-                Ok(b) => b,
-                Err(_) => continue,
+            let book_b = match uob.get_book(&pair.market_id, &pair.platform_b) {
+                Some(b) => b,
+                None => continue,
             };
-            let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
-            if status == "FILLED" || status == "CLOSED" {
-                let avg_price = body.get("average_price")
-                    .or_else(|| body.get("price"))
-                    .and_then(|p| p.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok());
-                let filled_size = body.get("size_filled")
-                    .or_else(|| body.get("original_size"))
-                    .and_then(|s| s.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok());
-                let fee = body.get("fee")
-                    .and_then(|f| f.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok())
-                    .unwrap_or(Decimal::ZERO);
-                if let (Some(price), Some(size)) = (avg_price, filled_size) {
-                    return Some((price, size, fee));
+
+            let spreads = spread_engine.compute_spreads(book_a, book_b, target_size);
+
+            for spread in spreads {
+                self.stats.opportunities_detected += 1;
+
+                match self.run_gates(&spread, book_a, book_b, pair.confidence) {
+                    Ok(()) => {
+                        self.stats.opportunities_passed += 1;
+
+                        let market_question = registry.get_market(&pair.market_id)
+                            .map(|m| m.question.clone())
+                            .unwrap_or_default();
+
+                        let liquidity = spread.leg_a_available.min(spread.leg_b_available);
+                        let log_liq = if liquidity > Decimal::ZERO {
+                            // Add 1.0 to the natural log so a liquidity of 1.0 yields a multiplier of 1.0 (ln(1) = 0 + 1 = 1)
+                            let val = liquidity.to_f64().unwrap_or(1.0).ln() + 1.0;
+                            Decimal::from_str(&format!("{:.4}", val.max(0.1))).unwrap_or(Decimal::ONE)
+                        } else {
+                            Decimal::ONE
+                        };
+                        let score = spread.net_spread * log_liq * Decimal::from_str(&format!("{:.4}", pair.confidence)).unwrap_or(Decimal::ONE);
+
+                        opportunities.push(ArbitrageOpportunity {
+                            opp_id: Uuid::new_v4(),
+                            market_id: spread.market_id,
+                            market_question,
+                            leg_a: LegDetail {
+                                platform: spread.leg_a_platform,
+                                side: spread.leg_a_side,
+                                price: spread.leg_a_price,
+                                available_size: spread.leg_a_available,
+                                fee_estimate: spread.leg_a_fee,
+                                fee_rate_bps: 0, 
+                                // NOTE: Replace this with the actual exchange token ID from the registry when available
+                                platform_market_id: spread.market_id.to_string(), 
+                            },
+                            leg_b: LegDetail {
+                                platform: spread.leg_b_platform,
+                                side: spread.leg_b_side,
+                                price: spread.leg_b_price,
+                                available_size: spread.leg_b_available,
+                                fee_estimate: spread.leg_b_fee,
+                                fee_rate_bps: 0,
+                                // NOTE: Replace this with the actual exchange token ID from the registry when available
+                                platform_market_id: spread.market_id.to_string(), 
+                            },
+                            raw_spread: spread.raw_spread,
+                            net_spread: spread.net_spread,
+                            kelly_fraction: Decimal::ZERO, 
+                            recommended_size: Decimal::ZERO, 
+                            score,
+                            detected_at: now_ns(),
+                            ttl_ms: 5000,
+                        });
+                    }
+                    Err(reason) => {
+                        debug!(?reason, market_id = %spread.market_id, "Opportunity rejected");
+                    }
                 }
             }
         }
-        None
+
+        opportunities.sort_by(|a, b| b.score.cmp(&a.score));
+        let slots = self.max_concurrent.saturating_sub(self.active_arbs);
+        opportunities.truncate(slots);
+
+        opportunities
     }
+
+    fn run_gates(
+        &mut self,
+        spread: &SpreadResult,
+        book_a: &crate::engine::order_book::PlatformBook,
+        book_b: &crate::engine::order_book::PlatformBook,
+        confidence: f64,
+    ) -> Result<(), RejectionReason> {
+        if spread.net_spread < self.min_spread {
+            self.stats.gate1_rejected += 1;
+            return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
+        }
+
+        let min_available = spread.leg_a_available.min(spread.leg_b_available);
+        if min_available < self.min_order_size {
+            self.stats.gate2_rejected += 1;
+            return Err(RejectionReason::InsufficientLiquidity {
+                available: min_available,
+                required: self.min_order_size,
+            });
+        }
+
+        let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
+        let now = now_ns();
+
+        let age_a = now.saturating_sub(book_a.last_update_ns);
+        if age_a > stale_timeout_ns {
+            self.stats.gate3_rejected += 1;
+            return Err(RejectionReason::StaleData {
+                age_ms: age_a / 1_000_000,
+                max_ms: self.stale_timeout_ms,
+            });
+        }
+
+        let age_b = now.saturating_sub(book_b.last_update_ns);
+        if age_b > stale_timeout_ns {
+            self.stats.gate3_rejected += 1;
+            return Err(RejectionReason::StaleData {
+                age_ms: age_b / 1_000_000,
+                max_ms: self.stale_timeout_ms,
+            });
+        }
+
+        if confidence < 0.95 {
+            self.stats.gate4_rejected += 1;
+            return Err(RejectionReason::CorrelationExposure {
+                current: Decimal::ZERO,
+                max: Decimal::ZERO,
+            });
+        }
+
+        if self.active_arbs >= self.max_concurrent {
+            self.stats.gate5_rejected += 1;
+            return Err(RejectionReason::RiskBudgetExceeded {
+                reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
+            });
+        }
+
+        Ok(())
+    }
+}
+````
+
+## File: src/execution/executor.rs
+````rust
+use anyhow::Result;
+use chrono::Utc;
+use rust_decimal::Decimal;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+use rust_decimal::prelude::ToPrimitive;
+
+use crate::db::Database;
+use crate::types::*;
+use super::polymarket_client::PolymarketClient;
+use super::kalshi_client::KalshiClient;
+use super::cdna_client::CdnaClient;
+use super::forecastex_client::ForecastExClient;
+
+#[derive(Debug, Clone)]
+pub struct OrderResult {
+    pub filled: bool,
+    pub fill_price: Decimal,
+    pub fill_size: Decimal,
+    pub fee: Decimal,
+    pub order_id: String,
+    pub error: Option<String>,
 }
 
 #[async_trait::async_trait]
-impl PlatformOrderClient for PolymarketClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
-        let side_str = match side { Side::Yes => "BUY", Side::No => "SELL" };
-        let side_u8: u8 = match side { Side::Yes => 0, Side::No => 1 };
-        info!(market_id, side = side_str, price = %price, size = %size, fee_rate_bps, "Submitting Polymarket order");
+pub trait PlatformOrderClient: Send + Sync {
+    async fn submit_order(
+        &self,
+        market_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        fee_rate_bps: u32,
+    ) -> Result<OrderResult>;
 
-        // Scale to USDC/outcome-token base units (6 decimals)
-        let scale = Decimal::from(1_000_000u64);
-        
-        // Ensure maker/taker amounts invert correctly for SELL orders
-        let (maker_amount_scaled, taker_amount_scaled) = if side == Side::Yes {
-            ((size * price * scale).floor(), (size * scale).floor())
-        } else {
-            ((size * scale).floor(), (size * price * scale).floor())
-        };
+    async fn cancel_order(&self, order_id: &str) -> Result<()>;
+}
 
-        let maker_amount_u256 = U256::from_dec_str(&maker_amount_scaled.to_string()).unwrap_or(U256::zero());
-        let taker_amount_u256 = U256::from_dec_str(&taker_amount_scaled.to_string()).unwrap_or(U256::zero());
-        
-        let token_id_u256 = U256::from_dec_str(market_id)
-            .map_err(|_| anyhow::anyhow!("Invalid Polymarket token ID: {}", market_id))?;
+pub struct ExecutionEngine {
+    rx: mpsc::Receiver<ValidatedOpportunity>,
+    trade_result_tx: mpsc::Sender<TradeResult>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    db: Arc<dyn Database>,
+    polymarket_client: Option<PolymarketClient>,
+    kalshi_client: Option<KalshiClient>,
+    cdna_client: Option<CdnaClient>,
+    forecastex_client: Option<ForecastExClient>,
+    trade_counter: i64,
+    bankroll: Decimal,
+}
 
-        let fee_rate_bps_u256 = U256::from(fee_rate_bps);
-
-        let now = chrono::Utc::now();
-        let nonce_val = now.timestamp_nanos_opt().unwrap_or(0) as u64;
-        let nonce = U256::from(nonce_val);
-        let expiration_u256 = U256::from((now.timestamp() + 300) as u64);
-
-        let maker_addr = self.signer.address();
-
-        let signature = self.signer.sign_order(
-            nonce, maker_addr, maker_addr, Address::zero(), token_id_u256,
-            maker_amount_u256, taker_amount_u256, expiration_u256, nonce, 
-            fee_rate_bps_u256, // Pass the actual fee rate so the signature matches the payload
-            side_u8, 0,
-        ).await.context("EIP-712 order signing failed")?;
-
-        let url = format!("{}/order", self.rest_url);
-
-        let payload = OrderPayload {
-            token_id: market_id.to_string(),
-            maker_amount: maker_amount_scaled.to_string(),
-            taker_amount: taker_amount_scaled.to_string(),
-            side: side_str.to_string(),
-            fee_rate_bps: fee_rate_bps.to_string(), 
-            nonce: nonce_val.to_string(),
-            expiration: expiration_u256.to_string(),
-            signature,
-            signature_type: 0,
-            order_type: "IOC".to_string(),
-        };
-
-        let resp = self.http
-            .post(&url)
-            .header("POLY_API_KEY", &self.api_key)
-            .header("POLY_SECRET", &self.api_secret)
-            .header("POLY_PASSPHRASE", &self.api_passphrase)
-            .json(&CreateOrderRequest { order: payload })
-            .send()
-            .await
-            .context("Polymarket order submission failed")?;
-
-        let status_code = resp.status();
-        let body: OrderResponse = resp.json().await.unwrap_or(OrderResponse {
-            success: false,
-            order_id: None,
-            error_msg: Some(format!("HTTP {}", status_code)),
-        });
-
-        if body.success {
-            let order_id_str = body.order_id.unwrap_or_default();
-            let fill_size = taker_amount_scaled / scale;
-            let estimated_fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, fee_rate_bps as u16);
-
-            // Return immediately with the estimated fill details.
-            // Actual fill prices will be reconciled asynchronously by the
-            // reconciliation engine — polling here adds 1.2s latency to
-            // every execution, which is unacceptable for an HFT system.
-            let (actual_price, actual_size, actual_fee) = (price, fill_size, estimated_fee);
-            Ok(OrderResult {
-                filled: true,
-                fill_price: actual_price,
-                fill_size: actual_size,
-                fee: actual_fee,
-                order_id: order_id_str,
-                error: None,
-            })
-        } else {
-            Ok(OrderResult {
-                filled: false,
-                fill_price: Decimal::ZERO,
-                fill_size: Decimal::ZERO,
-                fee: Decimal::ZERO,
-                order_id: String::new(),
-                error: body.error_msg.or_else(|| Some(format!("HTTP {}", status_code))),
-            })
+impl ExecutionEngine {
+    pub fn new(
+        rx: mpsc::Receiver<ValidatedOpportunity>,
+        trade_result_tx: mpsc::Sender<TradeResult>,
+        alert_tx: mpsc::Sender<AlertMessage>,
+        db: Arc<dyn Database>,
+        polymarket_client: Option<PolymarketClient>,
+        kalshi_client: Option<KalshiClient>,
+        cdna_client: Option<CdnaClient>,
+        forecastex_client: Option<ForecastExClient>,
+        initial_bankroll: Decimal,
+        initial_trade_count: i64,
+    ) -> Self {
+        Self {
+            rx,
+            trade_result_tx,
+            alert_tx,
+            db,
+            polymarket_client,
+            kalshi_client,
+            cdna_client,
+            forecastex_client,
+            trade_counter: initial_trade_count,
+            bankroll: initial_bankroll,
         }
     }
 
-    async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let url = format!("{}/order/{}", self.rest_url, order_id);
-        let resp = self.http.delete(&url)
-            .header("POLY_API_KEY", &self.api_key)
-            .header("POLY_SECRET", &self.api_secret)
-            .header("POLY_PASSPHRASE", &self.api_passphrase)
-            .send()
-            .await
-            .context("Polymarket cancel failed")?;
-        if !resp.status().is_success() {
-            tracing::warn!(order_id, status = %resp.status(), "Polymarket cancel returned non-2xx");
+    pub async fn run(mut self) {
+        info!("Execution engine started");
+        while let Some(opp) = self.rx.recv().await {
+            if let Err(e) = self.execute_arbitrage(opp).await {
+                error!(error = %e, "Arbitrage execution error");
+            }
         }
-        // IOC orders are already settled; cancel is best-effort only
-        let _ = dec!(0); // suppress unused import warning
+        info!("Execution engine stopped");
+    }
+
+    async fn execute_arbitrage(&mut self, validated: ValidatedOpportunity) -> Result<()> {
+        let opp = &validated.opportunity;
+        let start = Instant::now();
+        self.trade_counter += 1;
+
+        info!(
+            opp_id = %opp.opp_id,
+            market = %opp.market_question,
+            net_spread = %opp.net_spread,
+            size = %validated.approved_size,
+            "Executing arbitrage"
+        );
+
+        let (first_leg, second_leg) = self.order_legs(opp);
+
+        let first_result = self.execute_leg(
+            &first_leg.platform,
+            &first_leg.platform_market_id,
+            first_leg.side,
+            first_leg.price,
+            validated.approved_size,
+            first_leg.fee_rate_bps, // Pass actual BPS rate
+        ).await;
+
+        let (leg_a_result, leg_b_result) = match first_result {
+            Ok(first_fill) if first_fill.filled => {
+                let hedge_size = first_fill.fill_size; 
+                let second_result = self.execute_leg(
+                    &second_leg.platform,
+                    &second_leg.platform_market_id,
+                    second_leg.side,
+                    second_leg.price,
+                    hedge_size,
+                    second_leg.fee_rate_bps, // Pass actual BPS rate
+                ).await;
+
+                match second_result {
+                    Ok(second_fill) if second_fill.filled => {
+                        (first_fill, second_fill)
+                    }
+                    Ok(second_fill) => {
+                        warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
+                        let _ = self.attempt_unwind(
+                            &first_leg.platform,
+                            &opp.market_id.to_string(),
+                            &first_fill,
+                        ).await;
+                        (first_fill, second_fill)
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Hedge leg error, attempting unwind");
+                        let _ = self.attempt_unwind(
+                            &first_leg.platform,
+                            &opp.market_id.to_string(),
+                            &first_fill,
+                        ).await;
+                    let err_str = e.to_string();
+                    let failed = OrderResult {
+                        filled: false,
+                        fill_price: Decimal::ZERO,
+                        fill_size: Decimal::ZERO,
+                        fee: Decimal::ZERO,
+                        order_id: String::new(),
+                        error: Some(err_str.clone()),
+                    };
+                    let failed2 = OrderResult {
+                        filled: false,
+                        fill_price: Decimal::ZERO,
+                        fill_size: Decimal::ZERO,
+                        fee: Decimal::ZERO,
+                        order_id: String::new(),
+                        error: Some(err_str),
+                    };
+                    (failed, failed2)
+                    }
+                }
+            }
+            Ok(first_fill) => {
+                let failed = OrderResult {
+                    filled: false,
+                    fill_price: Decimal::ZERO,
+                    fill_size: Decimal::ZERO,
+                    fee: Decimal::ZERO,
+                    order_id: String::new(),
+                    error: None,
+                };
+                (first_fill, failed)
+            }
+            Err(e) => {
+                error!(error = %e, "First leg execution error");
+                let failed = OrderResult {
+                    filled: false,
+                    fill_price: Decimal::ZERO,
+                    fill_size: Decimal::ZERO,
+                    fee: Decimal::ZERO,
+                    order_id: String::new(),
+                    error: Some(e.to_string()),
+                };
+                let failed2 = failed.clone();
+                (failed, failed2)
+            }
+        };
+
+        let execution_ms = start.elapsed().as_millis() as u64;
+
+        let (status, profit, failure_reason) = self.compute_result(
+            &leg_a_result, &leg_b_result, opp,
+        );
+
+        self.bankroll += profit;
+        let bankroll_change_pct = if self.bankroll > Decimal::ZERO {
+            profit / self.bankroll * Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        };
+
+        let trade_result = TradeResult {
+            trade_id: self.trade_counter,
+            opp_id: opp.opp_id,
+            market_id: opp.market_id,
+            market_question: opp.market_question.clone(),
+            approved_size: validated.approved_size,
+            leg_a_platform: first_leg.platform,
+            leg_a_side: first_leg.side,
+            leg_a_price: first_leg.price,
+            leg_a_size: leg_a_result.fill_size,
+            leg_a_fill_price: leg_a_result.fill_price,
+            leg_a_fee: leg_a_result.fee,
+            leg_b_platform: second_leg.platform,
+            leg_b_side: second_leg.side,
+            leg_b_price: second_leg.price,
+            leg_b_size: leg_b_result.fill_size,
+            leg_b_fill_price: leg_b_result.fill_price,
+            leg_b_fee: leg_b_result.fee,
+            raw_spread: opp.raw_spread,
+            net_spread: opp.net_spread,
+            profit,
+            status,
+            failure_reason,
+            execution_ms,
+            executed_at: Utc::now(),
+            bankroll_after: self.bankroll,
+            bankroll_change_pct,
+        };
+
+        // NOTIFY IMMEDIATELY so we do not block for IO
+        let _ = self.trade_result_tx.send(trade_result.clone()).await;
+        let _ = self.alert_tx.send(AlertMessage::TradeComplete(trade_result.clone())).await;
+
+        // NON-BLOCKING SQL DB INSERT
+        let db_clone = self.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db_clone.insert_trade(&trade_result).await {
+                tracing::error!(error = %e, "Failed to persist trade result to database");
+            }
+        });
+
         Ok(())
+    }
+
+    fn order_legs<'a>(&self, opp: &'a ArbitrageOpportunity) -> (&'a LegDetail, &'a LegDetail) {
+        let a_liquidity = opp.leg_a.available_size;
+        let b_liquidity = opp.leg_b.available_size;
+
+        if a_liquidity <= b_liquidity {
+            (&opp.leg_a, &opp.leg_b) 
+        } else {
+            (&opp.leg_b, &opp.leg_a)
+        }
+    }
+
+    async fn execute_leg(
+        &self,
+        platform: &Platform,
+        market_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        fee_rate_bps: u32,
+    ) -> Result<OrderResult> {
+        match platform {
+            Platform::Polymarket | Platform::PolymarketUs => {
+                if let Some(client) = &self.polymarket_client {
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("Polymarket client not configured")
+                }
+            }
+            Platform::Kalshi => {
+                if let Some(client) = &self.kalshi_client {
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("Kalshi client not configured")
+                }
+            }
+            Platform::Cdna => {
+                if let Some(client) = &self.cdna_client {
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("CDNA client not configured")
+                }
+            }
+            Platform::ForecastEx => {
+                if let Some(client) = &self.forecastex_client {
+                    client.submit_order(market_id, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("ForecastEx client not configured")
+                }
+            }
+        }
+    }
+
+    async fn attempt_unwind(
+        &self,
+        platform: &Platform,
+        _market_id: &str,
+        original_fill: &OrderResult,
+    ) -> Result<()> {
+        warn!(
+            platform = %platform,
+            size = %original_fill.fill_size,
+            "Attempting position unwind"
+        );
+        Ok(())
+    }
+
+    fn compute_result(
+        &self,
+        leg_a: &OrderResult,
+        leg_b: &OrderResult,
+        _opp: &ArbitrageOpportunity,
+    ) -> (TradeStatus, Decimal, Option<String>) {
+        if leg_a.filled && leg_b.filled {
+            let total_cost = leg_a.fill_price + leg_b.fill_price;
+            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.min(leg_b.fill_size);
+            let net_profit = gross_profit - leg_a.fee - leg_b.fee;
+            
+            let status = if leg_a.fill_size == leg_b.fill_size {
+                TradeStatus::Success
+            } else {
+                TradeStatus::Partial
+            };
+            
+            (status, net_profit, None)
+        } else if leg_a.filled && !leg_b.filled {
+            let loss = leg_a.fee; 
+            let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
+            (TradeStatus::Fail, -loss, Some(reason))
+        } else {
+            let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
+            (TradeStatus::Fail, Decimal::ZERO, Some(reason))
+        }
     }
 }
 ````
@@ -7363,7 +6718,23 @@ struct KalshiWsMessage {
     #[serde(rename = "type")]
     msg_type: String,
     #[serde(default)]
-    msg: Option<serde_json::Value>,
+    msg: Option<KalshiMsgPayload>,
+}
+
+#[derive(Deserialize)]
+pub struct KalshiMsgPayload {
+    #[serde(default)]
+    pub market_ticker: String,
+    pub seq: Option<u64>,
+    pub yes: Option<Vec<[String; 2]>>,
+    pub no: Option<Vec<[String; 2]>>,
+    pub price_deltas: Option<KalshiDeltas>,
+}
+
+#[derive(Deserialize)]
+pub struct KalshiDeltas {
+    pub yes: Option<Vec<[String; 2]>>,
+    pub no: Option<Vec<[String; 2]>>,
 }
 
 #[derive(Serialize)]
@@ -7560,32 +6931,32 @@ impl KalshiFeed {
 
     fn handle_orderbook_snapshot(
         &mut self,
-        data: &serde_json::Value,
+        data: &KalshiMsgPayload,
         tick_tx: &broadcast::Sender<NormalizedTick>,
     ) {
-        let ticker = data.get("market_ticker").and_then(|v| v.as_str()).unwrap_or("");
+        let ticker = &data.market_ticker;
         if let Some(book) = self.books.get_mut(ticker) {
             book.bids.clear();
             book.asks.clear();
 
             // Kalshi API v2 sends prices as dollar-formatted strings ("0.4200"),
             // NOT cent integers. Parse directly — no /100 conversion.
-            if let Some(yes_bids) = data.get("yes").and_then(|v| v.as_array()) {
+            if let Some(yes_bids) = &data.yes {
                 for level in yes_bids {
-                    if let (Some(p), Some(s)) = (
-                        level.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        level.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
+                    if let (Ok(p), Ok(s)) = (
+                        Decimal::from_str(&level[0]),
+                        Decimal::from_str(&level[1]),
                     ) {
                         book.bids.insert(p, s);
                     }
                 }
             }
 
-            if let Some(no_asks) = data.get("no").and_then(|v| v.as_array()) {
+            if let Some(no_asks) = &data.no {
                 for level in no_asks {
-                    if let (Some(p), Some(s)) = (
-                        level.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        level.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
+                    if let (Ok(p), Ok(s)) = (
+                        Decimal::from_str(&level[0]),
+                        Decimal::from_str(&level[1]),
                     ) {
                         book.asks.insert(p, s);
                     }
@@ -7602,12 +6973,12 @@ impl KalshiFeed {
 
     fn handle_orderbook_delta(
         &mut self,
-        data: &serde_json::Value,
+        data: &KalshiMsgPayload,
         tick_tx: &broadcast::Sender<NormalizedTick>,
     ) -> bool {
-        let ticker = data.get("market_ticker").and_then(|v| v.as_str()).unwrap_or("");
+        let ticker = &data.market_ticker;
+        let seq = data.seq.unwrap_or(0);
 
-        let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
         if let Some(book) = self.books.get(ticker) {
             if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
                 warn!(ticker, expected = book.last_seq + 1, got = seq,
@@ -7619,26 +6990,28 @@ impl KalshiFeed {
         if let Some(book) = self.books.get_mut(ticker) {
             book.last_seq = seq;
 
-            if let Some(bid_deltas) = data.get("price_deltas").and_then(|v| v.get("yes")).and_then(|v| v.as_array()) {
-                for delta in bid_deltas {
-                    if let (Some(p), Some(s)) = (
-                        delta.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        delta.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                    ) {
-                        if s == Decimal::ZERO { book.bids.remove(&p); }
-                        else { book.bids.insert(p, s); }
+            if let Some(deltas) = &data.price_deltas {
+                if let Some(bid_deltas) = &deltas.yes {
+                    for delta in bid_deltas {
+                        if let (Ok(p), Ok(s)) = (
+                            Decimal::from_str(&delta[0]),
+                            Decimal::from_str(&delta[1]),
+                        ) {
+                            if s == Decimal::ZERO { book.bids.remove(&p); }
+                            else { book.bids.insert(p, s); }
+                        }
                     }
                 }
-            }
 
-            if let Some(ask_deltas) = data.get("price_deltas").and_then(|v| v.get("no")).and_then(|v| v.as_array()) {
-                for delta in ask_deltas {
-                    if let (Some(p), Some(s)) = (
-                        delta.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        delta.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                    ) {
-                        if s == Decimal::ZERO { book.asks.remove(&p); }
-                        else { book.asks.insert(p, s); }
+                if let Some(ask_deltas) = &deltas.no {
+                    for delta in ask_deltas {
+                        if let (Ok(p), Ok(s)) = (
+                            Decimal::from_str(&delta[0]),
+                            Decimal::from_str(&delta[1]),
+                        ) {
+                            if s == Decimal::ZERO { book.asks.remove(&p); }
+                            else { book.asks.insert(p, s); }
+                        }
                     }
                 }
             }
@@ -7651,6 +7024,667 @@ impl KalshiFeed {
         }
 
         false // no reconnect needed
+    }
+}
+````
+
+## File: src/feeds/normalizer.rs
+````rust
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use uuid::Uuid;
+
+use crate::types::*;
+
+/// Compute a deterministic unified market ID from question + resolution + expiry
+pub fn compute_unified_market_id(question: &str, resolution_source: &str, expiry: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(question.to_lowercase().as_bytes());
+    hasher.update(b"|");
+    hasher.update(resolution_source.to_lowercase().as_bytes());
+    hasher.update(b"|");
+    hasher.update(expiry.as_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// Calculate Kalshi taker fee for a given contract price (0.01-0.99)
+pub fn kalshi_taker_fee(contract_price: Decimal) -> Decimal {
+    dec!(0.07) * contract_price * (Decimal::ONE - contract_price)
+}
+
+/// Calculate Kalshi maker fee (25% of taker fee)
+pub fn kalshi_maker_fee(contract_price: Decimal) -> Decimal {
+    kalshi_taker_fee(contract_price) * dec!(0.25)
+}
+
+/// Calculate Polymarket fee for given price and fee_rate_bps
+pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
+    let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
+    let max_side = price.max(Decimal::ONE - price);
+    rate * quantity * max_side
+}
+
+/// Calculate VWAP slippage for a target order size against order book depth.
+///
+/// `depth` **must** be pre-sorted in fill-walk order by the caller:
+///   - For buys against asks: ascending price (`PlatformBook::ask_depth()`)
+///   - For sells into bids: descending price (`PlatformBook::bid_depth()`)
+///
+/// Returns `None` when the available depth is insufficient to fill `target_size`.
+/// Returns `Some(slippage)` — the absolute VWAP deviation from best quoted price.
+pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<Decimal> {
+    if depth.is_empty() || target_size <= Decimal::ZERO {
+        return Some(Decimal::ZERO);
+    }
+
+    let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();
+    if levels.is_empty() {
+        // Return None to explicitly signal a complete lack of liquidity
+        return None;
+    }
+
+    let best_price = levels[0].price;
+    let mut remaining = target_size;
+    let mut total_cost = Decimal::ZERO;
+
+    for level in &levels {
+        let fill_qty = remaining.min(level.size);
+        total_cost += fill_qty * level.price;
+        remaining -= fill_qty;
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+    }
+
+    if remaining > Decimal::ZERO {
+        return None;
+    }
+
+    let vwap = total_cost / target_size;
+    Some((vwap - best_price).abs())
+}
+````
+
+## File: src/feeds/polymarket.rs
+````rust
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use tokio::sync::broadcast;
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::Connector;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use super::base::FeedHandler;
+use crate::config::PolymarketConfig;
+use crate::types::*;
+
+pub struct PolymarketFeed {
+    config: PolymarketConfig,
+    subscriptions: Vec<(String, Uuid)>,
+    books: std::collections::HashMap<String, LocalOrderBook>,
+    fee_rates: std::collections::HashMap<String, u16>,
+    sequence: u64,
+}
+
+struct LocalOrderBook {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+    last_trade_price: Decimal,
+}
+
+impl LocalOrderBook {
+    fn new() -> Self {
+        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_trade_price: Decimal::ZERO }
+    }
+
+    /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
+    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
+    }
+
+    /// Returns best ask only if non-empty — never returns phantom (1.0, 0) fallback.
+    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(p, s)| (*p, *s))
+    }
+
+    /// Returns mid-price only when both sides have real liquidity.
+    fn mid_price(&self) -> Option<Decimal> {
+        let (bid, _) = self.best_bid()?;
+        let (ask, _) = self.best_ask()?;
+        Some((bid + ask) / Decimal::from(2))
+    }
+
+    fn depth(&self) -> Vec<PriceLevel> {
+        let mut levels = Vec::with_capacity(20);
+        for (price, size) in self.bids.iter().rev().take(10) {
+            levels.push(PriceLevel { price: *price, size: *size });
+        }
+        for (price, size) in self.asks.iter().take(10) {
+            levels.push(PriceLevel { price: *price, size: *size });
+        }
+        levels
+    }
+
+    fn apply_update(&mut self, side: &str, price: Decimal, size: Decimal) {
+        let book = if side == "BUY" || side == "bid" { &mut self.bids } else { &mut self.asks };
+        if size == Decimal::ZERO {
+            book.remove(&price);
+        } else {
+            book.insert(price, size);
+        }
+    }
+
+    fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
+        self.bids.clear();
+        self.asks.clear();
+        for (p, s) in bids { self.bids.insert(*p, *s); }
+        for (p, s) in asks { self.asks.insert(*p, *s); }
+    }
+}
+
+#[derive(Deserialize)]
+struct WsMessage {
+    #[serde(default)]
+    event_type: String,
+    #[serde(default)]
+    asset_id: String,
+    #[serde(default)]
+    market: String,
+    #[serde(default)]
+    price: Option<String>,
+    #[serde(default)]
+    bids: Option<Vec<PriceSizeEntry>>,
+    #[serde(default)]
+    asks: Option<Vec<PriceSizeEntry>>,
+    #[serde(default)]
+    changes: Option<Vec<BookChange>>,
+}
+
+#[derive(Deserialize)]
+struct PriceSizeEntry {
+    price: String,
+    size: String,
+}
+
+#[derive(Deserialize)]
+struct BookChange {
+    side: String,
+    price: String,
+    size: String,
+}
+
+#[derive(Serialize)]
+struct SubscribeMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    assets_ids: Vec<String>,
+}
+
+impl PolymarketFeed {
+    pub fn new(config: PolymarketConfig, subscriptions: Vec<(String, Uuid)>) -> Self {
+        Self {
+            config,
+            subscriptions,
+            books: std::collections::HashMap::new(),
+            fee_rates: std::collections::HashMap::new(),
+            sequence: 0,
+        }
+    }
+
+    fn asset_to_market_id(&self, asset_id: &str) -> Option<Uuid> {
+        self.subscriptions.iter()
+            .find(|(a, _)| a == asset_id)
+            .map(|(_, id)| *id)
+    }
+
+    fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
+        let market_id = self.asset_to_market_id(asset_id)?;
+        let book = self.books.get(asset_id)?;
+        // Both sides must be present — phantom fallbacks (bid=0, ask=1) would
+        // make the spread engine see a fake ~100% arb and fire real orders.
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        let mid = book.mid_price()?;
+        let fee_bps = self.fee_rates.get(asset_id).copied().unwrap_or(200);
+
+        Some(NormalizedTick {
+            platform: Platform::Polymarket,
+            market_id,
+            timestamp_ns: now_ns(),
+            bid_price: bid.0,
+            bid_size: bid.1,
+            ask_price: ask.0,
+            ask_size: ask.1,
+            mid_price: mid,
+            last_trade_price: book.last_trade_price,
+            last_trade_size: Decimal::ZERO,
+            book_depth: book.depth(),
+            fee_rate_bps: fee_bps,
+            sequence: 0,
+        })
+    }
+}
+
+#[async_trait]
+impl FeedHandler for PolymarketFeed {
+    fn platform(&self) -> Platform {
+        Platform::Polymarket
+    }
+
+    fn clear_books(&mut self) {
+        for book in self.books.values_mut() {
+            book.bids.clear();
+            book.asks.clear();
+        }
+    }
+
+    async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
+        let url = &self.config.ws_url;
+        info!(url, "Connecting to Polymarket WebSocket");
+
+        let tls_connector = native_tls::TlsConnector::builder()
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()
+            .context("Failed to build TLS connector")?;
+        let connector = Connector::NativeTls(tls_connector);
+        let (ws_stream, _) = connect_async_tls_with_config(
+            url,
+            None, // WebSocket config
+            false, // disable_nagle
+            Some(connector),
+        )
+            .await
+            .context("Failed to connect to Polymarket WebSocket")?;
+
+        let (mut write, mut read) = ws_stream.split();
+
+        let asset_ids: Vec<String> = self.subscriptions.iter().map(|(a, _)| a.clone()).collect();
+        if !asset_ids.is_empty() {
+            let sub_msg = SubscribeMessage {
+                msg_type: "subscribe".into(),
+                assets_ids: asset_ids.clone(),
+            };
+            let msg_text = serde_json::to_string(&sub_msg)?;
+            write.send(Message::Text(msg_text.into())).await?;
+            info!(count = asset_ids.len(), "Subscribed to Polymarket markets");
+        }
+
+        for (asset_id, _) in &self.subscriptions {
+            self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
+        }
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Err(e) = self.handle_message(&text, &tick_tx) {
+                        warn!(error = %e, "Failed to process Polymarket message");
+                    }
+                }
+                Ok(Message::Ping(data)) => {
+                    let _ = write.send(Message::Pong(data)).await;
+                }
+                Ok(Message::Close(_)) => {
+                    info!("Polymarket WebSocket closed by server");
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(e).context("Polymarket WebSocket error");
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PolymarketPayload {
+    Array(Vec<WsMessage>),
+    Single(WsMessage),
+}
+
+impl PolymarketFeed {
+    fn handle_message(
+        &mut self,
+        text: &str,
+        tick_tx: &broadcast::Sender<NormalizedTick>,
+    ) -> Result<()> {
+        match serde_json::from_str::<PolymarketPayload>(text) {
+            Ok(PolymarketPayload::Array(messages)) => {
+                for msg in messages {
+                    self.process_event(&msg, tick_tx);
+                }
+            }
+            Ok(PolymarketPayload::Single(msg)) => {
+                self.process_event(&msg, tick_tx);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to parse Polymarket WS message");
+            }
+        }
+        Ok(())
+    }
+
+    fn process_event(&mut self, msg: &WsMessage, tick_tx: &broadcast::Sender<NormalizedTick>) {
+        let asset_id = if !msg.asset_id.is_empty() {
+            &msg.asset_id
+        } else if !msg.market.is_empty() {
+            &msg.market
+        } else {
+            return;
+        };
+
+        match msg.event_type.as_str() {
+            "book" => {
+                if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
+                    if let Some(book) = self.books.get_mut(asset_id) {
+                        book.bids.clear();
+                        book.asks.clear();
+                        
+                        for e in bids {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                book.bids.insert(p, s);
+                            }
+                        }
+                        for e in asks {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                book.asks.insert(p, s);
+                            }
+                        }
+                        
+                        self.sequence += 1;
+                        if let Some(mut tick) = self.emit_tick(asset_id) {
+                            tick.sequence = self.sequence;
+                            let _ = tick_tx.send(tick);
+                        }
+                    }
+                }
+            }
+            "price_change" | "book_update" => {
+                if let Some(changes) = &msg.changes {
+                    if let Some(book) = self.books.get_mut(asset_id) {
+                        for change in changes {
+                            if let (Ok(p), Ok(s)) = (
+                                Decimal::from_str(&change.price),
+                                Decimal::from_str(&change.size),
+                            ) {
+                                book.apply_update(&change.side, p, s);
+                            }
+                        }
+                        self.sequence += 1;
+                        if let Some(mut tick) = self.emit_tick(asset_id) {
+                            tick.sequence = self.sequence;
+                            let _ = tick_tx.send(tick);
+                        }
+                    }
+                }
+            }
+            "last_trade_price" => {
+                if let Some(price_str) = &msg.price {
+                    if let Ok(price) = Decimal::from_str(price_str) {
+                        if let Some(book) = self.books.get_mut(asset_id) {
+                            book.last_trade_price = price;
+                        }
+                    }
+                }
+            }
+            _ => {
+                debug!(event_type = %msg.event_type, "Unknown Polymarket event type");
+            }
+        }
+    }
+}
+````
+
+## File: src/execution/polymarket_client.rs
+````rust
+use anyhow::{Context, Result};
+use ethers::core::types::{Address, U256};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
+use tracing::info;
+
+use super::executor::{OrderResult, PlatformOrderClient};
+use crate::crypto::eip712::PolymarketSigner;
+use crate::types::Side;
+
+#[derive(Clone)]
+pub struct PolymarketClient {
+    http: reqwest::Client,
+    rest_url: String,
+    signer: PolymarketSigner,
+    api_key: String,
+    api_secret: String,
+    api_passphrase: String,
+}
+
+#[derive(Serialize)]
+struct CreateOrderRequest {
+    order: OrderPayload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrderPayload {
+    token_id: String,
+    maker_amount: String,
+    taker_amount: String,
+    side: String,
+    fee_rate_bps: String,
+    nonce: String,
+    expiration: String,
+    signature: String,
+    signature_type: u8,
+    order_type: String,
+}
+
+#[derive(Deserialize)]
+struct OrderResponse {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    order_id: Option<String>,
+    #[serde(default)]
+    error_msg: Option<String>,
+}
+
+impl PolymarketClient {
+    pub fn new(
+        rest_url: String,
+        signer: PolymarketSigner,
+        api_key: String,
+        api_secret: String,
+        api_passphrase: String,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build Polymarket HTTP client");
+        Self {
+            http,
+            rest_url,
+            signer,
+            api_key,
+            api_secret,
+            api_passphrase,
+        }
+    }
+    /// Poll the order status endpoint to get actual fill details.
+    /// Returns (actual_fill_price, actual_fill_size, fee) if filled.
+    async fn poll_fill(&self, order_id: &str) -> Option<(Decimal, Decimal, Decimal)> {
+        let url = format!("{}/order/{}", self.rest_url, order_id);
+        for attempt in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
+            let resp = match self.http
+                .get(&url)
+                .header("POLY_API_KEY", &self.api_key)
+                .header("POLY_SECRET", &self.api_secret)
+                .header("POLY_PASSPHRASE", &self.api_passphrase)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body: serde_json::Value = match resp.json().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status == "FILLED" || status == "CLOSED" {
+                let avg_price = body.get("average_price")
+                    .or_else(|| body.get("price"))
+                    .and_then(|p| p.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok());
+                let filled_size = body.get("size_filled")
+                    .or_else(|| body.get("original_size"))
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok());
+                let fee = body.get("fee")
+                    .and_then(|f| f.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok())
+                    .unwrap_or(Decimal::ZERO);
+                if let (Some(price), Some(size)) = (avg_price, filled_size) {
+                    return Some((price, size, fee));
+                }
+            }
+        }
+        None
+    }
+}
+
+#[async_trait::async_trait]
+impl PlatformOrderClient for PolymarketClient {
+    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
+        let side_str = match side { Side::Yes => "BUY", Side::No => "SELL" };
+        let side_u8: u8 = match side { Side::Yes => 0, Side::No => 1 };
+        info!(market_id, side = side_str, price = %price, size = %size, fee_rate_bps, "Submitting Polymarket order");
+
+        // Scale to USDC/outcome-token base units (6 decimals)
+        let scale = Decimal::from(1_000_000u64);
+        
+        // Ensure maker/taker amounts invert correctly for SELL orders
+        let (maker_amount_scaled, taker_amount_scaled) = if side == Side::Yes {
+            ((size * price * scale).floor(), (size * scale).floor())
+        } else {
+            ((size * scale).floor(), (size * price * scale).floor())
+        };
+
+        let maker_amount_u256 = U256::from_dec_str(&maker_amount_scaled.to_string()).unwrap_or(U256::zero());
+        let taker_amount_u256 = U256::from_dec_str(&taker_amount_scaled.to_string()).unwrap_or(U256::zero());
+        
+        let token_id_u256 = U256::from_dec_str(market_id)
+            .map_err(|_| anyhow::anyhow!("Invalid Polymarket token ID: {}", market_id))?;
+
+        let fee_rate_bps_u256 = U256::from(fee_rate_bps);
+
+        let now = chrono::Utc::now();
+        let nonce_val = now.timestamp_nanos_opt().unwrap_or(0) as u64;
+        let nonce = U256::from(nonce_val);
+        let expiration_u256 = U256::from((now.timestamp() + 300) as u64);
+
+        let maker_addr = self.signer.address();
+
+        let signature = self.signer.sign_order(
+            nonce, maker_addr, maker_addr, Address::zero(), token_id_u256,
+            maker_amount_u256, taker_amount_u256, expiration_u256, nonce, 
+            fee_rate_bps_u256, // Pass the actual fee rate so the signature matches the payload
+            side_u8, 0,
+        ).await.context("EIP-712 order signing failed")?;
+
+        let url = format!("{}/order", self.rest_url);
+
+        let payload = OrderPayload {
+            token_id: market_id.to_string(),
+            maker_amount: maker_amount_scaled.to_string(),
+            taker_amount: taker_amount_scaled.to_string(),
+            side: side_str.to_string(),
+            fee_rate_bps: fee_rate_bps.to_string(), 
+            nonce: nonce_val.to_string(),
+            expiration: expiration_u256.to_string(),
+            signature,
+            signature_type: 0,
+            order_type: "IOC".to_string(),
+        };
+
+        let resp = self.http
+            .post(&url)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_SECRET", &self.api_secret)
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .json(&CreateOrderRequest { order: payload })
+            .send()
+            .await
+            .context("Polymarket order submission failed")?;
+
+        let status_code = resp.status();
+        let body: OrderResponse = resp.json().await.unwrap_or(OrderResponse {
+            success: false,
+            order_id: None,
+            error_msg: Some(format!("HTTP {}", status_code)),
+        });
+
+        if body.success {
+            let order_id_str = body.order_id.unwrap_or_default();
+            let fill_size = taker_amount_scaled / scale;
+            let estimated_fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, fee_rate_bps as u16);
+
+            // Return immediately with the estimated fill details.
+            // Actual fill prices will be reconciled asynchronously by the
+            // reconciliation engine — polling here adds 1.2s latency to
+            // every execution, which is unacceptable for an HFT system.
+            let (actual_price, actual_size, actual_fee) = (price, fill_size, estimated_fee);
+            Ok(OrderResult {
+                filled: true,
+                fill_price: actual_price,
+                fill_size: actual_size,
+                fee: actual_fee,
+                order_id: order_id_str,
+                error: None,
+            })
+        } else {
+            Ok(OrderResult {
+                filled: false,
+                fill_price: Decimal::ZERO,
+                fill_size: Decimal::ZERO,
+                fee: Decimal::ZERO,
+                order_id: String::new(),
+                error: body.error_msg.or_else(|| Some(format!("HTTP {}", status_code))),
+            })
+        }
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let url = format!("{}/order/{}", self.rest_url, order_id);
+        let resp = self.http.delete(&url)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_SECRET", &self.api_secret)
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .send()
+            .await
+            .context("Polymarket cancel failed")?;
+        if !resp.status().is_success() {
+            tracing::warn!(order_id, status = %resp.status(), "Polymarket cancel returned non-2xx");
+        }
+        // IOC orders are already settled; cancel is best-effort only
+        let _ = dec!(0); // suppress unused import warning
+        Ok(())
     }
 }
 ````
@@ -8278,6 +8312,9 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(86400),
     );
 
+    // ADDED: Sync interval to prevent state drift
+    let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+
     let mut cached_open_positions: usize = db.get_open_arb_count().await
         .unwrap_or_else(|e| {
             warn!("Could not read open arb count from DB on startup: {e}");
@@ -8392,7 +8429,11 @@ loop {
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
 
                 in_flight_notional = in_flight_notional.saturating_sub(result.approved_size);
-                cached_open_positions = cached_open_positions.saturating_sub(1);
+                // Only decrement the local open positions counter if the trade failed.
+                // Successful and partial trades remain open in the database and consume position capacity.
+                if result.status == TradeStatus::Fail {
+                    cached_open_positions = cached_open_positions.saturating_sub(1);
+                }
 
                 if let Err(e) = trade_result_tx2.send(result.clone()).await {
                     error!(error = %e, trade_id = result.trade_id,
@@ -8412,6 +8453,13 @@ loop {
                 spread_engine.update_matic_price(gas.matic_usd);
                 circuit_breakers.update_gas_price(gas.gas_gwei);
                 debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated");
+            }
+
+            // ── Periodic State Sync ──
+            _ = sync_interval.tick() => {
+                if let Ok(count) = db.get_open_arb_count().await {
+                    cached_open_positions = count;
+                }
             }
 
             // ── Daily Report ──

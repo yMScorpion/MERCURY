@@ -48,15 +48,22 @@ impl TelegramBot {
         // then release the lock before sleeping so other callers aren't blocked.
         {
             let sleep_for = {
-                let last = self.last_send.lock().await;
+                let mut last = self.last_send.lock().await;
                 let elapsed = last.elapsed();
                 let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
-                if elapsed < min_interval { Some(min_interval - elapsed) } else { None }
+                if elapsed < min_interval {
+                    let wait = min_interval - elapsed;
+                    // Pre-emptively advance the timer for the NEXT concurrent caller
+                    *last += min_interval;
+                    Some(wait)
+                } else {
+                    *last = Instant::now();
+                    None
+                }
             };
             if let Some(dur) = sleep_for {
                 tokio::time::sleep(dur).await;
             }
-            *self.last_send.lock().await = Instant::now();
         }
 
         // Truncate if too long

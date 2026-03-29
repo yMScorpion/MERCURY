@@ -70,7 +70,23 @@ struct KalshiWsMessage {
     #[serde(rename = "type")]
     msg_type: String,
     #[serde(default)]
-    msg: Option<serde_json::Value>,
+    msg: Option<KalshiMsgPayload>,
+}
+
+#[derive(Deserialize)]
+pub struct KalshiMsgPayload {
+    #[serde(default)]
+    pub market_ticker: String,
+    pub seq: Option<u64>,
+    pub yes: Option<Vec<[String; 2]>>,
+    pub no: Option<Vec<[String; 2]>>,
+    pub price_deltas: Option<KalshiDeltas>,
+}
+
+#[derive(Deserialize)]
+pub struct KalshiDeltas {
+    pub yes: Option<Vec<[String; 2]>>,
+    pub no: Option<Vec<[String; 2]>>,
 }
 
 #[derive(Serialize)]
@@ -267,32 +283,32 @@ impl KalshiFeed {
 
     fn handle_orderbook_snapshot(
         &mut self,
-        data: &serde_json::Value,
+        data: &KalshiMsgPayload,
         tick_tx: &broadcast::Sender<NormalizedTick>,
     ) {
-        let ticker = data.get("market_ticker").and_then(|v| v.as_str()).unwrap_or("");
+        let ticker = &data.market_ticker;
         if let Some(book) = self.books.get_mut(ticker) {
             book.bids.clear();
             book.asks.clear();
 
             // Kalshi API v2 sends prices as dollar-formatted strings ("0.4200"),
             // NOT cent integers. Parse directly — no /100 conversion.
-            if let Some(yes_bids) = data.get("yes").and_then(|v| v.as_array()) {
+            if let Some(yes_bids) = &data.yes {
                 for level in yes_bids {
-                    if let (Some(p), Some(s)) = (
-                        level.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        level.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
+                    if let (Ok(p), Ok(s)) = (
+                        Decimal::from_str(&level[0]),
+                        Decimal::from_str(&level[1]),
                     ) {
                         book.bids.insert(p, s);
                     }
                 }
             }
 
-            if let Some(no_asks) = data.get("no").and_then(|v| v.as_array()) {
+            if let Some(no_asks) = &data.no {
                 for level in no_asks {
-                    if let (Some(p), Some(s)) = (
-                        level.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        level.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
+                    if let (Ok(p), Ok(s)) = (
+                        Decimal::from_str(&level[0]),
+                        Decimal::from_str(&level[1]),
                     ) {
                         book.asks.insert(p, s);
                     }
@@ -309,12 +325,12 @@ impl KalshiFeed {
 
     fn handle_orderbook_delta(
         &mut self,
-        data: &serde_json::Value,
+        data: &KalshiMsgPayload,
         tick_tx: &broadcast::Sender<NormalizedTick>,
     ) -> bool {
-        let ticker = data.get("market_ticker").and_then(|v| v.as_str()).unwrap_or("");
+        let ticker = &data.market_ticker;
+        let seq = data.seq.unwrap_or(0);
 
-        let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
         if let Some(book) = self.books.get(ticker) {
             if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
                 warn!(ticker, expected = book.last_seq + 1, got = seq,
@@ -326,26 +342,28 @@ impl KalshiFeed {
         if let Some(book) = self.books.get_mut(ticker) {
             book.last_seq = seq;
 
-            if let Some(bid_deltas) = data.get("price_deltas").and_then(|v| v.get("yes")).and_then(|v| v.as_array()) {
-                for delta in bid_deltas {
-                    if let (Some(p), Some(s)) = (
-                        delta.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        delta.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                    ) {
-                        if s == Decimal::ZERO { book.bids.remove(&p); }
-                        else { book.bids.insert(p, s); }
+            if let Some(deltas) = &data.price_deltas {
+                if let Some(bid_deltas) = &deltas.yes {
+                    for delta in bid_deltas {
+                        if let (Ok(p), Ok(s)) = (
+                            Decimal::from_str(&delta[0]),
+                            Decimal::from_str(&delta[1]),
+                        ) {
+                            if s == Decimal::ZERO { book.bids.remove(&p); }
+                            else { book.bids.insert(p, s); }
+                        }
                     }
                 }
-            }
 
-            if let Some(ask_deltas) = data.get("price_deltas").and_then(|v| v.get("no")).and_then(|v| v.as_array()) {
-                for delta in ask_deltas {
-                    if let (Some(p), Some(s)) = (
-                        delta.get(0).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                        delta.get(1).and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()),
-                    ) {
-                        if s == Decimal::ZERO { book.asks.remove(&p); }
-                        else { book.asks.insert(p, s); }
+                if let Some(ask_deltas) = &deltas.no {
+                    for delta in ask_deltas {
+                        if let (Ok(p), Ok(s)) = (
+                            Decimal::from_str(&delta[0]),
+                            Decimal::from_str(&delta[1]),
+                        ) {
+                            if s == Decimal::ZERO { book.asks.remove(&p); }
+                            else { book.asks.insert(p, s); }
+                        }
                     }
                 }
             }

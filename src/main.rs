@@ -448,6 +448,9 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(86400),
     );
 
+    // ADDED: Sync interval to prevent state drift
+    let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+
     let mut cached_open_positions: usize = db.get_open_arb_count().await
         .unwrap_or_else(|e| {
             warn!("Could not read open arb count from DB on startup: {e}");
@@ -586,6 +589,13 @@ loop {
                 spread_engine.update_matic_price(gas.matic_usd);
                 circuit_breakers.update_gas_price(gas.gas_gwei);
                 debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated");
+            }
+
+            // ── Periodic State Sync ──
+            _ = sync_interval.tick() => {
+                if let Ok(count) = db.get_open_arb_count().await {
+                    cached_open_positions = count;
+                }
             }
 
             // ── Daily Report ──

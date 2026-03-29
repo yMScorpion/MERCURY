@@ -141,10 +141,10 @@ impl BankrollManager {
         self.success_today = 0;
         self.fail_today = 0;
         self.day_start = Utc::now();
-        // Reset the peak so drawdown is measured within the current day only.
-        // Without this, a single historical loss permanently suppresses Kelly
-        // sizing even after recovery ("fear lock").
-        self.peak_bankroll = self.total_bankroll;
+        // REMOVED: peak_bankroll reset. 
+        // The Kelly calculator in src/risk/kelly.rs already handles recovery 
+        // smoothly by restoring the fraction when drawdown < 5%. Resetting peak 
+        // here causes lethal over-sizing during multi-day losing streaks.
         info!(bankroll = %self.total_bankroll, "Daily counters reset");
     }
 
