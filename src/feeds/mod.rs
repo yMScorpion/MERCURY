@@ -4,3 +4,4 @@ pub mod kalshi;
 pub mod cdna;
 pub mod forecastex;
 pub mod normalizer;
+pub mod discovery;

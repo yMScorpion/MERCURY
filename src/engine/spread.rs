@@ -71,8 +71,8 @@ impl NetSpreadEngine {
                 let fee_a = self.compute_fee(book_a.platform, ask_a, target_size, book_a.fee_rate_bps);
                 let fee_b = self.compute_fee(book_b.platform, ask_b_no, target_size, book_b.fee_rate_bps);
                 match (
-                    normalizer::estimate_slippage(target_size, &book_a.ask_depth(), true),
-                    normalizer::estimate_slippage(target_size, &book_b.bid_depth(), false),
+                    normalizer::estimate_slippage(target_size, &book_a.ask_depth()),
+                    normalizer::estimate_slippage(target_size, &book_b.bid_depth()),
                 ) {
                     (Some(slippage_a), Some(slippage_b)) => {
                         let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
@@ -119,8 +119,8 @@ impl NetSpreadEngine {
                 let fee_a = self.compute_fee(book_a.platform, ask_a_no, target_size, book_a.fee_rate_bps);
                 let fee_b = self.compute_fee(book_b.platform, ask_b, target_size, book_b.fee_rate_bps);
                 match (
-                    normalizer::estimate_slippage(target_size, &book_a.bid_depth(), false),
-                    normalizer::estimate_slippage(target_size, &book_b.ask_depth(), true),
+                    normalizer::estimate_slippage(target_size, &book_a.bid_depth()),
+                    normalizer::estimate_slippage(target_size, &book_b.ask_depth()),
                 ) {
                     (Some(slippage_a), Some(slippage_b)) => {
                         let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);

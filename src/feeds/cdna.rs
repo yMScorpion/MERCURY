@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -131,7 +131,13 @@ impl FeedHandler for CdnaFeed {
         let url = &self.config.ws_url;
         info!(url, "Connecting to CDNA WebSocket");
 
-        let (ws_stream, _) = connect_async(url)
+        let tls_connector = native_tls::TlsConnector::builder()
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()
+            .context("Failed to build CDNA TLS connector")?;
+        let (ws_stream, _) = connect_async_tls_with_config(
+            url, None, false, Some(Connector::NativeTls(tls_connector)),
+        )
             .await
             .context("Failed to connect to CDNA WebSocket")?;
 

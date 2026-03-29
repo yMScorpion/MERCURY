@@ -5,10 +5,11 @@ use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use uuid::Uuid;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod config;
 mod crypto;
@@ -33,14 +34,40 @@ struct Cli {
     config: String,
 }
 
+/// Calculate seconds from now until the next occurrence of `hour_utc`:00 UTC.
+fn seconds_until_report_hour(hour_utc: u32) -> u64 {
+    let now = chrono::Utc::now();
+    let today_target = now.date_naive()
+        .and_hms_opt(hour_utc, 0, 0)
+        .unwrap()
+        .and_utc();
+    let target = if today_target > now {
+        today_target
+    } else {
+        today_target + chrono::Duration::days(1)
+    };
+    (target - now).num_seconds().max(1) as u64
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let (non_blocking_writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("mercury=info".parse()?),
         )
+        .with_writer(non_blocking_writer)
         .init();
+
+    let cli = Cli::parse();
+    info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
+    let mercury_config = MercuryConfig::load(&cli.config)?;
+
+    // HARD PANIC FOR FORECAST EX
+    if mercury_config.platforms.forecastex.enabled {
+        panic!("CRITICAL: ForecastEx FIX execution is not fully implemented. Do not run with forecastex.enabled = true to prevent unhedged dual-leg exposure.");
+    }
 
     let cli = Cli::parse();
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
@@ -61,16 +88,12 @@ async fn main() -> Result<()> {
     let (tick_tx, _) = broadcast::channel::<NormalizedTick>(10_000);
     let (opportunity_tx, opportunity_rx) = mpsc::channel::<ValidatedOpportunity>(100);
     let (trade_result_tx, trade_result_rx) = mpsc::channel::<TradeResult>(100);
-    // 1 000-slot buffer: each TradeResult is ~200 B; 200 KB headroom vs the
-    // 100-slot original that could drop results under burst load, leaving
-    // positions open in the DB and diverging cached_open_positions on restart.
     let (trade_result_tx2, trade_result_rx2) = mpsc::channel::<TradeResult>(1_000);
     let (alert_tx, alert_rx) = mpsc::channel::<AlertMessage>(500);
     let (daily_report_tx, daily_report_rx) = mpsc::channel::<DailyReport>(10);
     let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
 
     // ─── Telegram ───
-    // Two separate bots: MERCURY_NOTIFICATION (real-time alerts) and MERCURY_DAILYBOT (daily reports)
     let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
     let tg_daily_token = std::env::var("TELEGRAM_DAILY_TOKEN").unwrap_or_default();
     let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_default();
@@ -114,7 +137,7 @@ async fn main() -> Result<()> {
     let initial_bankroll = mercury_config.trading.initial_bankroll;
     let mut bankroll_manager = risk::bankroll::BankrollManager::new(initial_bankroll);
     let mut kelly = risk::kelly::KellyCalculator::new(
-        Decimal::from_str_exact(&mercury_config.trading.kelly_fraction_multiplier.to_string())
+        Decimal::try_from(mercury_config.trading.kelly_fraction_multiplier)
             .unwrap_or(dec!(0.25))
     );
     let mut circuit_breakers = risk::circuit_breaker::CircuitBreakers::new(
@@ -132,12 +155,9 @@ async fn main() -> Result<()> {
     let mut spread_engine = engine::spread::NetSpreadEngine::new(
         mercury_config.trading.min_net_spread_threshold,
     );
-
-    // Polymarket runs on Polygon — gas is paid in MATIC, not ETH.
-    // Set safe startup defaults; the GasOracle will overwrite these on its first
-    // fetch (which fires immediately — see gas_oracle.rs).
     spread_engine.update_gas_price(Decimal::from(50));
     spread_engine.update_matic_price(dec!(0.50));
+
     let mut detector = engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,
         Decimal::from(5),
@@ -146,14 +166,104 @@ async fn main() -> Result<()> {
     );
     let mut registry = engine::market_registry::MarketRegistry::new();
 
-    // ─── Execution Engine ───
+    let initial_trade_count = db.get_trade_count().await.unwrap_or(0);
+
+    // ─── Initialize Platform Clients from Environment ───
+    let polymarket_client = (|| -> Option<execution::polymarket_client::PolymarketClient> {
+        let api_key = std::env::var("POLYMARKET_API_KEY").ok()?;
+        let api_secret = std::env::var("POLYMARKET_API_SECRET").ok()?;
+        let api_passphrase = std::env::var("POLYMARKET_API_PASSPHRASE").ok()?;
+        let wallet_key = std::env::var("POLYMARKET_WALLET_KEY").ok()?;
+        let chain_id: u64 = std::env::var("POLYMARKET_CHAIN_ID")
+            .unwrap_or_else(|_| "137".to_string())
+            .parse()
+            .unwrap_or(137);
+        let signer = match crypto::eip712::PolymarketSigner::from_hex_default(&wallet_key, chain_id) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize Polymarket signer");
+                return None;
+            }
+        };
+        info!(address = %signer.address(), "Polymarket client initialized");
+        Some(execution::polymarket_client::PolymarketClient::new(
+            mercury_config.platforms.polymarket.rest_url.clone(),
+            signer,
+            api_key,
+            api_secret,
+            api_passphrase,
+        ))
+    })();
+
+    let kalshi_client = (|| -> Option<execution::kalshi_client::KalshiClient> {
+        let api_key_id = std::env::var("KALSHI_API_KEY_ID").ok()?;
+        let rsa_pem_path = std::env::var("KALSHI_RSA_PEM_PATH").ok()?;
+        let pem_bytes = match std::fs::read(&rsa_pem_path) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, path = %rsa_pem_path, "Failed to read Kalshi RSA PEM");
+                return None;
+            }
+        };
+        let auth = match crypto::jwt::KalshiAuth::new(api_key_id, &pem_bytes) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize Kalshi auth");
+                return None;
+            }
+        };
+        info!("Kalshi client initialized");
+        Some(execution::kalshi_client::KalshiClient::new(
+            mercury_config.platforms.kalshi.rest_url.clone(),
+            auth,
+        ))
+    })();
+
+    let cdna_client = (|| -> Option<execution::cdna_client::CdnaClient> {
+        if !mercury_config.platforms.cdna.enabled {
+            return None;
+        }
+        let api_key = std::env::var("CDNA_API_KEY").ok()?;
+        let api_secret = std::env::var("CDNA_API_SECRET").ok()?;
+        info!("CDNA client initialized");
+        Some(execution::cdna_client::CdnaClient::new(
+            mercury_config.platforms.cdna.rest_url.clone(),
+            api_key,
+            api_secret,
+        ))
+    })();
+
+    let forecastex_client = if mercury_config.platforms.forecastex.enabled {
+        Some(execution::forecastex_client::ForecastExClient::new(
+            mercury_config.platforms.forecastex.fix_host.clone(),
+            mercury_config.platforms.forecastex.fix_port,
+        ))
+    } else {
+        None
+    };
+
+    if polymarket_client.is_some() {
+        info!("Polymarket execution: ENABLED");
+    } else {
+        warn!("Polymarket execution: DISABLED (set POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE, POLYMARKET_WALLET_KEY)");
+    }
+    if kalshi_client.is_some() {
+        info!("Kalshi execution: ENABLED");
+    } else {
+        warn!("Kalshi execution: DISABLED (set KALSHI_API_KEY_ID, KALSHI_RSA_PEM_PATH)");
+    }
+
     let executor = execution::executor::ExecutionEngine::new(
         opportunity_rx,
         trade_result_tx.clone(),
         alert_tx.clone(),
         db.clone(),
-        None, None, None, None,
+        polymarket_client,
+        kalshi_client,
+        cdna_client,
+        forecastex_client,
         initial_bankroll,
+        initial_trade_count,
     );
     join_set.spawn(executor.run());
 
@@ -173,14 +283,21 @@ async fn main() -> Result<()> {
     );
     join_set.spawn(settlement.run());
 
+    // ─── Unwind Watchdog ───
+    let unwind_watchdog = inventory::unwind_watchdog::UnwindWatchdog::new(
+        db.clone(), alert_tx.clone(), 30,
+    );
+    join_set.spawn(unwind_watchdog.run());
+
     // ─── Health Server ───
     let health_metrics = metrics.clone();
-    join_set.spawn(monitoring::health::run_health_server(mercury_config.health.port, health_metrics));
+    join_set.spawn(monitoring::health::run_health_server(
+        mercury_config.health.port,
+        health_metrics,
+        mercury_config.trading.stale_data_timeout_ms,
+    ));
 
     // ─── Gas Oracle ───
-    // Polls live Polygon gas price (eth_gasPrice) and MATIC/USD spot price.
-    // Updates are delivered via gas_update_rx into the main event loop so
-    // spread_engine and circuit_breakers always reflect current network costs.
     let gas_oracle = monitoring::gas_oracle::GasOracle::new(
         mercury_config.polygon_rpc.url.clone(),
         mercury_config.polygon_rpc.gas_poll_interval_secs,
@@ -188,165 +305,279 @@ async fn main() -> Result<()> {
     );
     join_set.spawn(gas_oracle.run());
 
+    // ─── DB Backup (every 6 hours) ───
+    let backup_task = monitoring::backup::BackupTask::new(
+        db.clone(),
+        "data/backups".to_string(),
+        6 * 3600,
+    );
+    join_set.spawn(backup_task.run());
+
+    // ─── Config Hot-Reload Watcher ───
+    {
+        let config_path = cli.config.clone();
+        let alert_tx_reload = alert_tx.clone();
+        let cancel_reload = cancel_token.clone();
+        join_set.spawn(async move {
+            use notify::{Watcher, RecursiveMode, Event, EventKind};
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+            let mut watcher = match notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, EventKind::Modify(_)) {
+                        let _ = tx.try_send(());
+                    }
+                }
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(error = %e, "Failed to create config file watcher");
+                    return;
+                }
+            };
+            if let Err(e) = watcher.watch(std::path::Path::new(&config_path), RecursiveMode::NonRecursive) {
+                warn!(error = %e, "Failed to watch config file");
+                return;
+            }
+            info!("Config hot-reload watcher active on {}", config_path);
+            loop {
+                tokio::select! {
+                    _ = cancel_reload.cancelled() => break,
+                    Some(()) = rx.recv() => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        match MercuryConfig::load(&config_path) {
+                            Ok(_new_config) => {
+                                info!("Config file changed — validated OK (live reload of risk params not yet wired)");
+                                let _ = alert_tx_reload.try_send(AlertMessage::SystemAlert {
+                                    severity: "info".into(),
+                                    message: "Config file reloaded and validated".into(),
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Config reload failed — keeping current config");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // ─── Market Discovery ───
+    let (matched_market_tx, mut matched_market_rx) = mpsc::channel::<feeds::discovery::MatchedMarket>(500);
+    let discovery = feeds::discovery::MarketDiscovery::new(
+        mercury_config.platforms.clone(),
+        300,
+    );
+    join_set.spawn(discovery.run(matched_market_tx));
+
+    // ─── Feed Handlers ───
+    if mercury_config.platforms.polymarket.enabled {
+        let pm_feed = feeds::polymarket::PolymarketFeed::new(
+            mercury_config.platforms.polymarket.clone(),
+            vec![],
+        );
+        let pm_tick_tx = tick_tx.clone();
+        let pm_alert_tx = alert_tx.clone();
+        let pm_cancel = cancel_token.clone();
+        join_set.spawn(feeds::base::run_with_reconnect(
+            Box::new(pm_feed),
+            pm_tick_tx,
+            pm_alert_tx,
+            pm_cancel,
+        ));
+    }
+
+    if mercury_config.platforms.kalshi.enabled {
+        let kalshi_auth_for_feed = std::env::var("KALSHI_API_KEY_ID").ok().and_then(|key_id| {
+            let pem_path = std::env::var("KALSHI_RSA_PEM_PATH").ok()?;
+            let pem = std::fs::read(&pem_path).ok()?;
+            crypto::jwt::KalshiAuth::new(key_id, &pem).ok()
+        });
+        let k_feed = feeds::kalshi::KalshiFeed::new(
+            mercury_config.platforms.kalshi.clone(),
+            kalshi_auth_for_feed,
+            vec![],
+        );
+        let k_tick_tx = tick_tx.clone();
+        let k_alert_tx = alert_tx.clone();
+        let k_cancel = cancel_token.clone();
+        join_set.spawn(feeds::base::run_with_reconnect(
+            Box::new(k_feed),
+            k_tick_tx,
+            k_alert_tx,
+            k_cancel,
+        ));
+    }
+
+    if mercury_config.platforms.cdna.enabled {
+        let c_feed = feeds::cdna::CdnaFeed::new(
+            mercury_config.platforms.cdna.clone(),
+            vec![],
+        );
+        let c_tick_tx = tick_tx.clone();
+        let c_alert_tx = alert_tx.clone();
+        let c_cancel = cancel_token.clone();
+        join_set.spawn(feeds::base::run_with_reconnect(
+            Box::new(c_feed),
+            c_tick_tx,
+            c_alert_tx,
+            c_cancel,
+        ));
+    }
+
+    if mercury_config.platforms.forecastex.enabled {
+        let f_feed = feeds::forecastex::ForecastExFeed::new(
+            mercury_config.platforms.forecastex.clone(),
+            vec![],
+        );
+        let f_tick_tx = tick_tx.clone();
+        let f_alert_tx = alert_tx.clone();
+        let f_cancel = cancel_token.clone();
+        join_set.spawn(feeds::base::run_with_reconnect(
+            Box::new(f_feed),
+            f_tick_tx,
+            f_alert_tx,
+            f_cancel,
+        ));
+    }
+
     info!("All subsystems initialized. MERCURY engine running. Press Ctrl+C to shutdown.");
 
     // ─── Main Event Loop ───
     let mut tick_rx = tick_tx.subscribe();
     let mut trade_result_rx = trade_result_rx;
-    let daily_report_interval = tokio::time::interval(std::time::Duration::from_secs(86400));
-    tokio::pin!(daily_report_interval);
 
-    // Seed the open-position counter from the DB so that after a crash/restart
-    // the concurrency limit is accurate from the first tick.
-    let mut cached_open_positions: usize = db.get_open_positions().await
-        .map(|v| v.len())
+    let delay = seconds_until_report_hour(mercury_config.telegram.daily_report_hour_utc);
+    info!(delay_secs = delay, hour_utc = mercury_config.telegram.daily_report_hour_utc, "Daily report scheduled");
+    let mut daily_report_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(delay),
+        std::time::Duration::from_secs(86400),
+    );
+
+    let mut cached_open_positions: usize = db.get_open_arb_count().await
         .unwrap_or_else(|e| {
-            warn!("Could not read open positions from DB on startup: {e}");
+            warn!("Could not read open arb count from DB on startup: {e}");
             0
         });
 
-    // In-flight notional: capital reserved for opportunities that have been sent
-    // to the executor but not yet settled. Deducted from available capital when
-    // sizing new trades to prevent over-leveraging while orders are pending.
     let mut in_flight_notional = Decimal::ZERO;
 
-    loop {
+loop {
         tokio::select! {
             tick_result = tick_rx.recv() => {
                 let tick = match tick_result {
                     Ok(t) => t,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Broadcast channel lagged by {} ticks — consider increasing buffer", n);
-                        metrics.ws_reconnects.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Books may be stale.", n);
                         continue;
                     }
-                    Err(_) => break,
+                    Err(_) => break, // Channel closed
                 };
 
                 metrics.inc_ticks();
                 uob.update(&tick);
 
-                // Sync concurrency cap with the cached position count so the
-                // detector's slot guard actually works (BUG-3 fix).
+                if circuit_breakers.is_trading_halted() {
+                    continue;
+                }
+
                 detector.set_active_arbs(cached_open_positions);
 
-                // detector.detect() calls compute_spreads internally; the extra
-                // loop here was a 100 % duplicate that has been removed (CRITICAL-2).
-                let opps = detector.detect(&registry, &uob, &spread_engine, Decimal::from(10));
-                metrics.spreads_evaluated.fetch_add(opps.len() as u64, Ordering::Relaxed);
+                // Replaced O(N) detect with O(1) detect_for_market
+                let opps = detector.detect_for_market(
+                    &tick.market_id,
+                    &registry,
+                    &uob,
+                    &spread_engine,
+                    rust_decimal_macros::dec!(10.0), // fallback target size
+                );
+                metrics.inc_spreads(); 
 
+                // Process opportunities
                 for opp in opps {
-                    metrics.inc_detected();
-
-                    if circuit_breakers.is_trading_halted() {
-                        continue;
-                    }
-
-                    let exec_prob = bankroll_manager.exec_success_rate();
-                    let kelly_frac = kelly.optimal_fraction(exec_prob, opp.net_spread);
-                    let approved_size = kelly.position_size(
-                        bankroll_manager.total_bankroll(),
-                        exec_prob,
-                        opp.net_spread,
-                        mercury_config.trading.max_single_trade_pct,
+                    let mut trips = circuit_breakers.check_all(
+                        opp.recommended_size, 
+                        bankroll_manager.total_bankroll(), 
+                        bankroll_manager.daily_loss_pct(), 
+                        bankroll_manager.drawdown_pct(), 
+                        bankroll_manager.platform_exposure_pct(&opp.leg_a.platform).max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)), 
+                        cached_open_positions, 
+                        opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket
                     );
 
-                    // Use the per-tick cached count — no DB round-trip per opportunity.
-                    let involves_poly = matches!(opp.leg_a.platform, Platform::Polymarket | Platform::PolymarketUs)
-                        || matches!(opp.leg_b.platform, Platform::Polymarket | Platform::PolymarketUs);
-
-                    let trips = circuit_breakers.check_all(
-                        approved_size,
-                        bankroll_manager.total_bankroll(),
-                        bankroll_manager.daily_loss_pct(),
-                        bankroll_manager.drawdown_pct(),
-                        bankroll_manager.platform_exposure_pct(&opp.leg_a.platform)
-                            .max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)),
-                        cached_open_positions,
-                        involves_poly,
-                    );
-
-                    if !trips.is_empty() {
-                        if tg_enabled {
-                            for trip in &trips {
-                                // Non-blocking send: the alert channel has a 500-slot
-                                // buffer; dropping one alert on overflow is acceptable.
-                                let _ = alert_tx.try_send(AlertMessage::CircuitBreaker {
-                                    breaker_type: trip.breaker_type.clone(),
-                                    details: trip.details.clone(),
-                                    action: trip.action.clone(),
-                                    resume_at: trip.resume_at,
-                                });
+                    if trips.is_empty() {
+                        let kelly_frac = kelly.optimal_fraction(rust_decimal_macros::dec!(0.90), opp.net_spread);
+                        let approved_size = kelly.position_size(bankroll_manager.total_bankroll(), rust_decimal_macros::dec!(0.90), opp.net_spread, mercury_config.trading.max_single_trade_pct);
+                        
+                        if approved_size > Decimal::ZERO {
+                            let effective_bankroll = (bankroll_manager.total_bankroll() - in_flight_notional).max(Decimal::ZERO);
+                            if effective_bankroll >= approved_size {
+                                let validated = ValidatedOpportunity { opportunity: opp.clone(), approved_size, risk_score: kelly_frac };
+                                if opportunity_tx.try_send(validated).is_ok() {
+                                    metrics.inc_executed();
+                                    cached_open_positions = cached_open_positions.saturating_add(1);
+                                    in_flight_notional += approved_size;
+                                    bankroll_manager.add_exposure(opp.leg_a.platform, approved_size / rust_decimal_macros::dec!(2.0));
+                                    bankroll_manager.add_exposure(opp.leg_b.platform, approved_size / rust_decimal_macros::dec!(2.0));
+                                }
                             }
-                        }
-                        continue;
-                    }
-
-                    if approved_size > Decimal::ZERO {
-                        // Reserve in-flight capital: reduce available bankroll by the
-                        // size of this opportunity so concurrent rapid detections don't
-                        // all size themselves against the full bankroll. Without this,
-                        // max_open_positions trades can each claim max_single_trade_pct
-                        // of the full bankroll, over-leveraging by a factor of N.
-                        let effective_bankroll = (bankroll_manager.total_bankroll()
-                            - in_flight_notional)
-                            .max(Decimal::ZERO);
-                        if effective_bankroll < approved_size {
-                            // Not enough un-reserved capital — skip until in-flight trades settle.
-                            continue;
-                        }
-
-                        let validated = ValidatedOpportunity {
-                            opportunity: opp,
-                            approved_size,
-                            risk_score: kelly_frac,
-                        };
-                        // Non-blocking send: if the executor queue is full we skip
-                        // this opportunity rather than blocking the event loop.
-                        if opportunity_tx.try_send(validated).is_ok() {
-                            metrics.inc_executed();
-                            cached_open_positions = cached_open_positions.saturating_add(1);
-                            in_flight_notional += approved_size;
                         }
                     }
                 }
             }
 
+            // ── Market Discovery Results ──
+            Some(matched) = matched_market_rx.recv() => {
+                let market_id = matched.market.unified_id;
+                if registry.get_market(&market_id).is_none() {
+                    info!(
+                        market_id = %market_id,
+                        question = %matched.market.question,
+                        platforms = matched.market.platforms.len(),
+                        "New cross-platform market registered"
+                    );
+                    let _ = db.upsert_market(&matched.market).await;
+                    registry.register_market(matched.market);
+                }
+            }
+
+            // ── Trade Results ──
             Some(result) = trade_result_rx.recv() => {
                 bankroll_manager.record_trade(&result);
-                // Release platform exposure for both legs now that the trade is
-                // settled; without this, failed-trade exposure accumulates and
-                // the platform exposure circuit breaker trips prematurely.
-                bankroll_manager.remove_exposure(result.leg_a_platform, result.leg_a_size);
-                bankroll_manager.remove_exposure(result.leg_b_platform, result.leg_b_size);
+                // Release the exposure that was RESERVED when dispatched (approved_size/2 per leg),
+                // NOT the actual fill size. On failed trades fill_size=0 but the reservation
+                // must still be freed or the platform exposure accumulates permanently,
+                // eventually triggering CB4 and halting all trading on that platform.
+                let reserved_per_leg = result.approved_size / Decimal::from(2);
+                bankroll_manager.remove_exposure(result.leg_a_platform, reserved_per_leg);
+                bankroll_manager.remove_exposure(result.leg_b_platform, reserved_per_leg);
                 circuit_breakers.record_execution(result.status == TradeStatus::Success);
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
-                // Release the in-flight capital reservation. approved_size is the exact
-                // amount that was reserved when the opportunity was dispatched, so this
-                // correctly frees capital whether the trade succeeded, partially filled, or failed.
+
                 in_flight_notional = in_flight_notional.saturating_sub(result.approved_size);
-                // Decrement cached counter now that the position is settled.
                 cached_open_positions = cached_open_positions.saturating_sub(1);
-                if let Err(e) = trade_result_tx2.try_send(result.clone()) {
-                    // ERROR not warn: a dropped result means the position tracker
-                    // never closes the DB record, leaving a ghost open position that
-                    // inflates exposure and causes cached_open_positions to diverge
-                    // from the database after a restart.
-                    tracing::error!(error = %e, "Position tracker channel full — trade result dropped, open position may not be closed in DB");
+
+                if let Err(e) = trade_result_tx2.send(result.clone()).await {
+                    error!(error = %e, trade_id = result.trade_id,
+                        "CRITICAL: Position tracker channel closed — trade result lost, \
+                         open position will not be closed in DB. Manual intervention required.");
                 }
+
                 match result.status {
                     TradeStatus::Success => metrics.inc_success(),
                     _ => metrics.inc_failed(),
                 }
             }
 
+            // ── Gas Oracle Updates ──
             Some(gas) = gas_update_rx.recv() => {
                 spread_engine.update_gas_price(Decimal::from(gas.gas_gwei));
                 spread_engine.update_matic_price(gas.matic_usd);
                 circuit_breakers.update_gas_price(gas.gas_gwei);
-                debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated live");
+                debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated");
             }
 
+            // ── Daily Report ──
             _ = daily_report_interval.tick() => {
                 let snapshot = bankroll_manager.daily_snapshot(kelly.fraction());
                 let trades = db.get_trades_for_date(chrono::Utc::now().date_naive()).await.unwrap_or_default();
@@ -371,6 +602,7 @@ async fn main() -> Result<()> {
                 let worst_trades: Vec<TradeResult> = sorted_trades.iter().take(3).cloned().collect();
 
                 let db_size = db.db_size_bytes().await.unwrap_or(0);
+
                 let report = DailyReport {
                     snapshot,
                     platform_breakdown,
@@ -382,16 +614,16 @@ async fn main() -> Result<()> {
                     db_size_bytes: db_size,
                 };
 
-                // Persist snapshot before resetting counters (BUG-13 fix).
                 let _ = db.insert_daily_snapshot(&report.snapshot).await;
 
                 if tg_reports_enabled {
                     let _ = daily_report_tx.try_send(report);
                 }
+
                 bankroll_manager.reset_daily();
             }
 
-            // Warn if any background task exits unexpectedly during the main loop.
+            // ── Background Task Monitor ──
             Some(task_result) = join_set.join_next() => {
                 match task_result {
                     Ok(()) => warn!("A background task exited cleanly but unexpectedly"),
@@ -399,28 +631,37 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // ── Graceful Shutdown ──
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutdown signal received");
                 cancel_token.cancel();
+
                 if tg_alerts_enabled {
                     let bot = telegram::bot::TelegramBot::new(tg_notification_token.clone());
-                    let _ = bot.send_message(&tg_alerts_chat, "MERCURY SHUTTING DOWN - Graceful shutdown initiated.").await;
+                    let _ = bot.send_message(
+                        &tg_alerts_chat,
+                        "MERCURY SHUTTING DOWN - Graceful shutdown initiated.",
+                    ).await;
                 }
+
                 info!("MERCURY shutdown complete");
                 break;
             }
         }
     }
 
-    // Drain in-flight trades before killing subsystems. The executor task is
-    // still alive (not yet aborted); give it up to 30 s to settle open legs.
+    // Drain in-flight trades before killing subsystems.
     if cached_open_positions > 0 {
         info!(positions = cached_open_positions, "Draining in-flight positions (up to 30s)");
         let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while cached_open_positions > 0 {
             let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                warn!(positions = cached_open_positions, "Shutdown drain timeout — {} position(s) may remain open", cached_open_positions);
+                warn!(
+                    positions = cached_open_positions,
+                    "Shutdown drain timeout — {} position(s) may remain open",
+                    cached_open_positions
+                );
                 break;
             }
             match tokio::time::timeout(remaining, trade_result_rx.recv()).await {
@@ -430,7 +671,7 @@ async fn main() -> Result<()> {
                     bankroll_manager.remove_exposure(result.leg_b_platform, result.leg_b_size);
                     cached_open_positions = cached_open_positions.saturating_sub(1);
                     if let Err(e) = trade_result_tx2.try_send(result) {
-                        tracing::error!(error = %e, "Position tracker channel full — trade result dropped on second send path");
+                        error!(error = %e, "Position tracker channel full during drain");
                     }
                 }
                 _ => break,

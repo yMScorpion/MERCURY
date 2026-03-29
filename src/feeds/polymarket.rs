@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::Connector;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -178,7 +179,17 @@ impl FeedHandler for PolymarketFeed {
         let url = &self.config.ws_url;
         info!(url, "Connecting to Polymarket WebSocket");
 
-        let (ws_stream, _) = connect_async(url)
+        let tls_connector = native_tls::TlsConnector::builder()
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()
+            .context("Failed to build TLS connector")?;
+        let connector = Connector::NativeTls(tls_connector);
+        let (ws_stream, _) = connect_async_tls_with_config(
+            url,
+            None, // WebSocket config
+            false, // disable_nagle
+            Some(connector),
+        )
             .await
             .context("Failed to connect to Polymarket WebSocket")?;
 

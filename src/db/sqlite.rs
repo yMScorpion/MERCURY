@@ -449,6 +449,21 @@ impl Database for SqliteDb {
         .context("get_open_positions db task panicked")?
     }
 
+    async fn get_open_arb_count(&self) -> Result<usize> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT market_id) FROM positions WHERE closed = 0",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        })
+        .await
+        .context("get_open_arb_count db task panicked")?
+    }
+
     async fn close_position(&self, id: i64) -> Result<()> {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -661,6 +676,32 @@ impl Database for SqliteDb {
         .context("append_audit db task panicked")?
     }
 
+    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let pool = self.pool.clone();
+        let entries: Vec<AuditEntry> = entries.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool.get().context("failed to get db connection")?;
+            let tx = conn.transaction()?;
+            for entry in &entries {
+                let data_str = serde_json::to_string(&entry.data)?;
+                tx.execute(
+                    "INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES (?1,?2,?3,?4)",
+                    rusqlite::params![
+                        entry.timestamp_ns as i64,
+                        entry.module, entry.event_type, data_str,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .context("append_audit_batch db task panicked")?
+    }
+
     async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()> {
         let pool = self.pool.clone();
         let key = key.to_owned();
@@ -694,7 +735,32 @@ impl Database for SqliteDb {
         .await
         .context("db_size_bytes db task panicked")?
     }
+
+    async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
+        let pool = self.pool.clone();
+        let dest = dest_path.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            // Use the SQLite Online Backup API which does NOT lock the source
+            // database. It copies pages incrementally, allowing concurrent reads
+            // and writes during the backup (unlike VACUUM INTO which holds a lock
+            // for the entire operation).
+            let mut dest_conn = rusqlite::Connection::open(&dest)
+                .context("failed to open backup destination")?;
+            let backup = rusqlite::backup::Backup::new(&conn, &mut dest_conn)
+                .context("failed to initialize SQLite backup")?;
+            // Copy 256 pages at a time, sleeping 10ms between batches to avoid
+            // starving active queries on the source connection pool.
+            backup.run_to_completion(256, std::time::Duration::from_millis(10), None)
+                .context("SQLite backup failed")?;
+            Ok(())
+        })
+        .await
+        .context("backup_to_file db task panicked")?
+    }
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Row-to-struct helpers

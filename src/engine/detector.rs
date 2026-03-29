@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
-use tracing::debug;
+use std::str::FromStr;
+use tracing::{debug};
 use uuid::Uuid;
 
 use crate::engine::market_registry::MarketRegistry;
@@ -60,9 +60,10 @@ impl ArbitrageDetector {
         self.active_arbs = count;
     }
 
-    /// Run the detection pipeline on all registered arb pairs
-    pub fn detect(
+    /// Evaluates spreads ONLY for the specific market that just updated.
+    pub fn detect_for_market(
         &mut self,
+        market_id: &Uuid,
         registry: &MarketRegistry,
         uob: &UnifiedOrderBook,
         spread_engine: &NetSpreadEngine,
@@ -70,7 +71,7 @@ impl ArbitrageDetector {
     ) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::new();
 
-        for pair in registry.get_arb_pairs() {
+        for pair in registry.get_arb_pairs().iter().filter(|p| p.market_id == *market_id) {
             let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
                 Some(b) => b,
                 None => continue,
@@ -89,18 +90,17 @@ impl ArbitrageDetector {
                     Ok(()) => {
                         self.stats.opportunities_passed += 1;
 
-                        let market = registry.get_market(&pair.market_id);
-                        let market_question = market.map(|m| m.question.clone()).unwrap_or_default();
-                        let leg_a_pmi = market.and_then(|m| m.platforms.get(&spread.leg_a_platform));
-                        let leg_b_pmi = market.and_then(|m| m.platforms.get(&spread.leg_b_platform));
+                        let market_question = registry.get_market(&pair.market_id)
+                            .map(|m| m.question.clone())
+                            .unwrap_or_default();
 
                         let liquidity = spread.leg_a_available.min(spread.leg_b_available);
-                        let log_liq = liquidity.to_f64()
-                            .map(|l| if l > 0.0 { l.ln() } else { 1.0 })
-                            .unwrap_or(1.0);
-                        let score = spread.net_spread
-                            * Decimal::from_f64_retain(log_liq).unwrap_or(Decimal::ONE)
-                            * Decimal::from_f64_retain(pair.confidence).unwrap_or(Decimal::ONE);
+                        let log_liq = if liquidity > Decimal::ZERO {
+                            Decimal::from_str(&format!("{:.4}", (liquidity.to_f64().unwrap_or(1.0)).ln())).unwrap_or(Decimal::ONE)
+                        } else {
+                            Decimal::ONE
+                        };
+                        let score = spread.net_spread * log_liq * Decimal::from_str(&format!("{:.4}", pair.confidence)).unwrap_or(Decimal::ONE);
 
                         opportunities.push(ArbitrageOpportunity {
                             opp_id: Uuid::new_v4(),
@@ -108,8 +108,6 @@ impl ArbitrageDetector {
                             market_question,
                             leg_a: LegDetail {
                                 platform: spread.leg_a_platform,
-                                platform_market_id: leg_a_pmi.map(|p| p.platform_market_id.clone()).unwrap_or_default(),
-                                fee_rate_bps: leg_a_pmi.map(|p| p.fee_rate_bps as u32).unwrap_or(0),
                                 side: spread.leg_a_side,
                                 price: spread.leg_a_price,
                                 available_size: spread.leg_a_available,
@@ -117,8 +115,6 @@ impl ArbitrageDetector {
                             },
                             leg_b: LegDetail {
                                 platform: spread.leg_b_platform,
-                                platform_market_id: leg_b_pmi.map(|p| p.platform_market_id.clone()).unwrap_or_default(),
-                                fee_rate_bps: leg_b_pmi.map(|p| p.fee_rate_bps as u32).unwrap_or(0),
                                 side: spread.leg_b_side,
                                 price: spread.leg_b_price,
                                 available_size: spread.leg_b_available,
@@ -126,8 +122,8 @@ impl ArbitrageDetector {
                             },
                             raw_spread: spread.raw_spread,
                             net_spread: spread.net_spread,
-                            kelly_fraction: Decimal::ZERO,
-                            recommended_size: Decimal::ZERO,
+                            kelly_fraction: Decimal::ZERO, 
+                            recommended_size: Decimal::ZERO, 
                             score,
                             detected_at: now_ns(),
                             ttl_ms: 5000,
@@ -141,7 +137,6 @@ impl ArbitrageDetector {
         }
 
         opportunities.sort_by(|a, b| b.score.cmp(&a.score));
-
         let slots = self.max_concurrent.saturating_sub(self.active_arbs);
         opportunities.truncate(slots);
 
@@ -155,13 +150,11 @@ impl ArbitrageDetector {
         book_b: &crate::engine::order_book::PlatformBook,
         confidence: f64,
     ) -> Result<(), RejectionReason> {
-        // G1: Spread Threshold
         if spread.net_spread < self.min_spread {
             self.stats.gate1_rejected += 1;
             return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
         }
 
-        // G2: Liquidity Check
         let min_available = spread.leg_a_available.min(spread.leg_b_available);
         if min_available < self.min_order_size {
             self.stats.gate2_rejected += 1;
@@ -171,7 +164,6 @@ impl ArbitrageDetector {
             });
         }
 
-        // G3: Staleness Filter
         let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
         let now = now_ns();
 
@@ -193,7 +185,6 @@ impl ArbitrageDetector {
             });
         }
 
-        // G4: Correlation Check
         if confidence < 0.95 {
             self.stats.gate4_rejected += 1;
             return Err(RejectionReason::CorrelationExposure {
@@ -202,7 +193,6 @@ impl ArbitrageDetector {
             });
         }
 
-        // G5: Risk Budget
         if self.active_arbs >= self.max_concurrent {
             self.stats.gate5_rejected += 1;
             return Err(RejectionReason::RiskBudgetExceeded {

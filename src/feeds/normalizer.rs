@@ -40,17 +40,18 @@ pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> D
 
 /// Calculate VWAP slippage for a target order size against order book depth.
 ///
-/// Returns `None` when the available depth is insufficient to fill `target_size`
-/// (the caller must treat this as an illiquid / unsizable opportunity).
-/// Returns `Some(slippage)` where slippage is the absolute deviation of the
-/// fill VWAP from the best quoted price.
-pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel], _is_buy: bool) -> Option<Decimal> {
-    if depth.is_empty() || target_size == Decimal::ZERO {
+/// `depth` **must** be pre-sorted in fill-walk order by the caller:
+///   - For buys against asks: ascending price (`PlatformBook::ask_depth()`)
+///   - For sells into bids: descending price (`PlatformBook::bid_depth()`)
+///
+/// Returns `None` when the available depth is insufficient to fill `target_size`.
+/// Returns `Some(slippage)` — the absolute VWAP deviation from best quoted price.
+pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<Decimal> {
+    if depth.is_empty() || target_size <= Decimal::ZERO {
         return Some(Decimal::ZERO);
     }
 
     let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();
-
     if levels.is_empty() {
         return Some(Decimal::ZERO);
     }

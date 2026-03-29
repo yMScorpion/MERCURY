@@ -5,13 +5,14 @@ edition = "2021"
 description = "Cross-market prediction arbitrage engine"
 
 [dependencies]
+native-tls = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 reqwest = { version = "0.12", features = ["json", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-rusqlite = { version = "0.31", features = ["bundled", "serde_json"] }
+rusqlite = { version = "0.31", features = ["bundled", "serde_json", "backup"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 ethers = { version = "2", features = ["legacy"] }

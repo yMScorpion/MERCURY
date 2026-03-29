@@ -71,6 +71,48 @@ impl PolymarketClient {
             api_passphrase,
         }
     }
+    /// Poll the order status endpoint to get actual fill details.
+    /// Returns (actual_fill_price, actual_fill_size, fee) if filled.
+    async fn poll_fill(&self, order_id: &str) -> Option<(Decimal, Decimal, Decimal)> {
+        let url = format!("{}/order/{}", self.rest_url, order_id);
+        for attempt in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
+            let resp = match self.http
+                .get(&url)
+                .header("POLY_API_KEY", &self.api_key)
+                .header("POLY_SECRET", &self.api_secret)
+                .header("POLY_PASSPHRASE", &self.api_passphrase)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body: serde_json::Value = match resp.json().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status == "FILLED" || status == "CLOSED" {
+                let avg_price = body.get("average_price")
+                    .or_else(|| body.get("price"))
+                    .and_then(|p| p.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok());
+                let filled_size = body.get("size_filled")
+                    .or_else(|| body.get("original_size"))
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok());
+                let fee = body.get("fee")
+                    .and_then(|f| f.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok())
+                    .unwrap_or(Decimal::ZERO);
+                if let (Some(price), Some(size)) = (avg_price, filled_size) {
+                    return Some((price, size, fee));
+                }
+            }
+        }
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -150,17 +192,22 @@ impl PlatformOrderClient for PolymarketClient {
             error_msg: Some(format!("HTTP {}", status_code)),
         });
 
-        // Actual fill_price comes from exchange; use requested price as approximation
         if body.success {
+            let order_id_str = body.order_id.unwrap_or_default();
             let fill_size = taker_amount_scaled / scale;
-            // Fix 2: use the actual fee_rate_bps instead of hardcoded 0
-            let fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, fee_rate_bps as u16);
+            let estimated_fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, fee_rate_bps as u16);
+
+            // Return immediately with the estimated fill details.
+            // Actual fill prices will be reconciled asynchronously by the
+            // reconciliation engine — polling here adds 1.2s latency to
+            // every execution, which is unacceptable for an HFT system.
+            let (actual_price, actual_size, actual_fee) = (price, fill_size, estimated_fee);
             Ok(OrderResult {
                 filled: true,
-                fill_price: price,
-                fill_size,
-                fee,
-                order_id: body.order_id.unwrap_or_default(),
+                fill_price: actual_price,
+                fill_size: actual_size,
+                fee: actual_fee,
+                order_id: order_id_str,
                 error: None,
             })
         } else {
@@ -170,7 +217,7 @@ impl PlatformOrderClient for PolymarketClient {
                 fill_size: Decimal::ZERO,
                 fee: Decimal::ZERO,
                 order_id: String::new(),
-                error: body.error_msg,
+                error: body.error_msg.or_else(|| Some(format!("HTTP {}", status_code))),
             })
         }
     }

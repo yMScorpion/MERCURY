@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where claude:*)",
+      "Bash(rtk git:*)",
+      "Bash(wc -l /c/Users/ADRIANO/MERCURY/src/engine/*.rs)",
+      "Bash(wc -l /c/Users/ADRIANO/MERCURY/src/feeds/*.rs)",
+      "Bash(grep -v \"^$\")",
+      "Bash(rtk cargo:*)",
+      "Bash(cargo check:*)",
+      "Bash(git add:*)",
+      "Bash(cat C:/Users/ADRIANO/MERCURY/.serena/logs/health-checks/*.log)",
+      "Bash(rtk ls:*)",
+      "Bash(python3:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "claude-flow"
+  ]
+}

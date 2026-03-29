@@ -25,20 +25,21 @@ impl MarketRegistry {
         }
     }
 
-    /// Register a market (with its cross-platform mappings)
+    /// Register a market. Idempotent: re-registering the same market_id updates
+    /// the market definition but does not create duplicate arb pairs.
     pub fn register_market(&mut self, market: Market) {
         let market_id = market.unified_id;
         let platforms: Vec<Platform> = market.platforms.keys().cloned().collect();
+        let confidence = market.confidence;
+
+        // Remove stale arb pairs for this market before re-adding.
+        self.arb_pairs.retain(|p| p.market_id != market_id);
 
         self.markets.insert(market_id, market);
 
-        for i in 0..platforms.len() {
-            for j in (i + 1)..platforms.len() {
-                let confidence = self.markets.get(&market_id)
-                    .map(|m| m.confidence)
-                    .unwrap_or(0.0);
-
-                if confidence >= 0.95 {
+        if confidence >= 0.95 {
+            for i in 0..platforms.len() {
+                for j in (i + 1)..platforms.len() {
                     self.arb_pairs.push(ArbPair {
                         market_id,
                         platform_a: platforms[i],

@@ -221,7 +221,7 @@ impl FeedHandler for ForecastExFeed {
 
                     match msg_type {
                         "W" | "X" => {
-                            self.handle_market_data(&fields, &tick_tx);
+                            self.handle_market_data(&fields, &line_buf, &tick_tx);
                         }
                         "0" => {
                             let hb = self.build_fix_message("0", &[]);
@@ -257,57 +257,96 @@ impl ForecastExFeed {
     fn handle_market_data(
         &mut self,
         fields: &std::collections::HashMap<u32, String>,
+        raw_msg: &str,
         tick_tx: &broadcast::Sender<NormalizedTick>,
     ) {
         let symbol = fields.get(&55).map(|s| s.as_str()).unwrap_or("");
         if symbol.is_empty() { return; }
 
-        if let Some(book) = self.books.get_mut(symbol) {
-            let entry_type = fields.get(&269).map(|s| s.as_str()).unwrap_or("");
+        let book = match self.books.get_mut(symbol) {
+            Some(b) => b,
+            None => return,
+        };
 
-            // Never default price or size to 0 on parse failure — a 0-priced ask
-            // would look like a near-100% arb opportunity and fire real orders.
-            // If we can't parse the field, drop the update and log the raw value.
-            let price = match fields.get(&270).and_then(|s| Decimal::from_str(s).ok()) {
-                Some(p) => p,
-                None => {
-                    tracing::error!(
-                        symbol,
-                        raw = fields.get(&270).map(|s| s.as_str()).unwrap_or("<missing>"),
-                        "ForecastEx: failed to parse FIX tag 270 (price) — dropping update"
-                    );
-                    return;
+        // FIX repeating groups: parse all 269/270/271 triplets from the raw message.
+        // Tags appear in order: 269 (type), 270 (price), 271 (size), then next 269, etc.
+        let parts: Vec<&str> = raw_msg.split(SOH).collect();
+        let mut i = 0;
+        let mut updated = false;
+        while i < parts.len() {
+            if let Some(eq) = parts[i].find('=') {
+                let tag_str = &parts[i][..eq];
+                if tag_str == "269" {
+                    let entry_type = &parts[i][eq + 1..];
+                    // Look ahead for 270 and 271
+                    let price = Self::find_next_tag(&parts, i + 1, 270);
+                    let size = Self::find_next_tag(&parts, i + 1, 271);
+                    match (price, size) {
+                        (Some(p_str), Some(s_str)) => {
+                            let price = match Decimal::from_str(p_str) {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::error!(symbol, raw = p_str,
+                                        "ForecastEx: bad price in repeating group — skipping entry");
+                                    i += 1;
+                                    continue;
+                                }
+                            };
+                            let size = match Decimal::from_str(s_str) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    tracing::error!(symbol, raw = s_str,
+                                        "ForecastEx: bad size in repeating group — skipping entry");
+                                    i += 1;
+                                    continue;
+                                }
+                            };
+                            match entry_type {
+                                "0" => { // Bid
+                                    if size == Decimal::ZERO { book.bids.remove(&price); }
+                                    else { book.bids.insert(price, size); }
+                                    updated = true;
+                                }
+                                "1" => { // Offer
+                                    if size == Decimal::ZERO { book.asks.remove(&price); }
+                                    else { book.asks.insert(price, size); }
+                                    updated = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-            };
-            let size = match fields.get(&271).and_then(|s| Decimal::from_str(s).ok()) {
-                Some(s) => s,
-                None => {
-                    tracing::error!(
-                        symbol,
-                        raw = fields.get(&271).map(|s| s.as_str()).unwrap_or("<missing>"),
-                        "ForecastEx: failed to parse FIX tag 271 (size) — dropping update"
-                    );
-                    return;
-                }
-            };
-
-            match entry_type {
-                "0" => {
-                    if size == Decimal::ZERO { book.bids.remove(&price); }
-                    else { book.bids.insert(price, size); }
-                }
-                "1" => {
-                    if size == Decimal::ZERO { book.asks.remove(&price); }
-                    else { book.asks.insert(price, size); }
-                }
-                _ => {}
             }
+            i += 1;
+        }
 
+        if updated {
             self.sequence += 1;
             if let Some(mut tick) = self.emit_tick(symbol) {
                 tick.sequence = self.sequence;
                 let _ = tick_tx.send(tick);
             }
         }
+    }
+
+    /// Scan forward from `start` for the next occurrence of `target_tag`.
+    /// Stop if we hit another 269 (start of next entry) or run out of parts.
+    fn find_next_tag<'a>(parts: &[&'a str], start: usize, target_tag: u32) -> Option<&'a str> {
+        let target = target_tag.to_string();
+        for i in start..parts.len() {
+            if let Some(eq) = parts[i].find('=') {
+                let tag = &parts[i][..eq];
+                if tag == target {
+                    return Some(&parts[i][eq + 1..]);
+                }
+                // Stop at next entry group
+                if tag == "269" {
+                    return None;
+                }
+            }
+        }
+        None
     }
 }

@@ -8,11 +8,13 @@ use super::executor::{OrderResult, PlatformOrderClient};
 use crate::crypto::jwt::KalshiAuth;
 use crate::types::Side;
 
+use std::sync::Arc;
+
 #[derive(Clone)]
 pub struct KalshiClient {
     http: reqwest::Client,
     rest_url: String,
-    auth: KalshiAuth,
+    auth: Arc<KalshiAuth>,
 }
 
 #[derive(Serialize)]
@@ -61,7 +63,7 @@ impl KalshiClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("failed to build Kalshi HTTP client");
-        Self { http, rest_url, auth }
+        Self { http, rest_url, auth: Arc::new(auth) }
     }
 }
 
@@ -84,7 +86,7 @@ impl PlatformOrderClient for KalshiClient {
         info!(ticker = market_id, side = %kalshi_side, price_cents, count, "Submitting Kalshi order");
 
         let url = format!("{}/portfolio/orders", self.rest_url);
-        let auth_header = self.auth.auth_header()?;
+        let auth_header = self.auth.auth_header().await?;
 
         let req = KalshiOrderRequest {
             ticker: market_id.to_string(),
@@ -152,7 +154,7 @@ impl PlatformOrderClient for KalshiClient {
 
     async fn cancel_order(&self, order_id: &str) -> Result<()> {
         let url = format!("{}/portfolio/orders/{}", self.rest_url, order_id);
-        let auth_header = self.auth.auth_header()?;
+        let auth_header = self.auth.auth_header().await?;
         let resp = self.http.delete(&url)
             .header("Authorization", &auth_header)
             .send()

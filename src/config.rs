@@ -133,6 +133,35 @@ impl MercuryConfig {
             "max_open_positions must be at least 1, got {}", t.max_open_positions);
         anyhow::ensure!(t.max_concurrent_arbs >= 1,
             "max_concurrent_arbs must be at least 1, got {}", t.max_concurrent_arbs);
+            
+        // Validate platform URLs
+        let p = &self.platforms;
+        if p.polymarket.enabled {
+            anyhow::ensure!(!p.polymarket.ws_url.is_empty(),
+                "Polymarket enabled but ws_url is empty");
+            anyhow::ensure!(!p.polymarket.rest_url.is_empty(),
+                "Polymarket enabled but rest_url is empty");
+            anyhow::ensure!(p.polymarket.ws_url.starts_with("wss://") || p.polymarket.ws_url.starts_with("ws://"),
+                "Polymarket ws_url must start with ws:// or wss://, got: {}", p.polymarket.ws_url);
+        }
+        if p.kalshi.enabled {
+            anyhow::ensure!(!p.kalshi.ws_url.is_empty(),
+                "Kalshi enabled but ws_url is empty");
+            anyhow::ensure!(!p.kalshi.rest_url.is_empty(),
+                "Kalshi enabled but rest_url is empty");
+        }
+        if p.cdna.enabled {
+            anyhow::ensure!(!p.cdna.ws_url.is_empty(),
+                "CDNA enabled but ws_url is empty");
+            anyhow::ensure!(!p.cdna.rest_url.is_empty(),
+                "CDNA enabled but rest_url is empty");
+        }
+        if p.forecastex.enabled {
+            anyhow::ensure!(!p.forecastex.fix_host.is_empty(),
+                "ForecastEx enabled but fix_host is empty");
+            anyhow::ensure!(p.forecastex.fix_port > 0,
+                "ForecastEx enabled but fix_port is 0");
+        }
         Ok(())
     }
 }

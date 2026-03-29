@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::client::IntoClientRequest, tungstenite::Message, Connector};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -15,10 +15,11 @@ use super::base::FeedHandler;
 use crate::config::KalshiConfig;
 use crate::crypto::jwt::KalshiAuth;
 use crate::types::*;
+use std::sync::Arc;
 
 pub struct KalshiFeed {
     config: KalshiConfig,
-    auth: Option<KalshiAuth>,
+    auth: Option<Arc<KalshiAuth>>,
     subscriptions: Vec<(String, Uuid)>,
     books: std::collections::HashMap<String, KalshiOrderBook>,
     sequence: u64,
@@ -89,7 +90,7 @@ impl KalshiFeed {
     pub fn new(config: KalshiConfig, auth: Option<KalshiAuth>, subscriptions: Vec<(String, Uuid)>) -> Self {
         Self {
             config,
-            auth,
+            auth: auth.map(Arc::new),
             subscriptions,
             books: std::collections::HashMap::new(),
             sequence: 0,
@@ -166,11 +167,23 @@ impl FeedHandler for KalshiFeed {
                     .try_into()
                     .context("Failed to build Kalshi auth header")?,
             );
-            connect_async(request).await.context("Failed to connect to Kalshi WebSocket")?
+            {
+                let tls = native_tls::TlsConnector::builder()
+                    .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+                    .build()
+                    .context("Failed to build Kalshi TLS connector")?;
+                connect_async_tls_with_config(request, None, false, Some(Connector::NativeTls(tls)))
+                    .await.context("Failed to connect to Kalshi WebSocket")?
+            }
         } else {
-            connect_async(self.config.ws_url.as_str())
-                .await
-                .context("Failed to connect to Kalshi WebSocket")?
+            {
+                let tls = native_tls::TlsConnector::builder()
+                    .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+                    .build()
+                    .context("Failed to build Kalshi TLS connector")?;
+                connect_async_tls_with_config(self.config.ws_url.as_str(), None, false, Some(Connector::NativeTls(tls)))
+                    .await.context("Failed to connect to Kalshi WebSocket")?
+            }
         };
 
         let (mut write, mut read) = ws_stream.split();
@@ -181,7 +194,7 @@ impl FeedHandler for KalshiFeed {
                 id: 1,
                 cmd: "subscribe".into(),
                 params: KalshiSubParams {
-                    channels: vec!["orderbook_delta".into(), "trade".into()],
+                    channels: vec!["orderbook_snapshot".into(), "orderbook_delta".into(), "trade".into()],
                     market_tickers: tickers.clone(),
                 },
             };

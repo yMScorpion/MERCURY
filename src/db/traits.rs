@@ -17,6 +17,8 @@ pub trait Database: Send + Sync + 'static {
     async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>>;
     async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>>;
     async fn get_trade_count(&self) -> Result<i64>;
+    /// Count distinct in-flight arbitrage pairs (not individual position records).
+    async fn get_open_arb_count(&self) -> Result<usize>;
 
     // Positions
     async fn upsert_position(&self, position: &Position) -> Result<()>;
@@ -37,10 +39,14 @@ pub trait Database: Send + Sync + 'static {
 
     // Audit log
     async fn append_audit(&self, entry: &AuditEntry) -> Result<()>;
+    /// Batch-insert multiple audit entries in a single transaction.
+    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()>;
 
     // Config history
     async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()>;
 
     // Utility
     async fn db_size_bytes(&self) -> Result<u64>;
+    /// Create an atomic backup of the database to the given file path.
+    async fn backup_to_file(&self, dest_path: &str) -> Result<()>;
 }

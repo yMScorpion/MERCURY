@@ -38,18 +38,6 @@ struct RpcError {
     message: String,
 }
 
-// ── JSON shapes for CoinGecko simple/price ─────────────────────────────────
-
-#[derive(Deserialize)]
-struct CoinGeckoPrice {
-    #[serde(rename = "matic-network")]
-    matic_network: Option<MaticEntry>,
-}
-
-#[derive(Deserialize)]
-struct MaticEntry {
-    usd: f64,
-}
 
 /// Alert if this many consecutive CoinGecko fetches fail (rate-limited or down).
 const COINGECKO_ALERT_THRESHOLD: u32 = 5;
@@ -191,17 +179,28 @@ impl GasOracle {
         Ok(gwei.max(1)) // floor at 1 gwei to avoid zero gas cost in spread calc
     }
 
-    /// Fetch MATIC/USD from CoinGecko's free (no-key) simple/price endpoint.
+    /// Fetch MATIC/USD (or POL/USD) from CoinGecko's free simple/price endpoint.
+    /// Tries both the legacy `matic-network` and new `polygon-ecosystem-token` IDs.
     async fn fetch_matic_usd(&self) -> Result<Decimal> {
+        // Try the current ID first, fall back to legacy
+        for coin_id in &["polygon-ecosystem-token", "matic-network"] {
+            match self.try_coingecko_price(coin_id).await {
+                Ok(price) => return Ok(price),
+                Err(e) => {
+                    tracing::debug!(coin_id, error = %e, "CoinGecko fetch failed, trying next ID");
+                }
+            }
+        }
+        Err(anyhow::anyhow!("All CoinGecko IDs failed for MATIC/POL price"))
+    }
+
+    async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
         let http_resp = self.http
             .get("https://api.coingecko.com/api/v3/simple/price")
-            .query(&[("ids", "matic-network"), ("vs_currencies", "usd")])
+            .query(&[("ids", coin_id), ("vs_currencies", "usd")])
             .send()
             .await?;
 
-        // Check HTTP status before attempting JSON deserialization.
-        // CoinGecko returns 429 with a plain-text body on rate limits, which
-        // would produce a misleading deserialization error if not checked first.
         let status = http_resp.status();
         if !status.is_success() {
             let body = http_resp.text().await.unwrap_or_default();
@@ -212,13 +211,13 @@ impl GasOracle {
             ));
         }
 
-        let resp: CoinGeckoPrice = http_resp.json().await?;
-
-        let usd = resp.matic_network
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing 'matic-network' field"))?
-            .usd;
+        let resp: serde_json::Value = http_resp.json().await?;
+        let usd = resp.get(coin_id)
+            .and_then(|v| v.get("usd"))
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
 
         Decimal::from_f64_retain(usd)
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko MATIC/USD value is not finite: {}", usd))
+            .ok_or_else(|| anyhow::anyhow!("CoinGecko value is not finite: {}", usd))
     }
 }
