@@ -71,12 +71,10 @@ impl KalshiClient {
 impl PlatformOrderClient for KalshiClient {
     async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
         // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
-        let price_cents = (price * Decimal::from(100))
-            .round()
-            .to_i64()
-            .unwrap_or(50);
-        // Round to nearest whole contract — avoids asymmetric leg sizes (e.g. 2.5 → 2).
-        let count = size.round().to_i64().unwrap_or(1).max(1);
+
+        // Avoid string parsing panics by directly safely converting rounded decimals
+        let price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
+        let count = size.round().to_i64().unwrap_or(1);
 
         let (kalshi_side, yes_price, no_price) = match side {
             Side::Yes => ("yes".to_string(), Some(price_cents), None),

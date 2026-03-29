@@ -5,7 +5,6 @@ use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use uuid::Uuid;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -63,17 +62,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
     let mercury_config = MercuryConfig::load(&cli.config)?;
+    info!("Configuration loaded");
 
     // HARD PANIC FOR FORECAST EX
     if mercury_config.platforms.forecastex.enabled {
         panic!("CRITICAL: ForecastEx FIX execution is not fully implemented. Do not run with forecastex.enabled = true to prevent unhedged dual-leg exposure.");
     }
-
-    let cli = Cli::parse();
-    info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
-
-    let mercury_config = MercuryConfig::load(&cli.config)?;
-    info!("Configuration loaded");
 
     let db: Arc<dyn db::Database> = Arc::new(SqliteDb::new(
         &mercury_config.database.path,
@@ -107,7 +101,7 @@ async fn main() -> Result<()> {
         && !tg_daily_token.is_empty()
         && !tg_report_chat.is_empty()
         && tg_report_chat != "YOUR_CHAT_ID_HERE";
-    let tg_enabled = tg_alerts_enabled || tg_reports_enabled;
+    let _tg_enabled = tg_alerts_enabled || tg_reports_enabled;
 
     // ─── Shared cancellation token & task tracker ───
     let cancel_token = CancellationToken::new();
@@ -495,14 +489,16 @@ loop {
 
                 // Process opportunities
                 for opp in opps {
-                    let mut trips = circuit_breakers.check_all(
+                    let trips = circuit_breakers.check_all(
                         opp.recommended_size, 
                         bankroll_manager.total_bankroll(), 
                         bankroll_manager.daily_loss_pct(), 
                         bankroll_manager.drawdown_pct(), 
                         bankroll_manager.platform_exposure_pct(&opp.leg_a.platform).max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)), 
                         cached_open_positions, 
-                        opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket
+                        opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
+                        0, // ms_since_last_tick (defaulting to 0 for the hot path)
+                        rust_decimal::Decimal::ZERO // market_exposure_pct (defaulting to 0)
                     );
 
                     if trips.is_empty() {
@@ -512,13 +508,24 @@ loop {
                         if approved_size > Decimal::ZERO {
                             let effective_bankroll = (bankroll_manager.total_bankroll() - in_flight_notional).max(Decimal::ZERO);
                             if effective_bankroll >= approved_size {
-                                let validated = ValidatedOpportunity { opportunity: opp.clone(), approved_size, risk_score: kelly_frac };
-                                if opportunity_tx.try_send(validated).is_ok() {
-                                    metrics.inc_executed();
-                                    cached_open_positions = cached_open_positions.saturating_add(1);
-                                    in_flight_notional += approved_size;
-                                    bankroll_manager.add_exposure(opp.leg_a.platform, approved_size / rust_decimal_macros::dec!(2.0));
-                                    bankroll_manager.add_exposure(opp.leg_b.platform, approved_size / rust_decimal_macros::dec!(2.0));
+                                let leg_exposure = approved_size * rust_decimal_macros::dec!(0.5);
+                                
+                                // Extract the Enums BEFORE moving the opportunity into the channel
+                                let platform_a = opp.leg_a.platform;
+                                let platform_b = opp.leg_b.platform;
+                                
+                                let validated = ValidatedOpportunity { opportunity: opp, approved_size, risk_score: kelly_frac };
+                                match opportunity_tx.try_send(validated) {
+                                    Ok(_) => {
+                                        metrics.inc_executed();
+                                        cached_open_positions = cached_open_positions.saturating_add(1);
+                                        in_flight_notional += approved_size;
+                                        bankroll_manager.add_exposure(platform_a, leg_exposure);
+                                        bankroll_manager.add_exposure(platform_b, leg_exposure);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Execution channel full, dropping opportunity to maintain latency");
+                                    }
                                 }
                             }
                         }
@@ -555,7 +562,11 @@ loop {
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
 
                 in_flight_notional = in_flight_notional.saturating_sub(result.approved_size);
-                cached_open_positions = cached_open_positions.saturating_sub(1);
+                // Only decrement the local open positions counter if the trade failed.
+                // Successful and partial trades remain open in the database and consume position capacity.
+                if result.status == TradeStatus::Fail {
+                    cached_open_positions = cached_open_positions.saturating_sub(1);
+                }
 
                 if let Err(e) = trade_result_tx2.send(result.clone()).await {
                     error!(error = %e, trade_id = result.trade_id,
@@ -624,7 +635,7 @@ loop {
             }
 
             // ── Background Task Monitor ──
-            Some(task_result) = join_set.join_next() => {
+            Some(task_result) = join_set.join_next(), if !join_set.is_empty() => {
                 match task_result {
                     Ok(()) => warn!("A background task exited cleanly but unexpectedly"),
                     Err(e) => warn!("A background task was cancelled or panicked: {e}"),

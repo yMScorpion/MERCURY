@@ -53,7 +53,8 @@ pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<D
 
     let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();
     if levels.is_empty() {
-        return Some(Decimal::ZERO);
+        // Return None to explicitly signal a complete lack of liquidity
+        return None;
     }
 
     let best_price = levels[0].price;

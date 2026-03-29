@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::db::Database;
 use crate::types::*;
@@ -104,11 +105,11 @@ impl ExecutionEngine {
 
         let first_result = self.execute_leg(
             &first_leg.platform,
-            &opp.market_id.to_string(),
+            &first_leg.platform_market_id,
             first_leg.side,
             first_leg.price,
             validated.approved_size,
-            first_leg.fee_estimate.to_u32().unwrap_or(0),
+            first_leg.fee_rate_bps, // Pass actual BPS rate
         ).await;
 
         let (leg_a_result, leg_b_result) = match first_result {
@@ -116,11 +117,11 @@ impl ExecutionEngine {
                 let hedge_size = first_fill.fill_size; 
                 let second_result = self.execute_leg(
                     &second_leg.platform,
-                    &opp.market_id.to_string(),
+                    &second_leg.platform_market_id,
                     second_leg.side,
                     second_leg.price,
                     hedge_size,
-                    second_leg.fee_estimate.to_u32().unwrap_or(0),
+                    second_leg.fee_rate_bps, // Pass actual BPS rate
                 ).await;
 
                 match second_result {
@@ -143,15 +144,24 @@ impl ExecutionEngine {
                             &opp.market_id.to_string(),
                             &first_fill,
                         ).await;
-                        let failed = OrderResult {
-                            filled: false,
-                            fill_price: Decimal::ZERO,
-                            fill_size: Decimal::ZERO,
-                            fee: Decimal::ZERO,
-                            order_id: String::new(),
-                            error: Some(e.to_string()),
-                        };
-                        (first_fill, failed)
+                    let err_str = e.to_string();
+                    let failed = OrderResult {
+                        filled: false,
+                        fill_price: Decimal::ZERO,
+                        fill_size: Decimal::ZERO,
+                        fee: Decimal::ZERO,
+                        order_id: String::new(),
+                        error: Some(err_str.clone()),
+                    };
+                    let failed2 = OrderResult {
+                        filled: false,
+                        fill_price: Decimal::ZERO,
+                        fill_size: Decimal::ZERO,
+                        fee: Decimal::ZERO,
+                        order_id: String::new(),
+                        error: Some(err_str),
+                    };
+                    (failed, failed2)
                     }
                 }
             }
@@ -199,6 +209,7 @@ impl ExecutionEngine {
             opp_id: opp.opp_id,
             market_id: opp.market_id,
             market_question: opp.market_question.clone(),
+            approved_size: validated.approved_size,
             leg_a_platform: first_leg.platform,
             leg_a_side: first_leg.side,
             leg_a_price: first_leg.price,
@@ -313,7 +324,14 @@ impl ExecutionEngine {
             let total_cost = leg_a.fill_price + leg_b.fill_price;
             let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.min(leg_b.fill_size);
             let net_profit = gross_profit - leg_a.fee - leg_b.fee;
-            (TradeStatus::Success, net_profit, None)
+            
+            let status = if leg_a.fill_size == leg_b.fill_size {
+                TradeStatus::Success
+            } else {
+                TradeStatus::Partial
+            };
+            
+            (status, net_profit, None)
         } else if leg_a.filled && !leg_b.filled {
             let loss = leg_a.fee; 
             let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());

@@ -121,7 +121,7 @@ impl MarketDiscovery {
         }
 
         let mut matched = Vec::new();
-        for (norm_q, group) in &by_question {
+        for (_norm_q, group) in &by_question {
             // Only create an arb-eligible market if ≥2 platforms carry it.
             let platforms_present: Vec<Platform> =
                 group.iter().map(|g| g.platform).collect::<std::collections::HashSet<_>>()
@@ -206,7 +206,7 @@ impl MarketDiscovery {
         let resp: serde_json::Value = self
             .http
             .get(&url)
-            .query(&[("active", "true"), ("limit", "100")])
+            .query(&[("active", "true"), ("limit", "1000")])
             .send()
             .await
             .context("Polymarket markets fetch failed")?
@@ -263,7 +263,7 @@ impl MarketDiscovery {
         let resp: serde_json::Value = self
             .http
             .get(&url)
-            .query(&[("status", "open"), ("limit", "100")])
+            .query(&[("status", "open"), ("limit", "1000")])
             .send()
             .await
             .context("Kalshi markets fetch failed")?

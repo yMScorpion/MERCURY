@@ -124,40 +124,34 @@ impl PlatformOrderClient for PolymarketClient {
 
         // Scale to USDC/outcome-token base units (6 decimals)
         let scale = Decimal::from(1_000_000u64);
-        let maker_amount_scaled = (size * price * scale).floor();
-        let taker_amount_scaled = (size * scale).floor();
+        
+        // Ensure maker/taker amounts invert correctly for SELL orders
+        let (maker_amount_scaled, taker_amount_scaled) = if side == Side::Yes {
+            ((size * price * scale).floor(), (size * scale).floor())
+        } else {
+            ((size * scale).floor(), (size * price * scale).floor())
+        };
 
-        let maker_amount_u256 = U256::from_dec_str(&maker_amount_scaled.to_string())
-            .unwrap_or(U256::zero());
-        let taker_amount_u256 = U256::from_dec_str(&taker_amount_scaled.to_string())
-            .unwrap_or(U256::zero());
-
-        // Fix 3: reject UUIDs or non-decimal strings instead of silently using zero
+        let maker_amount_u256 = U256::from_dec_str(&maker_amount_scaled.to_string()).unwrap_or(U256::zero());
+        let taker_amount_u256 = U256::from_dec_str(&taker_amount_scaled.to_string()).unwrap_or(U256::zero());
+        
         let token_id_u256 = U256::from_dec_str(market_id)
             .map_err(|_| anyhow::anyhow!("Invalid Polymarket token ID: {}", market_id))?;
 
+        let fee_rate_bps_u256 = U256::from(fee_rate_bps);
+
         let now = chrono::Utc::now();
-        // Fix 1: derive a single nonce from the nanosecond timestamp and use it
-        // consistently in both sign_order and OrderPayload so the exchange
-        // can verify the signature against the REST payload nonce.
-        let nonce = U256::from(now.timestamp_nanos_opt().unwrap_or(0) as u64);
+        let nonce_val = now.timestamp_nanos_opt().unwrap_or(0) as u64;
+        let nonce = U256::from(nonce_val);
         let expiration_u256 = U256::from((now.timestamp() + 300) as u64);
 
         let maker_addr = self.signer.address();
 
         let signature = self.signer.sign_order(
-            nonce,
-            maker_addr,
-            maker_addr,
-            Address::zero(),
-            token_id_u256,
-            maker_amount_u256,
-            taker_amount_u256,
-            expiration_u256,
-            nonce,   // Fix 1: pass the same nonce (was U256::zero())
-            U256::zero(),
-            side_u8,
-            0,
+            nonce, maker_addr, maker_addr, Address::zero(), token_id_u256,
+            maker_amount_u256, taker_amount_u256, expiration_u256, nonce, 
+            fee_rate_bps_u256, // Pass the actual fee rate so the signature matches the payload
+            side_u8, 0,
         ).await.context("EIP-712 order signing failed")?;
 
         let url = format!("{}/order", self.rest_url);
@@ -167,8 +161,8 @@ impl PlatformOrderClient for PolymarketClient {
             maker_amount: maker_amount_scaled.to_string(),
             taker_amount: taker_amount_scaled.to_string(),
             side: side_str.to_string(),
-            fee_rate_bps: fee_rate_bps.to_string(), // Fix 2: use caller-supplied fee rate
-            nonce: nonce.to_string(),               // Fix 1: matches the signed nonce
+            fee_rate_bps: fee_rate_bps.to_string(), 
+            nonce: nonce_val.to_string(),
             expiration: expiration_u256.to_string(),
             signature,
             signature_type: 0,

@@ -52,7 +52,7 @@ impl LocalOrderBook {
     }
 
     fn depth(&self) -> Vec<PriceLevel> {
-        let mut levels = Vec::new();
+        let mut levels = Vec::with_capacity(20);
         for (price, size) in self.bids.iter().rev().take(10) {
             levels.push(PriceLevel { price: *price, size: *size });
         }
@@ -235,23 +235,32 @@ impl FeedHandler for PolymarketFeed {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PolymarketPayload {
+    Array(Vec<WsMessage>),
+    Single(WsMessage),
+}
+
 impl PolymarketFeed {
     fn handle_message(
         &mut self,
         text: &str,
         tick_tx: &broadcast::Sender<NormalizedTick>,
     ) -> Result<()> {
-        if let Ok(messages) = serde_json::from_str::<Vec<WsMessage>>(text) {
-            for msg in messages {
+        match serde_json::from_str::<PolymarketPayload>(text) {
+            Ok(PolymarketPayload::Array(messages)) => {
+                for msg in messages {
+                    self.process_event(&msg, tick_tx);
+                }
+            }
+            Ok(PolymarketPayload::Single(msg)) => {
                 self.process_event(&msg, tick_tx);
             }
-            return Ok(());
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to parse Polymarket WS message");
+            }
         }
-
-        if let Ok(msg) = serde_json::from_str::<WsMessage>(text) {
-            self.process_event(&msg, tick_tx);
-        }
-
         Ok(())
     }
 
@@ -267,23 +276,21 @@ impl PolymarketFeed {
         match msg.event_type.as_str() {
             "book" => {
                 if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
-                    let bid_levels: Vec<(Decimal, Decimal)> = bids.iter()
-                        .filter_map(|e| {
-                            let p = Decimal::from_str(&e.price).ok()?;
-                            let s = Decimal::from_str(&e.size).ok()?;
-                            Some((p, s))
-                        })
-                        .collect();
-                    let ask_levels: Vec<(Decimal, Decimal)> = asks.iter()
-                        .filter_map(|e| {
-                            let p = Decimal::from_str(&e.price).ok()?;
-                            let s = Decimal::from_str(&e.size).ok()?;
-                            Some((p, s))
-                        })
-                        .collect();
-
                     if let Some(book) = self.books.get_mut(asset_id) {
-                        book.apply_snapshot(&bid_levels, &ask_levels);
+                        book.bids.clear();
+                        book.asks.clear();
+                        
+                        for e in bids {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                book.bids.insert(p, s);
+                            }
+                        }
+                        for e in asks {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                book.asks.insert(p, s);
+                            }
+                        }
+                        
                         self.sequence += 1;
                         if let Some(mut tick) = self.emit_tick(asset_id) {
                             tick.sequence = self.sequence;

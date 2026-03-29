@@ -2,6 +2,7 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 use tracing::{debug};
 use uuid::Uuid;
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::engine::market_registry::MarketRegistry;
 use crate::engine::order_book::UnifiedOrderBook;
@@ -96,7 +97,9 @@ impl ArbitrageDetector {
 
                         let liquidity = spread.leg_a_available.min(spread.leg_b_available);
                         let log_liq = if liquidity > Decimal::ZERO {
-                            Decimal::from_str(&format!("{:.4}", (liquidity.to_f64().unwrap_or(1.0)).ln())).unwrap_or(Decimal::ONE)
+                            // Add 1.0 to the natural log so a liquidity of 1.0 yields a multiplier of 1.0 (ln(1) = 0 + 1 = 1)
+                            let val = liquidity.to_f64().unwrap_or(1.0).ln() + 1.0;
+                            Decimal::from_str(&format!("{:.4}", val.max(0.1))).unwrap_or(Decimal::ONE)
                         } else {
                             Decimal::ONE
                         };
@@ -112,6 +115,9 @@ impl ArbitrageDetector {
                                 price: spread.leg_a_price,
                                 available_size: spread.leg_a_available,
                                 fee_estimate: spread.leg_a_fee,
+                                fee_rate_bps: 0, 
+                                // NOTE: Replace this with the actual exchange token ID from the registry when available
+                                platform_market_id: spread.market_id.to_string(), 
                             },
                             leg_b: LegDetail {
                                 platform: spread.leg_b_platform,
@@ -119,6 +125,9 @@ impl ArbitrageDetector {
                                 price: spread.leg_b_price,
                                 available_size: spread.leg_b_available,
                                 fee_estimate: spread.leg_b_fee,
+                                fee_rate_bps: 0,
+                                // NOTE: Replace this with the actual exchange token ID from the registry when available
+                                platform_market_id: spread.market_id.to_string(), 
                             },
                             raw_spread: spread.raw_spread,
                             net_spread: spread.net_spread,
