@@ -571,9 +571,11 @@ loop {
                     cached_open_positions = cached_open_positions.saturating_sub(1);
                 }
 
-                if let Err(e) = trade_result_tx2.send(result.clone()).await {
+                // CRITICAL FIX: Use try_send. If SQLite I/O lags, the position tracker blocks.
+                // Awaiting here would halt the main tick-processing event loop.
+                if let Err(e) = trade_result_tx2.try_send(result.clone()) {
                     error!(error = %e, trade_id = result.trade_id,
-                        "CRITICAL: Position tracker channel closed — trade result lost, \
+                        "CRITICAL: Position tracker channel full/closed — trade result lost, \
                          open position will not be closed in DB. Manual intervention required.");
                 }
 

@@ -178,14 +178,20 @@ impl NetSpreadEngine {
     }
 
     fn gas_cost_if_onchain(&self, platform_a: Platform, platform_b: Platform) -> Decimal {
-        let needs_gas = matches!(platform_a, Platform::Polymarket | Platform::PolymarketUs)
-            || matches!(platform_b, Platform::Polymarket | Platform::PolymarketUs);
+        let mut tx_count = Decimal::ZERO;
+        if matches!(platform_a, Platform::Polymarket | Platform::PolymarketUs) {
+            tx_count += Decimal::ONE;
+        }
+        if matches!(platform_b, Platform::Polymarket | Platform::PolymarketUs) {
+            tx_count += Decimal::ONE;
+        }
 
-        if !needs_gas {
+        if tx_count == Decimal::ZERO {
             return Decimal::ZERO;
         }
 
-        let gas_units = Decimal::from(200_000);
+        // CRITICAL FIX: If both legs are on-chain, we pay gas twice (400,000 units).
+        let gas_units = Decimal::from(200_000) * tx_count;
         let gwei_to_matic = dec!(0.000000001); // 1 gwei = 10^-9 MATIC
         self.gas_price_gwei * gas_units * gwei_to_matic * self.matic_price_usd
     }

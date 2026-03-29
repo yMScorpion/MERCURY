@@ -234,8 +234,14 @@ impl ExecutionEngine {
         };
 
         // NOTIFY IMMEDIATELY so we do not block for IO
-        let _ = self.trade_result_tx.send(trade_result.clone()).await;
-        let _ = self.alert_tx.send(AlertMessage::TradeComplete(trade_result.clone())).await;
+        // CRITICAL FIX: Use try_send. Telegram API rate limits will cause alert_tx to fill up.
+        // Using .await here will deadlock the execution engine during trade bursts.
+        if let Err(e) = self.trade_result_tx.try_send(trade_result.clone()) {
+            tracing::error!(error = %e, "Trade result channel full — dropping notification");
+        }
+        if let Err(e) = self.alert_tx.try_send(AlertMessage::TradeComplete(trade_result.clone())) {
+            tracing::warn!(error = %e, "Alert channel full — dropping Telegram trade notification");
+        }
 
         // NON-BLOCKING SQL DB INSERT
         let db_clone = self.db.clone();

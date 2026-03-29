@@ -89,9 +89,13 @@ impl PlatformBook {
         }
 
         if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
+            // CRITICAL: Prevent crossed books by wiping asks that are lower than the new bid
+            self.asks.retain(|&p, _| p > tick.bid_price);
             self.bids.insert(tick.bid_price, tick.bid_size);
         }
         if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
+            // CRITICAL: Prevent crossed books by wiping bids that are higher than the new ask
+            self.bids.retain(|&p, _| p < tick.ask_price);
             self.asks.insert(tick.ask_price, tick.ask_size);
         }
 

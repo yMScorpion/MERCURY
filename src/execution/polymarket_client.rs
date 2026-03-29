@@ -155,11 +155,16 @@ impl PlatformOrderClient for PolymarketClient {
         ).await.context("EIP-712 order signing failed")?;
 
         let url = format!("{}/order", self.rest_url);
+        
+        use rust_decimal::prelude::ToPrimitive;
+        // Strip out any trailing decimals from the scaling operation to prevent HTTP 400s
+        let maker_str = maker_amount_scaled.to_u64().unwrap_or(0).to_string();
+        let taker_str = taker_amount_scaled.to_u64().unwrap_or(0).to_string();
 
         let payload = OrderPayload {
             token_id: market_id.to_string(),
-            maker_amount: maker_amount_scaled.to_string(),
-            taker_amount: taker_amount_scaled.to_string(),
+            maker_amount: maker_str,
+            taker_amount: taker_str,
             side: side_str.to_string(),
             fee_rate_bps: fee_rate_bps.to_string(), 
             nonce: nonce_val.to_string(),

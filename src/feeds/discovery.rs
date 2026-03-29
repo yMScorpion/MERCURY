@@ -111,87 +111,82 @@ impl MarketDiscovery {
             }
         }
 
-        // Group by normalized question for cross-platform matching.
-        let mut by_question: HashMap<String, Vec<DiscoveredMarket>> = HashMap::new();
-        for dm in &all_discovered {
-            by_question
-                .entry(dm.question_normalized.clone())
-                .or_default()
-                .push(dm.clone());
-        }
-
         let mut matched = Vec::new();
-        for (_norm_q, group) in &by_question {
-            // Only create an arb-eligible market if ≥2 platforms carry it.
-            let platforms_present: Vec<Platform> =
-                group.iter().map(|g| g.platform).collect::<std::collections::HashSet<_>>()
-                    .into_iter().collect();
-            if platforms_present.len() < 2 {
-                continue;
+        let poly_markets: Vec<_> = all_discovered.iter().filter(|m| m.platform == Platform::Polymarket).collect();
+        let kalshi_markets: Vec<_> = all_discovered.iter().filter(|m| m.platform == Platform::Kalshi).collect();
+
+        // O(N^2) Fuzzy Matcher: Compares every Kalshi market against every Polymarket market
+        for pm in &poly_markets {
+            for km in &kalshi_markets {
+                // 1. Expiration check: Must be within 48 hours to be the same event
+                let exp_diff_hours = (pm.expiration - km.expiration).num_hours().abs();
+                if exp_diff_hours > 48 { continue; }
+
+                // 2. Token Overlap Jaccard Similarity
+                let tokens_a: std::collections::HashSet<&str> = pm.question_normalized.split_whitespace().collect();
+                let tokens_b: std::collections::HashSet<&str> = km.question_normalized.split_whitespace().collect();
+                let intersection = tokens_a.intersection(&tokens_b).count();
+                let union = tokens_a.union(&tokens_b).count();
+                let sim = if union == 0 { 0.0 } else { intersection as f64 / union as f64 };
+
+                // 30% overlap is the mathematical sweet spot for matching financial shorthand
+                if sim >= 0.3 {
+                    let unified_id = compute_unified_market_id(
+                        &pm.question,
+                        "cross_platform",
+                        &pm.expiration.to_rfc3339(),
+                    );
+
+                    let mut platform_infos = HashMap::new();
+                    platform_infos.insert(pm.platform, PlatformMarketInfo {
+                        platform: pm.platform,
+                        platform_market_id: pm.platform_market_id.clone(),
+                        fee_rate_bps: pm.fee_rate_bps,
+                        min_order_size: pm.min_order_size,
+                        tick_size: pm.tick_size,
+                    });
+                    platform_infos.insert(km.platform, PlatformMarketInfo {
+                        platform: km.platform,
+                        platform_market_id: km.platform_market_id.clone(),
+                        fee_rate_bps: km.fee_rate_bps,
+                        min_order_size: km.min_order_size,
+                        tick_size: km.tick_size,
+                    });
+
+                    matched.push(MatchedMarket {
+                        market: Market {
+                            unified_id,
+                            question: format!("{} / {}", pm.question, km.question), // Store both for auditability
+                            resolution_source: "cross_platform".into(),
+                            expiration: pm.expiration,
+                            platforms: platform_infos,
+                            category: MarketCategory::Crypto,
+                            confidence: if sim > 0.7 { 0.98 } else { 0.95 },
+                            // CRITICAL FIX: Fuzzy-matched markets MUST be suspended by default. 
+                            // Textual overlap cannot differentiate between distinct price targets (e.g., $60k vs $70k).
+                            // A human MUST review and flip this to 'Active' in the DB to prevent catastrophic loss.
+                            status: MarketStatus::Suspended,
+                            created_at: chrono::Utc::now(),
+                            updated_at: chrono::Utc::now(),
+                        }
+                    });
+                }
             }
-
-            let first = &group[0];
-            let unified_id = compute_unified_market_id(
-                &first.question,
-                &first.resolution_source,
-                &first.expiration.to_rfc3339(),
-            );
-
-            let mut platform_infos: HashMap<Platform, PlatformMarketInfo> = HashMap::new();
-            for dm in group {
-                platform_infos.insert(
-                    dm.platform,
-                    PlatformMarketInfo {
-                        platform: dm.platform,
-                        platform_market_id: dm.platform_market_id.clone(),
-                        fee_rate_bps: dm.fee_rate_bps,
-                        min_order_size: dm.min_order_size,
-                        tick_size: dm.tick_size,
-                    },
-                );
-            }
-
-            // Verify expirations are within 48 hours of each other.
-            // Two markets with the same question but different expiry dates
-            // are NOT the same event — trading them as an arb pair guarantees losses.
-            let expirations: Vec<DateTime<Utc>> = group.iter().map(|dm| dm.expiration).collect();
-            let min_exp = expirations.iter().min().copied().unwrap_or(first.expiration);
-            let max_exp = expirations.iter().max().copied().unwrap_or(first.expiration);
-            let exp_diff_hours = (max_exp - min_exp).num_hours().abs();
-            if exp_diff_hours > 48 {
-                warn!(
-                    question = %first.question,
-                    exp_diff_hours,
-                    "Skipping cross-platform match — expiration mismatch ({} hours apart)",
-                    exp_diff_hours
-                );
-                continue;
-            }
-
-            // Scale confidence by how close the expirations are
-            let confidence = if exp_diff_hours == 0 { 0.98 } else { 0.95 };
-
-            let market = Market {
-                unified_id,
-                question: first.question.clone(),
-                resolution_source: first.resolution_source.clone(),
-                expiration: first.expiration,
-                platforms: platform_infos,
-                category: first.category,
-                confidence,
-                status: MarketStatus::Active,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
-
-            matched.push(MatchedMarket { market });
         }
 
         Ok(matched)
     }
 
+
     fn normalize_question(q: &str) -> String {
-        q.to_lowercase()
+        let mut lower = q.to_lowercase();
+        // Standardize common crypto/finance vocabulary for higher match accuracy
+        lower = lower.replace("bitcoin", "btc");
+        lower = lower.replace("ethereum", "eth");
+        lower = lower.replace("minutes", "min");
+        lower = lower.replace("minute", "min");
+        
+        lower
             .chars()
             .filter(|c| c.is_alphanumeric() || c.is_whitespace())
             .collect::<String>()
@@ -225,14 +220,18 @@ impl MarketDiscovery {
                 if question.is_empty() {
                     continue;
                 }
+                // Navigate into the tokens array to get the actual CLOB token ID (specifically the YES token)
                 let token_id = item
-                    .get("condition_id")
-                    .or_else(|| item.get("token_id"))
+                    .get("tokens")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.get(0)) // Index 0 is the YES token
+                    .and_then(|t| t.get("token_id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                if token_id.is_empty() {
-                    continue;
+                
+                if token_id.is_empty() || token_id.starts_with("0x") {
+                    continue; // Skip if it pulled a hex condition_id; we strictly need the decimal Token ID
                 }
                 let end_date = item
                     .get("end_date_iso")
