@@ -54,7 +54,6 @@ pub struct ExecutionEngine {
     cdna_client: Option<CdnaClient>,
     forecastex_client: Option<ForecastExClient>,
     trade_counter: i64,
-    bankroll: Decimal,
 }
 
 impl ExecutionEngine {
@@ -67,7 +66,6 @@ impl ExecutionEngine {
         kalshi_client: Option<KalshiClient>,
         cdna_client: Option<CdnaClient>,
         forecastex_client: Option<ForecastExClient>,
-        initial_bankroll: Decimal,
         initial_trade_count: i64,
     ) -> Self {
         Self {
@@ -80,7 +78,6 @@ impl ExecutionEngine {
             cdna_client,
             forecastex_client,
             trade_counter: initial_trade_count,
-            bankroll: initial_bankroll,
         }
     }
 

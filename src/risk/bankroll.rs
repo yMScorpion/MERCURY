@@ -11,6 +11,7 @@ pub struct BankrollManager {
     peak_bankroll: Decimal,
     platform_balances: HashMap<Platform, Decimal>,
     platform_exposure: HashMap<Platform, Decimal>,
+    market_exposure: HashMap<Uuid, Decimal>,
     daily_pnl: Decimal,
     daily_start_bankroll: Decimal,
     daily_fees: Decimal,
@@ -29,6 +30,7 @@ impl BankrollManager {
             peak_bankroll: initial_bankroll,
             platform_balances: HashMap::new(),
             platform_exposure: HashMap::new(),
+            market_exposure: HashMap::new(),
             daily_pnl: Decimal::ZERO,
             daily_start_bankroll: initial_bankroll,
             daily_fees: Decimal::ZERO,
@@ -88,6 +90,28 @@ impl BankrollManager {
             self.total_exposure() / self.total_bankroll
         } else {
             Decimal::ZERO
+        }
+    }
+
+    pub fn market_exposure(&self, market_id: &Uuid) -> Decimal {
+        self.market_exposure.get(market_id).copied().unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn market_exposure_pct(&self, market_id: &Uuid) -> Decimal {
+        if self.total_bankroll > Decimal::ZERO {
+            self.market_exposure(market_id) / self.total_bankroll
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    pub fn add_market_exposure(&mut self, market_id: Uuid, amount: Decimal) {
+        *self.market_exposure.entry(market_id).or_insert(Decimal::ZERO) += amount;
+    }
+
+    pub fn remove_market_exposure(&mut self, market_id: Uuid, amount: Decimal) {
+        if let Some(exp) = self.market_exposure.get_mut(&market_id) {
+            *exp = (*exp - amount).max(Decimal::ZERO);
         }
     }
 

@@ -258,7 +258,6 @@ async fn main() -> Result<()> {
         kalshi_client,
         cdna_client,
         forecastex_client,
-        initial_bankroll,
         initial_trade_count,
     );
     join_set.spawn(executor.run());
