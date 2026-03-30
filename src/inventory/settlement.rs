@@ -11,12 +11,20 @@ use serde_json::json;
 pub struct SettlementMonitor {
     db: Arc<dyn Database>,
     alert_tx: mpsc::Sender<AlertMessage>,
+    settlement_tx: mpsc::Sender<Decimal>,
     check_interval: Duration,
+    kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
 }
 
 impl SettlementMonitor {
-    pub fn new(db: Arc<dyn Database>, alert_tx: mpsc::Sender<AlertMessage>, check_interval_secs: u64) -> Self {
-        Self { db, alert_tx, check_interval: Duration::from_secs(check_interval_secs) }
+    pub fn new(
+        db: Arc<dyn Database>, 
+        alert_tx: mpsc::Sender<AlertMessage>, 
+        settlement_tx: mpsc::Sender<Decimal>,
+        check_interval_secs: u64,
+        kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+    ) -> Self {
+        Self { db, alert_tx, settlement_tx, check_interval: Duration::from_secs(check_interval_secs), kalshi_client }
     }
 
     pub async fn run(self) {
@@ -39,6 +47,21 @@ impl SettlementMonitor {
                 match market.status {
                     MarketStatus::Resolved => {
                         info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
+                        
+                        let mut realized_pnl = -(position.avg_entry_price * position.quantity); // Assume total loss by default
+                        
+                        if let Some(info) = market.platforms.get(&position.platform) {
+                            if position.platform == Platform::Kalshi {
+                                if let Some(client) = &self.kalshi_client {
+                                    if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
+                                        realized_pnl = pnl;
+                                    }
+                                }
+                            }
+                            // Note: Polymarket settlements are processed on-chain via USDC redemption.
+                            // Assuming total loss here until the Web3 provider tracks the specific ERC1155 burn event.
+                        }
+                        
                         let audit = AuditEntry {
                             timestamp_ns: now_ns(),
                             module: "settlement".into(),
@@ -49,18 +72,22 @@ impl SettlementMonitor {
                                 "platform": position.platform.to_string(),
                                 "quantity": position.quantity.to_string(),
                                 "avg_entry_price": position.avg_entry_price.to_string(),
+                                "realized_pnl": realized_pnl.to_string(),
                             }),
                         };
                         if let Err(e) = self.db.append_audit(&audit).await {
                             warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
                         }
+                        
+                        let _ = self.settlement_tx.try_send(realized_pnl);
                         self.db.close_position(position.id).await?;
+                        
                         let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                             severity: "info".into(),
                             message: format!(
-                                "Position #{} settled: {} {} on {} ({} contracts @ ${})",
+                                "Position #{} settled: {} {} on {} ({} contracts @ ${})\nRealized PnL: ${}",
                                 position.id, position.side, market.question,
-                                position.platform, position.quantity, position.avg_entry_price,
+                                position.platform, position.quantity, position.avg_entry_price, realized_pnl.round_dp(2),
                             ),
                         });
                     }

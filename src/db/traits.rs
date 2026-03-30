@@ -46,6 +46,7 @@ pub trait Database: Send + Sync + 'static {
     async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()>;
 
     // Utility
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()>;
     async fn db_size_bytes(&self) -> Result<u64>;
     /// Create an atomic backup of the database to the given file path.
     async fn backup_to_file(&self, dest_path: &str) -> Result<()>;

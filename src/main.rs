@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
     let (daily_report_tx, daily_report_rx) = mpsc::channel::<DailyReport>(10);
     let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SystemCommand>(10); // Command routing from Telegram
+    let (settlement_tx, mut settlement_rx) = mpsc::channel::<Decimal>(100);
 
     // ─── Telegram ───
     let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
@@ -272,9 +273,9 @@ async fn main() -> Result<()> {
     );
     join_set.spawn(reconciler.run());
 
-    // ─── Settlement Monitor ───
+// ─── Settlement Monitor ───
     let settlement = inventory::settlement::SettlementMonitor::new(
-        db.clone(), alert_tx.clone(), 300,
+        db.clone(), alert_tx.clone(), settlement_tx, 300, kalshi_client.clone()
     );
     join_set.spawn(settlement.run());
 
@@ -341,11 +342,14 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         match MercuryConfig::load(&config_path) {
                             Ok(_new_config) => {
-                                warn!("Config file changed — validated OK but NOT APPLIED. Restart required for changes to take effect.");
+                                // CRITICAL FIX: Trigger graceful shutdown so systemd automatically 
+                                // restarts the process, fully applying the new risk configurations.
+                                warn!("Config file changed and validated OK. Initiating graceful shutdown for systemd auto-restart.");
                                 let _ = alert_tx_reload.try_send(AlertMessage::SystemAlert {
                                     severity: "warning".into(),
-                                    message: "Config file changed and validated OK, but MERCURY must be restarted for changes to take effect.".into(),
+                                    message: "Config file updated. Restarting MERCURY engine to apply new risk limits...".into(),
                                 });
+                                cancel_reload.cancel();
                             }
                             Err(e) => {
                                 warn!(error = %e, "Config reload failed — keeping current config");
@@ -619,6 +623,10 @@ loop {
                                         in_flight_notional += approved_size;
                                         bankroll_manager.add_exposure(platform_a, leg_exposure);
                                         bankroll_manager.add_exposure(platform_b, leg_exposure);
+                                        
+                                        // CRITICAL FIX: Track correlated market exposure for CB5.
+                                        // We reserve the full approved size against this specific market UUID.
+                                        bankroll_manager.add_market_exposure(opp.market_id, approved_size);
                                     }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "Execution channel full, dropping opportunity to maintain latency");
@@ -666,6 +674,11 @@ loop {
                 let reserved_per_leg = result.approved_size / Decimal::from(2);
                 bankroll_manager.remove_exposure(result.leg_a_platform, reserved_per_leg);
                 bankroll_manager.remove_exposure(result.leg_b_platform, reserved_per_leg);
+                
+                // CRITICAL FIX: Free up the correlated market exposure.
+                // This allows CB5 to permit new trades on this market if we are now under the 20% limit.
+                bankroll_manager.remove_market_exposure(result.market_id, result.approved_size);
+                
                 circuit_breakers.record_execution(result.status == TradeStatus::Success);
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
 
@@ -698,6 +711,11 @@ loop {
                 spread_engine.update_matic_price(gas.matic_usd);
                 circuit_breakers.update_gas_price(gas.gas_gwei);
                 debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated");
+            }
+
+            // ── Settlement PnL Sink ──
+            Some(pnl) = settlement_rx.recv() => {
+                bankroll_manager.record_settlement(pnl);
             }
 
             // ── Periodic State Sync ──

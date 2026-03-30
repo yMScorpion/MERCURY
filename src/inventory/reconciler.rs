@@ -65,9 +65,14 @@ impl Reconciler {
             }
         }
 
-        let total_position_value: Decimal = positions.iter()
+    let total_position_value: Decimal = positions.iter()
             .map(|p| p.quantity * p.avg_entry_price)
             .sum();
+
+        // Enforce DB TTL pruning to prevent unbounded disk growth (Issue #8)
+        if let Err(e) = self.db.prune_audit_log(7).await {
+            warn!(error = %e, "Failed to prune audit log during reconciliation cycle");
+        }
 
         info!(open_positions = positions.len(), total_position_value = %total_position_value.round_dp(2), "Reconciliation complete");
         Ok(())

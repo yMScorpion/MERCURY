@@ -115,6 +115,16 @@ impl BankrollManager {
         }
     }
 
+    /// Credits the bankroll with realized PnL from an expired/settled market.
+    /// Winning legs pay $1.00 per contract; losing legs pay $0.00. 
+    pub fn record_settlement(&mut self, realized_pnl: Decimal) {
+        self.total_bankroll += realized_pnl;
+        if self.total_bankroll > self.peak_bankroll {
+            self.peak_bankroll = self.total_bankroll;
+        }
+        tracing::info!(realized_pnl = %realized_pnl, bankroll = %self.total_bankroll, "Settlement credited to bankroll");
+    }
+
     pub fn record_trade(&mut self, result: &TradeResult) {
         self.daily_pnl += result.profit;
         self.daily_fees += result.leg_a_fee + result.leg_b_fee;

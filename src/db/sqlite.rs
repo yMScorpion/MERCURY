@@ -85,11 +85,11 @@ fn platform_from_db(s: &str) -> Result<Platform> {
     }
 }
 
-fn side_from_db(s: &str) -> Side {
+fn side_from_db(s: &str) -> Result<Side> {
     match s {
-        "YES" => Side::Yes,
-        "NO" => Side::No,
-        _ => Side::Yes,
+        "YES" => Ok(Side::Yes),
+        "NO" => Ok(Side::No),
+        _ => Err(anyhow::anyhow!("Unknown side string in DB: {}", s)),
     }
 }
 
@@ -724,6 +724,48 @@ impl Database for SqliteDb {
 
     // -- Meta -----------------------------------------------------------
 
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let cutoff_ns = crate::types::now_ns() - (keep_days as u64 * 24 * 3600 * 1_000_000_000);
+            conn.execute(
+                "DELETE FROM audit_log WHERE timestamp_ns < ?1",
+                rusqlite::params![cutoff_ns as i64],
+            )?;
+            
+            let cutoff_dt = Utc::now() - chrono::Duration::days(keep_days as i64);
+            conn.execute(
+                "DELETE FROM config_history WHERE changed_at < ?1",
+                rusqlite::params![dt_to_str(&cutoff_dt)],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("prune_audit_log db task panicked")?
+    }
+
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let cutoff_ns = crate::types::now_ns() - (keep_days as u64 * 24 * 3600 * 1_000_000_000);
+            conn.execute(
+                "DELETE FROM audit_log WHERE timestamp_ns < ?1",
+                rusqlite::params![cutoff_ns as i64],
+            )?;
+            
+            let cutoff_dt = Utc::now() - chrono::Duration::days(keep_days as i64);
+            conn.execute(
+                "DELETE FROM config_history WHERE changed_at < ?1",
+                rusqlite::params![dt_to_str(&cutoff_dt)],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("prune_audit_log db task panicked")?
+    }
+
     async fn db_size_bytes(&self) -> Result<u64> {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || -> Result<u64> {
@@ -775,13 +817,13 @@ fn row_to_trade(row: &rusqlite::Row) -> Result<TradeResult> {
         market_id: Uuid::parse_str(&row.get::<_, String>(2)?).unwrap_or_else(|_| Uuid::new_v4()),
         market_question: row.get(3)?,
         leg_a_platform: platform_from_db(&row.get::<_, String>(4)?)?,
-        leg_a_side: side_from_db(&row.get::<_, String>(5)?),
+        leg_a_side: side_from_db(&row.get::<_, String>(5)?)?,
         leg_a_price: dec(&row.get::<_, String>(6)?)?,
         leg_a_size: dec(&row.get::<_, String>(7)?)?,
         leg_a_fill_price: dec(&row.get::<_, String>(8)?)?,
         leg_a_fee: dec(&row.get::<_, String>(9)?)?,
         leg_b_platform: platform_from_db(&row.get::<_, String>(10)?)?,
-        leg_b_side: side_from_db(&row.get::<_, String>(11)?),
+        leg_b_side: side_from_db(&row.get::<_, String>(11)?)?,
         leg_b_price: dec(&row.get::<_, String>(12)?)?,
         leg_b_size: dec(&row.get::<_, String>(13)?)?,
         leg_b_fill_price: dec(&row.get::<_, String>(14)?)?,
@@ -805,7 +847,7 @@ fn row_to_position(row: &rusqlite::Row) -> Result<Position> {
         id: row.get(0)?,
         market_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::new_v4()),
         platform: platform_from_db(&row.get::<_, String>(2)?)?,
-        side: side_from_db(&row.get::<_, String>(3)?),
+        side: side_from_db(&row.get::<_, String>(3)?)?,
         quantity: dec(&row.get::<_, String>(4)?)?,
         avg_entry_price: dec(&row.get::<_, String>(5)?)?,
         unrealized_pnl: dec(&row.get::<_, String>(6)?)?,

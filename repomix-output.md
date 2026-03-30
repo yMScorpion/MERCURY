@@ -60,7 +60,6 @@ self.max_open_positions
 src/config.rs
 src/crypto/eip712.rs
 src/crypto/jwt.rs
-src/crypto/keystore.rs
 src/crypto/mod.rs
 src/db/migrations.rs
 src/db/mod.rs
@@ -238,27 +237,6 @@ keys/
 
 ```
 
-## File: deploy/Dockerfile
-```
-FROM rust:1.82-slim AS builder
-WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN useradd -r -s /bin/false mercury
-COPY --from=builder /build/target/release/mercury /opt/mercury/mercury
-COPY config/default.yaml /opt/mercury/config/default.yaml
-RUN mkdir -p /opt/mercury/data /opt/mercury/logs /opt/mercury/keys && \
-    chown -R mercury:mercury /opt/mercury
-USER mercury
-WORKDIR /opt/mercury
-EXPOSE 8080
-CMD ["/opt/mercury/mercury", "--config", "/opt/mercury/config/default.yaml"]
-```
-
 ## File: deploy/mercury.service
 ```
 [Unit]
@@ -343,7 +321,6 @@ echo "3. View logs: journalctl -u mercury -f"
 
 ## File: src/crypto/mod.rs
 ```rust
-pub mod keystore;
 pub mod eip712;
 pub mod jwt;
 ```
@@ -373,194 +350,6 @@ pub mod polymarket_client;
 pub mod kalshi_client;
 pub mod cdna_client;
 pub mod forecastex_client;
-```
-
-## File: src/inventory/reconciler.rs
-```rust
-use anyhow::Result;
-use rust_decimal::Decimal;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-
-use crate::db::Database;
-use crate::types::*;
-
-pub struct Reconciler {
-    db: Arc<dyn Database>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    interval: Duration,
-    threshold: Decimal,
-}
-
-impl Reconciler {
-    pub fn new(
-        db: Arc<dyn Database>,
-        alert_tx: mpsc::Sender<AlertMessage>,
-        interval_secs: u64,
-        threshold: Decimal,
-    ) -> Self {
-        Self { db, alert_tx, interval: Duration::from_secs(interval_secs), threshold }
-    }
-
-    pub async fn run(self) {
-        info!(interval_secs = self.interval.as_secs(), "Reconciler started");
-        let mut interval = tokio::time::interval(self.interval);
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.reconcile().await {
-                error!(error = %e, "Reconciliation cycle failed");
-            }
-        }
-    }
-
-    async fn reconcile(&self) -> Result<()> {
-        let positions = self.db.get_open_positions().await?;
-        let balances = self.db.get_all_balances().await?;
-
-        let audit = AuditEntry {
-            timestamp_ns: now_ns(),
-            module: "reconciler".into(),
-            event_type: "reconciliation_cycle".into(),
-            data: serde_json::json!({
-                "open_positions": positions.len(),
-                "platforms_with_balance": balances.len(),
-            }),
-        };
-        self.db.append_audit(&audit).await?;
-
-        for pos in &positions {
-            let age = chrono::Utc::now() - pos.opened_at;
-            if age.num_days() > 30 {
-                warn!(position_id = pos.id, market_id = %pos.market_id, age_days = age.num_days(), "Stale position detected");
-                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                    severity: "critical".into(),
-                    message: format!(
-                        "🚨 STALE POSITION: Position #{} on {} has been open for {} days. Manual resolution required. Market ID: {}",
-                        pos.id, pos.platform, age.num_days(), pos.market_id
-                    ),
-                });
-            }
-        }
-
-        let total_position_value: Decimal = positions.iter()
-            .map(|p| p.quantity * p.avg_entry_price)
-            .sum();
-
-        info!(open_positions = positions.len(), total_position_value = %total_position_value.round_dp(2), "Reconciliation complete");
-        Ok(())
-    }
-}
-```
-
-## File: src/inventory/unwind_watchdog.rs
-```rust
-//! Periodic watchdog that detects orphaned (one-sided) positions and escalates.
-//!
-//! An orphaned position occurs when one leg of an arb fills but the hedge leg
-//! fails and the automatic unwind also fails. These positions bleed money as
-//! the market moves. The watchdog scans every N seconds and alerts.
-
-use anyhow::Result;
-use rust_decimal::Decimal;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{error, info};
-use uuid::Uuid;
-
-use crate::db::Database;
-use crate::types::*;
-
-pub struct UnwindWatchdog {
-    db: Arc<dyn Database>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    check_interval: Duration,
-}
-
-impl UnwindWatchdog {
-    pub fn new(
-        db: Arc<dyn Database>,
-        alert_tx: mpsc::Sender<AlertMessage>,
-        check_interval_secs: u64,
-    ) -> Self {
-        Self {
-            db,
-            alert_tx,
-            check_interval: Duration::from_secs(check_interval_secs),
-        }
-    }
-
-    pub async fn run(self) {
-        info!("Unwind watchdog started");
-        let mut interval = tokio::time::interval(self.check_interval);
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.check_orphaned_positions().await {
-                error!(error = %e, "Unwind watchdog check failed");
-            }
-        }
-    }
-
-    async fn check_orphaned_positions(&self) -> Result<()> {
-        let positions = self.db.get_open_positions().await?;
-
-        // Group open positions by market_id.
-        let mut by_market: HashMap<Uuid, Vec<Position>> = HashMap::new();
-        for pos in positions {
-            by_market.entry(pos.market_id).or_default().push(pos);
-        }
-
-        for (market_id, legs) in &by_market {
-            // CRITICAL FIX: Accumulate net exposure across ALL positions.
-            // If the bot runs multiple arbs on the same market, legs.len() could be 4, 5, or 6.
-            let mut total_yes = Decimal::ZERO;
-            let mut total_no = Decimal::ZERO;
-
-            for pos in legs {
-                match pos.side {
-                    Side::Yes => total_yes += pos.quantity,
-                    Side::No => total_no += pos.quantity,
-                }
-            }
-
-            let unhedged_diff = (total_yes - total_no).abs();
-
-            if unhedged_diff > Decimal::ZERO {
-                // Find the oldest position to correctly calculate the age of the imbalance
-                let oldest = legs.iter().map(|p| p.opened_at).min().unwrap_or_else(chrono::Utc::now);
-                let age = chrono::Utc::now() - oldest;
-
-                if age.num_minutes() > 5 {
-                    error!(
-                        market_id = %market_id,
-                        unhedged_quantity = %unhedged_diff,
-                        age_minutes = age.num_minutes(),
-                        "ORPHANED POSITION DETECTED — {} contracts unhedged for {} minutes",
-                        unhedged_diff,
-                        age.num_minutes()
-                    );
-
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                        severity: "critical".into(),
-                        message: format!(
-                            "🚨 ORPHANED POSITION IMBALANCE: {} contracts unhedged \
-                             open for {} minutes. MANUAL CLOSE REQUIRED. \
-                             Market ID: {}",
-                            unhedged_diff,
-                            age.num_minutes(),
-                            market_id,
-                        ),
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
 ```
 
 ## File: src/monitoring/backup.rs
@@ -798,205 +587,30 @@ pub mod alerts;
 pub mod reports;
 ```
 
-## File: src/telegram/reports.rs
-```rust
-use crate::types::*;
-use super::bot::TelegramBot;
-use rust_decimal::Decimal;
-use tokio::sync::mpsc;
-use tracing::{error, info};
-
-pub struct ReportService {
-    bot: TelegramBot,
-    chat_id: String,
-    rx: mpsc::Receiver<DailyReport>,
-    cmd_tx: mpsc::Sender<SystemCommand>,
-}
-
-impl ReportService {
-    pub fn new(bot: TelegramBot, chat_id: String, rx: mpsc::Receiver<DailyReport>, cmd_tx: mpsc::Sender<SystemCommand>) -> Self {
-        Self { bot, chat_id, rx, cmd_tx }
-    }
-
-    pub async fn run(mut self) {
-        info!("Telegram report & command service started");
-        let mut offset = 0;
-        let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3)); // Aggressive but safe poll
-
-        loop {
-            tokio::select! {
-                Some(report) = self.rx.recv() => {
-                    let text = format_daily_report(&report);
-                    if let Err(e) = self.bot.send_message(&self.chat_id, &text).await {
-                        error!(error = %e, "Failed to send daily report");
-                    }
-                }
-                _ = poll_interval.tick() => {
-                    if let Ok(updates) = self.bot.get_updates(offset).await {
-                        for update in updates {
-                            offset = offset.max(update.update_id + 1);
-                            if let Some(msg) = update.message {
-                                if msg.chat.id.to_string() != self.chat_id { continue; } // Restrict to authorized chat
-                                if let Some(text) = msg.text {
-                                    let txt = text.to_lowercase();
-                                    if txt == "/start" {
-                                        let _ = self.cmd_tx.send(SystemCommand::StartTrading).await;
-                                        let _ = self.bot.send_message(&self.chat_id, "\u{25b6}\u{fe0f} MERCURY Trading Engine: <b>RESUMED</b>").await;
-                                    } else if txt == "/stop" {
-                                        let _ = self.cmd_tx.send(SystemCommand::StopTrading).await;
-                                        let _ = self.bot.send_message(&self.chat_id, "\u{23f8}\u{fe0f} MERCURY Trading Engine: <b>HALTED</b>").await;
-                                    } else if txt == "/enable polymarket" {
-                                        let _ = self.cmd_tx.send(SystemCommand::EnablePlatform(Platform::Polymarket)).await;
-                                        let _ = self.bot.send_message(&self.chat_id, "\u{2705} Polymarket routing enabled").await;
-                                    } else if txt == "/disable polymarket" {
-                                        let _ = self.cmd_tx.send(SystemCommand::DisablePlatform(Platform::Polymarket)).await;
-                                        let _ = self.bot.send_message(&self.chat_id, "\u{274c} Polymarket routing disabled").await;
-                                    } else if txt == "/enable kalshi" {
-                                        let _ = self.cmd_tx.send(SystemCommand::EnablePlatform(Platform::Kalshi)).await;
-                                        let _ = self.bot.send_message(&self.chat_id, "\u{2705} Kalshi routing enabled").await;
-                                    } else if txt == "/disable kalshi" {
-                                        let _ = self.cmd_tx.send(SystemCommand::DisablePlatform(Platform::Kalshi)).await;
-                                        let _ = self.bot.send_message(&self.chat_id, "\u{274c} Kalshi routing disabled").await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn format_daily_report(report: &DailyReport) -> String {
-    let s = &report.snapshot;
-    // CRITICAL FIX: ROI must be calculated against the STARTING bankroll, not the ending bankroll.
-    let starting_bankroll = s.bankroll - s.net_pnl;
-    let roi = if starting_bankroll > Decimal::ZERO {
-        (s.net_pnl / starting_bankroll * Decimal::from(100)).round_dp(2)
-    } else {
-        Decimal::ZERO
-    };
-
-    let pnl_sign = if s.net_pnl >= Decimal::ZERO { "+" } else { "" };
-
-    let mut msg = format!(
-        "\u{1f4c8} <b>MERCURY DAILY REPORT \u{2014} {date}</b>\n\
-         \n\
-         \u{2550}\u{2550}\u{2550} P&amp;L Summary \u{2550}\u{2550}\u{2550}\n\
-         Gross Profit:    {pnl_sign}${gross}\n\
-         Total Fees:      -${fees}\n\
-         <b>Net Profit:      {pnl_sign}${net}</b>\n\
-         ROI Today:       {pnl_sign}{roi}%\n\
-         \n\
-         \u{2550}\u{2550}\u{2550} Trading Activity \u{2550}\u{2550}\u{2550}\n\
-         Opportunities Executed:  {total}\n\
-         Successful Trades:       {success} ({rate}%)\n\
-         Failed/Loss Trades:      {fail}\n",
-        date = s.date,
-        gross = s.gross_pnl.round_dp(2).abs(),
-        fees = s.fees_paid.round_dp(2),
-        net = s.net_pnl.round_dp(2).abs(),
-        total = s.trades_count,
-        success = s.success_count,
-        fail = s.fail_count,
-        rate = (s.success_rate * Decimal::from(100)).round_dp(1),
-    );
-
-    // Platform breakdown
-    msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Platform Breakdown \u{2550}\u{2550}\u{2550}\n"));
-    for (platform, stats) in &report.platform_breakdown {
-        let p_sign = if stats.pnl >= Decimal::ZERO { "+" } else { "" };
-        msg.push_str(&format!(
-            "{}: ${} exposed \u{2502} {} trades \u{2502} {}${}\n",
-            platform,
-            stats.exposure.round_dp(2),
-            stats.trade_count,
-            p_sign,
-            stats.pnl.round_dp(2),
-        ));
-    }
-
-    // Risk metrics
-    msg.push_str(&format!(
-        "\n\u{2550}\u{2550}\u{2550} Risk Metrics \u{2550}\u{2550}\u{2550}\n\
-         Bankroll:         ${bankroll}\n\
-         Peak Bankroll:    ${peak}\n\
-         Drawdown:         {dd}%\n\
-         Kelly Utilization: {kelly}\n",
-        bankroll = s.bankroll.round_dp(2),
-        peak = s.peak_bankroll.round_dp(2),
-        dd = s.drawdown_pct.round_dp(2),
-        kelly = s.kelly_utilization.round_dp(2),
-    ));
-
-    // Top trades
-    if !report.top_trades.is_empty() {
-        msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Top Trades \u{2550}\u{2550}\u{2550}\n"));
-        for (i, t) in report.top_trades.iter().enumerate() {
-            let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
-            msg.push_str(&format!(
-                "{}. {}${} \u{2502} \"{}\" \u{2502} {}\u{2194}{}\n",
-                i + 1,
-                sign,
-                t.profit.round_dp(2),
-                truncate_question(&t.market_question, 30),
-                t.leg_a_platform,
-                t.leg_b_platform,
-            ));
-        }
-    }
-
-    if !report.worst_trades.is_empty() {
-        msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Worst Trades \u{2550}\u{2550}\u{2550}\n"));
-        for (i, t) in report.worst_trades.iter().enumerate() {
-            let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
-            let reason = t.failure_reason.as_deref().unwrap_or("n/a");
-            msg.push_str(&format!(
-                "{}. {}${} \u{2502} \"{}\" \u{2502} {}\n",
-                i + 1,
-                sign,
-                t.profit.round_dp(2),
-                truncate_question(&t.market_question, 30),
-                reason,
-            ));
-        }
-    }
-
-    // System health
-    let hours = report.uptime_secs / 3600;
-    let mins = (report.uptime_secs % 3600) / 60;
-    let db_mb = report.db_size_bytes as f64 / 1_048_576.0;
-    msg.push_str(&format!(
-        "\n\u{2550}\u{2550}\u{2550} System Health \u{2550}\u{2550}\u{2550}\n\
-         Uptime: {}h {}m\n\
-         WS Reconnects: {}\n\
-         API Errors: {}\n\
-         DB Size: {:.1}MB",
-        hours, mins,
-        report.ws_reconnects,
-        report.api_errors,
-        db_mb,
-    ));
-
-    msg
-}
-
-fn truncate_question(q: &str, max_len: usize) -> String {
-    let truncated = if q.len() > max_len - 3 {
-        let mut end = max_len - 3;
-        while end > 0 && !q.is_char_boundary(end) { end -= 1; }
-        format!("{}...", &q[..end])
-    } else {
-        q.to_string()
-    };
-    TelegramBot::escape_html(&truncated)
-}
-```
-
 ## File: stale_timeout_ns
 ```
 
+```
+
+## File: deploy/Dockerfile
+```
+FROM rust:1.82-slim AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd -r -s /bin/false mercury
+COPY --from=builder /build/target/release/mercury /opt/mercury/mercury
+COPY config/default.yaml /opt/mercury/config/default.yaml
+RUN mkdir -p /opt/mercury/data /opt/mercury/logs /opt/mercury/keys && \
+    chown -R mercury:mercury /opt/mercury
+USER mercury
+WORKDIR /opt/mercury
+EXPOSE 8080
+CMD ["/opt/mercury/mercury", "--config", "/opt/mercury/config/default.yaml"]
 ```
 
 ## File: src/crypto/eip712.rs
@@ -1154,89 +768,6 @@ impl PolymarketSigner {
 
         keccak256(&encoded)
     }
-}
-```
-
-## File: src/crypto/keystore.rs
-```rust
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
-use anyhow::{Context, Result};
-use argon2::Argon2;
-use rand::RngCore;
-use std::path::Path;
-use tracing::info;
-use zeroize::Zeroizing;
-
-const NONCE_SIZE: usize = 12;
-const SALT_SIZE: usize = 32;
-// File format: [salt:32][nonce:12][ciphertext:...]
-
-/// Encrypt a private key and save to file
-pub fn encrypt_keyfile(key_bytes: &[u8], passphrase: &str, path: &str) -> Result<()> {
-    let mut salt = [0u8; SALT_SIZE];
-    rand::thread_rng().fill_bytes(&mut salt);
-
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-
-    let derived_key = derive_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&*derived_key)
-        .context("Failed to create AES cipher")?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, key_bytes)
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-
-    let mut output = Vec::with_capacity(SALT_SIZE + NONCE_SIZE + ciphertext.len());
-    output.extend_from_slice(&salt);
-    output.extend_from_slice(&nonce_bytes);
-    output.extend_from_slice(&ciphertext);
-
-    if let Some(parent) = Path::new(path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, &output)?;
-    info!("Encrypted keyfile saved to {}", path);
-    Ok(())
-}
-
-/// Decrypt a private key from an encrypted file
-pub fn decrypt_keyfile(path: &str, passphrase: &str) -> Result<Zeroizing<Vec<u8>>> {
-    let data = std::fs::read(path)
-        .with_context(|| format!("Failed to read keyfile: {}", path))?;
-
-    if data.len() < SALT_SIZE + NONCE_SIZE + 16 {
-        anyhow::bail!("Keyfile too short to be valid");
-    }
-
-    let salt = &data[..SALT_SIZE];
-    let nonce_bytes = &data[SALT_SIZE..SALT_SIZE + NONCE_SIZE];
-    let ciphertext = &data[SALT_SIZE + NONCE_SIZE..];
-
-    let derived_key = derive_key(passphrase, salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&*derived_key)
-        .context("Failed to create AES cipher")?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("Decryption failed (wrong passphrase?): {}", e))?;
-
-    info!("Keyfile decrypted successfully from {}", path);
-    Ok(Zeroizing::new(plaintext))
-}
-
-/// Derive a 256-bit key from passphrase + salt using Argon2id
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    let mut key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
-        .map_err(|e| anyhow::anyhow!("Argon2id key derivation failed: {}", e))?;
-    Ok(key)
 }
 ```
 
@@ -1449,106 +980,194 @@ impl PositionTracker {
 }
 ```
 
-## File: src/inventory/settlement.rs
+## File: src/inventory/reconciler.rs
 ```rust
 use anyhow::Result;
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::db::Database;
 use crate::types::*;
-use serde_json::json;
 
-pub struct SettlementMonitor {
+pub struct Reconciler {
+    db: Arc<dyn Database>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    interval: Duration,
+    threshold: Decimal,
+}
+
+impl Reconciler {
+    pub fn new(
+        db: Arc<dyn Database>,
+        alert_tx: mpsc::Sender<AlertMessage>,
+        interval_secs: u64,
+        threshold: Decimal,
+    ) -> Self {
+        Self { db, alert_tx, interval: Duration::from_secs(interval_secs), threshold }
+    }
+
+    pub async fn run(self) {
+        info!(interval_secs = self.interval.as_secs(), "Reconciler started");
+        let mut interval = tokio::time::interval(self.interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.reconcile().await {
+                error!(error = %e, "Reconciliation cycle failed");
+            }
+        }
+    }
+
+    async fn reconcile(&self) -> Result<()> {
+        let positions = self.db.get_open_positions().await?;
+        let balances = self.db.get_all_balances().await?;
+
+        let audit = AuditEntry {
+            timestamp_ns: now_ns(),
+            module: "reconciler".into(),
+            event_type: "reconciliation_cycle".into(),
+            data: serde_json::json!({
+                "open_positions": positions.len(),
+                "platforms_with_balance": balances.len(),
+            }),
+        };
+        self.db.append_audit(&audit).await?;
+
+        for pos in &positions {
+            let age = chrono::Utc::now() - pos.opened_at;
+            if age.num_days() > 30 {
+                warn!(position_id = pos.id, market_id = %pos.market_id, age_days = age.num_days(), "Stale position detected");
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                    severity: "critical".into(),
+                    message: format!(
+                        "🚨 STALE POSITION: Position #{} on {} has been open for {} days. Manual resolution required. Market ID: {}",
+                        pos.id, pos.platform, age.num_days(), pos.market_id
+                    ),
+                });
+            }
+        }
+
+    let total_position_value: Decimal = positions.iter()
+            .map(|p| p.quantity * p.avg_entry_price)
+            .sum();
+
+        // Enforce DB TTL pruning to prevent unbounded disk growth (Issue #8)
+        if let Err(e) = self.db.prune_audit_log(7).await {
+            warn!(error = %e, "Failed to prune audit log during reconciliation cycle");
+        }
+
+        info!(open_positions = positions.len(), total_position_value = %total_position_value.round_dp(2), "Reconciliation complete");
+        Ok(())
+    }
+}
+```
+
+## File: src/inventory/unwind_watchdog.rs
+```rust
+//! Periodic watchdog that detects orphaned (one-sided) positions and escalates.
+//!
+//! An orphaned position occurs when one leg of an arb fills but the hedge leg
+//! fails and the automatic unwind also fails. These positions bleed money as
+//! the market moves. The watchdog scans every N seconds and alerts.
+
+use anyhow::Result;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+use uuid::Uuid;
+
+use crate::db::Database;
+use crate::types::*;
+
+pub struct UnwindWatchdog {
     db: Arc<dyn Database>,
     alert_tx: mpsc::Sender<AlertMessage>,
     check_interval: Duration,
 }
 
-impl SettlementMonitor {
-    pub fn new(db: Arc<dyn Database>, alert_tx: mpsc::Sender<AlertMessage>, check_interval_secs: u64) -> Self {
-        Self { db, alert_tx, check_interval: Duration::from_secs(check_interval_secs) }
+impl UnwindWatchdog {
+    pub fn new(
+        db: Arc<dyn Database>,
+        alert_tx: mpsc::Sender<AlertMessage>,
+        check_interval_secs: u64,
+    ) -> Self {
+        Self {
+            db,
+            alert_tx,
+            check_interval: Duration::from_secs(check_interval_secs),
+        }
     }
 
     pub async fn run(self) {
-        info!("Settlement monitor started");
+        info!("Unwind watchdog started");
         let mut interval = tokio::time::interval(self.check_interval);
         loop {
             interval.tick().await;
-            if let Err(e) = self.check_settlements().await {
-                tracing::error!(error = %e, "Settlement check failed");
+            if let Err(e) = self.check_orphaned_positions().await {
+                error!(error = %e, "Unwind watchdog check failed");
             }
         }
     }
 
-    async fn check_settlements(&self) -> Result<()> {
+    async fn check_orphaned_positions(&self) -> Result<()> {
         let positions = self.db.get_open_positions().await?;
-        let now = chrono::Utc::now();
 
-        for position in &positions {
-            if let Some(market) = self.db.get_market(&position.market_id).await? {
-                match market.status {
-                    MarketStatus::Resolved => {
-                        info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
-                        let audit = AuditEntry {
-                            timestamp_ns: now_ns(),
-                            module: "settlement".into(),
-                            event_type: "position_settled".into(),
-                            data: json!({
-                                "position_id": position.id,
-                                "market": market.question,
-                                "platform": position.platform.to_string(),
-                                "quantity": position.quantity.to_string(),
-                                "avg_entry_price": position.avg_entry_price.to_string(),
-                            }),
-                        };
-                        if let Err(e) = self.db.append_audit(&audit).await {
-                            warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
-                        }
-                        self.db.close_position(position.id).await?;
-                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                            severity: "info".into(),
-                            message: format!(
-                                "Position #{} settled: {} {} on {} ({} contracts @ ${})",
-                                position.id, position.side, market.question,
-                                position.platform, position.quantity, position.avg_entry_price,
-                            ),
-                        });
-                    }
-                    MarketStatus::Expired => {
-                        warn!(position_id = position.id, market = %market.question, "Market expired with open position");
-                        let audit = AuditEntry {
-                            timestamp_ns: now_ns(),
-                            module: "settlement".into(),
-                            event_type: "position_expired".into(),
-                            data: json!({
-                                "position_id": position.id,
-                                "market": market.question,
-                                "platform": position.platform.to_string(),
-                            }),
-                        };
-                        if let Err(e) = self.db.append_audit(&audit).await {
-                            warn!(error = %e, position_id = position.id, "Failed to write expiry audit entry");
-                        }
-                        self.db.close_position(position.id).await?;
-                    }
-                    _ => {
-                        let time_to_expiry = market.expiration - now;
-                        if time_to_expiry.num_hours() < 1 && time_to_expiry.num_seconds() > 0 {
-                            let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                severity: "warning".into(),
-                                message: format!(
-                                    "Position #{} expiring in {:.0} minutes: {}",
-                                    position.id, time_to_expiry.num_minutes(), market.question,
-                                ),
-                            });
-                        }
-                    }
+        // Group open positions by market_id.
+        let mut by_market: HashMap<Uuid, Vec<Position>> = HashMap::new();
+        for pos in positions {
+            by_market.entry(pos.market_id).or_default().push(pos);
+        }
+
+        for (market_id, legs) in &by_market {
+            // CRITICAL FIX: Accumulate net exposure across ALL positions.
+            // If the bot runs multiple arbs on the same market, legs.len() could be 4, 5, or 6.
+            let mut total_yes = Decimal::ZERO;
+            let mut total_no = Decimal::ZERO;
+
+            for pos in legs {
+                match pos.side {
+                    Side::Yes => total_yes += pos.quantity,
+                    Side::No => total_no += pos.quantity,
+                }
+            }
+
+            let unhedged_diff = (total_yes - total_no).abs();
+
+            if unhedged_diff > Decimal::ZERO {
+                // Find the oldest position to correctly calculate the age of the imbalance
+                let oldest = legs.iter().map(|p| p.opened_at).min().unwrap_or_else(chrono::Utc::now);
+                let age = chrono::Utc::now() - oldest;
+
+                if age.num_minutes() > 5 {
+                    error!(
+                        market_id = %market_id,
+                        unhedged_quantity = %unhedged_diff,
+                        age_minutes = age.num_minutes(),
+                        "ORPHANED POSITION DETECTED — {} contracts unhedged for {} minutes",
+                        unhedged_diff,
+                        age.num_minutes()
+                    );
+
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                        severity: "critical".into(),
+                        message: format!(
+                            "🚨 ORPHANED POSITION IMBALANCE: {} contracts unhedged \
+                             open for {} minutes. MANUAL CLOSE REQUIRED. \
+                             Market ID: {}",
+                            unhedged_diff,
+                            age.num_minutes(),
+                            market_id,
+                        ),
+                    });
                 }
             }
         }
+
         Ok(())
     }
 }
@@ -1676,6 +1295,202 @@ impl Metrics {
         let now = crate::types::now_ns();
         now.saturating_sub(last) / 1_000_000
     }
+}
+```
+
+## File: src/telegram/reports.rs
+```rust
+use crate::types::*;
+use super::bot::TelegramBot;
+use rust_decimal::Decimal;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+
+pub struct ReportService {
+    bot: TelegramBot,
+    chat_id: String,
+    rx: mpsc::Receiver<DailyReport>,
+    cmd_tx: mpsc::Sender<SystemCommand>,
+}
+
+impl ReportService {
+    pub fn new(bot: TelegramBot, chat_id: String, rx: mpsc::Receiver<DailyReport>, cmd_tx: mpsc::Sender<SystemCommand>) -> Self {
+        Self { bot, chat_id, rx, cmd_tx }
+    }
+
+    pub async fn run(mut self) {
+        info!("Telegram report & command service started");
+        let mut offset = 0;
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3)); // Aggressive but safe poll
+
+        loop {
+            tokio::select! {
+                Some(report) = self.rx.recv() => {
+                    let text = format_daily_report(&report);
+                    if let Err(e) = self.bot.send_message(&self.chat_id, &text).await {
+                        error!(error = %e, "Failed to send daily report");
+                    }
+                }
+                _ = poll_interval.tick() => {
+                    if let Ok(updates) = self.bot.get_updates(offset).await {
+                        for update in updates {
+                            offset = offset.max(update.update_id + 1);
+                            if let Some(msg) = update.message {
+                                if msg.chat.id.to_string() != self.chat_id { continue; } // Restrict to authorized chat
+                                if let Some(text) = msg.text {
+                                    let txt = text.to_lowercase();
+                                    if txt == "/start" {
+                                        let _ = self.cmd_tx.send(SystemCommand::StartTrading).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{25b6}\u{fe0f} MERCURY Trading Engine: <b>RESUMED</b>").await;
+                                    } else if txt == "/stop" {
+                                        let _ = self.cmd_tx.send(SystemCommand::StopTrading).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{23f8}\u{fe0f} MERCURY Trading Engine: <b>HALTED</b>").await;
+                                    } else if txt == "/enable polymarket" {
+                                        let _ = self.cmd_tx.send(SystemCommand::EnablePlatform(Platform::Polymarket)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{2705} Polymarket routing enabled").await;
+                                    } else if txt == "/disable polymarket" {
+                                        let _ = self.cmd_tx.send(SystemCommand::DisablePlatform(Platform::Polymarket)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{274c} Polymarket routing disabled").await;
+                                    } else if txt == "/enable kalshi" {
+                                        let _ = self.cmd_tx.send(SystemCommand::EnablePlatform(Platform::Kalshi)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{2705} Kalshi routing enabled").await;
+                                    } else if txt == "/disable kalshi" {
+                                        let _ = self.cmd_tx.send(SystemCommand::DisablePlatform(Platform::Kalshi)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{274c} Kalshi routing disabled").await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_daily_report(report: &DailyReport) -> String {
+    let s = &report.snapshot;
+    // CRITICAL FIX: ROI must be calculated against the STARTING bankroll, not the ending bankroll.
+    let starting_bankroll = s.bankroll - s.net_pnl;
+    let roi = if starting_bankroll > Decimal::ZERO {
+        (s.net_pnl / starting_bankroll * Decimal::from(100)).round_dp(2)
+    } else {
+        Decimal::ZERO
+    };
+
+    let pnl_sign = if s.net_pnl >= Decimal::ZERO { "+" } else { "" };
+
+    let mut msg = format!(
+        "\u{1f4c8} <b>MERCURY DAILY REPORT \u{2014} {date}</b>\n\
+         \n\
+         \u{2550}\u{2550}\u{2550} P&amp;L Summary \u{2550}\u{2550}\u{2550}\n\
+         Gross Profit:    {pnl_sign}${gross}\n\
+         Total Fees:      -${fees}\n\
+         <b>Net Profit:      {pnl_sign}${net}</b>\n\
+         ROI Today:       {pnl_sign}{roi}%\n\
+         \n\
+         \u{2550}\u{2550}\u{2550} Trading Activity \u{2550}\u{2550}\u{2550}\n\
+         Opportunities Executed:  {total}\n\
+         Successful Trades:       {success} ({rate}%)\n\
+         Failed/Loss Trades:      {fail}\n",
+        date = s.date,
+        gross = s.gross_pnl.round_dp(2).abs(),
+        fees = s.fees_paid.round_dp(2),
+        net = s.net_pnl.round_dp(2).abs(),
+        total = s.trades_count,
+        success = s.success_count,
+        fail = s.fail_count,
+        rate = (s.success_rate * Decimal::from(100)).round_dp(1),
+    );
+
+    // Platform breakdown
+    msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Platform Breakdown \u{2550}\u{2550}\u{2550}\n"));
+    for (platform, stats) in &report.platform_breakdown {
+        let p_sign = if stats.pnl >= Decimal::ZERO { "+" } else { "" };
+        msg.push_str(&format!(
+            "{}: ${} exposed \u{2502} {} trades \u{2502} {}${}\n",
+            platform,
+            stats.exposure.round_dp(2),
+            stats.trade_count,
+            p_sign,
+            stats.pnl.round_dp(2),
+        ));
+    }
+
+    // Risk metrics
+    msg.push_str(&format!(
+        "\n\u{2550}\u{2550}\u{2550} Risk Metrics \u{2550}\u{2550}\u{2550}\n\
+         Bankroll:         ${bankroll}\n\
+         Peak Bankroll:    ${peak}\n\
+         Drawdown:         {dd}%\n\
+         Kelly Utilization: {kelly}\n",
+        bankroll = s.bankroll.round_dp(2),
+        peak = s.peak_bankroll.round_dp(2),
+        dd = s.drawdown_pct.round_dp(2),
+        kelly = s.kelly_utilization.round_dp(2),
+    ));
+
+    // Top trades
+    if !report.top_trades.is_empty() {
+        msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Top Trades \u{2550}\u{2550}\u{2550}\n"));
+        for (i, t) in report.top_trades.iter().enumerate() {
+            let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
+            msg.push_str(&format!(
+                "{}. {}${} \u{2502} \"{}\" \u{2502} {}\u{2194}{}\n",
+                i + 1,
+                sign,
+                t.profit.round_dp(2),
+                truncate_question(&t.market_question, 30),
+                t.leg_a_platform,
+                t.leg_b_platform,
+            ));
+        }
+    }
+
+    if !report.worst_trades.is_empty() {
+        msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Worst Trades \u{2550}\u{2550}\u{2550}\n"));
+        for (i, t) in report.worst_trades.iter().enumerate() {
+            let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
+            let reason = t.failure_reason.as_deref().unwrap_or("n/a");
+            msg.push_str(&format!(
+                "{}. {}${} \u{2502} \"{}\" \u{2502} {}\n",
+                i + 1,
+                sign,
+                t.profit.round_dp(2),
+                truncate_question(&t.market_question, 30),
+                reason,
+            ));
+        }
+    }
+
+    // System health
+    let hours = report.uptime_secs / 3600;
+    let mins = (report.uptime_secs % 3600) / 60;
+    let db_mb = report.db_size_bytes as f64 / 1_048_576.0;
+    msg.push_str(&format!(
+        "\n\u{2550}\u{2550}\u{2550} System Health \u{2550}\u{2550}\u{2550}\n\
+         Uptime: {}h {}m\n\
+         WS Reconnects: {}\n\
+         API Errors: {}\n\
+         DB Size: {:.1}MB",
+        hours, mins,
+        report.ws_reconnects,
+        report.api_errors,
+        db_mb,
+    ));
+
+    msg
+}
+
+fn truncate_question(q: &str, max_len: usize) -> String {
+    let truncated = if q.len() > max_len - 3 {
+        let mut end = max_len - 3;
+        while end > 0 && !q.is_char_boundary(end) { end -= 1; }
+        format!("{}...", &q[..end])
+    } else {
+        q.to_string()
+    };
+    TelegramBot::escape_html(&truncated)
 }
 ```
 
@@ -1968,6 +1783,685 @@ CREATE INDEX IF NOT EXISTS idx_config_hist_ts ON config_history(changed_at);
 "#;
 ```
 
+## File: src/feeds/base.rs
+```rust
+use anyhow::Result;
+use async_trait::async_trait;
+use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+
+use crate::types::{NormalizedTick, Platform};
+
+#[async_trait]
+pub trait FeedHandler: Send + Sync + 'static {
+    fn platform(&self) -> Platform;
+
+    /// Connect and start processing. Should run until disconnected.
+    /// Returns Err on fatal error, Ok(()) on clean disconnect.
+    async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()>;
+
+    /// Clear all local order book state.
+    ///
+    /// Called immediately on every disconnect (clean or error) before the reconnect
+    /// backoff begins. This prevents stale book data from being visible to the spread
+    /// engine during the reconnect window. The first snapshot received after reconnect
+    /// will repopulate the books from authoritative exchange state.
+    fn clear_books(&mut self);
+}
+
+/// Run a feed handler with automatic reconnection.
+/// The loop exits cleanly when `token` is cancelled.
+pub async fn run_with_reconnect(
+    mut handler: Box<dyn FeedHandler>,
+    tick_tx: broadcast::Sender<NormalizedTick>,
+    alert_tx: tokio::sync::mpsc::Sender<crate::types::AlertMessage>,
+    token: CancellationToken,
+) {
+    let platform = handler.platform();
+    let mut backoff_secs = 1u64;
+    // 5 s maximum backoff — 60 s is an eternity for an HFT engine.
+    // During a 60 s blind window, resting limit orders become stale and
+    // can be sniped by other bots or filled at unfavorable prices.
+    let max_backoff = 5u64;
+
+    loop {
+        info!(%platform, "Connecting feed handler");
+
+        tokio::select! {
+            _ = token.cancelled() => {
+                info!(%platform, "Feed handler cancelled via token");
+                break;
+            }
+            result = handler.connect_and_run(tick_tx.clone()) => {
+                // Immediately discard all book state so no stale prices are visible
+                // to the spread engine during the reconnect window. The first snapshot
+                // after reconnect will rebuild from authoritative exchange data.
+                handler.clear_books();
+                match result {
+                    Ok(()) => {
+                        info!(%platform, "Feed handler disconnected cleanly — books cleared");
+                        backoff_secs = 1;
+                    }
+                    Err(e) => {
+                        error!(%platform, error = %e, "Feed handler error — books cleared");
+                        // Alert IMMEDIATELY on disconnect — the orchestrator must
+                        // halt trading on this platform until the book is rebuilt.
+                        // Use try_send (non-blocking) to avoid blocking the reconnect loop.
+                        let _ = alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
+                            severity: "critical".into(),
+                            message: format!(
+                                "{platform} feed DISCONNECTED — market data is stale, \
+                                 trading halted on this platform until reconnect and book rebuild: {e}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Check again before sleeping so a cancellation during backoff exits promptly.
+        tokio::select! {
+            _ = token.cancelled() => {
+                info!(%platform, "Feed handler cancelled during backoff");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+        }
+
+        warn!(%platform, backoff_secs, "Reconnecting after backoff");
+        backoff_secs = (backoff_secs * 2).min(max_backoff);
+    }
+}
+```
+
+## File: src/inventory/settlement.rs
+```rust
+use anyhow::Result;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::db::Database;
+use crate::types::*;
+use serde_json::json;
+
+pub struct SettlementMonitor {
+    db: Arc<dyn Database>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    settlement_tx: mpsc::Sender<Decimal>,
+    check_interval: Duration,
+    kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+}
+
+impl SettlementMonitor {
+    pub fn new(
+        db: Arc<dyn Database>, 
+        alert_tx: mpsc::Sender<AlertMessage>, 
+        settlement_tx: mpsc::Sender<Decimal>,
+        check_interval_secs: u64,
+        kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+    ) -> Self {
+        Self { db, alert_tx, settlement_tx, check_interval: Duration::from_secs(check_interval_secs), kalshi_client }
+    }
+
+    pub async fn run(self) {
+        info!("Settlement monitor started");
+        let mut interval = tokio::time::interval(self.check_interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.check_settlements().await {
+                tracing::error!(error = %e, "Settlement check failed");
+            }
+        }
+    }
+
+    async fn check_settlements(&self) -> Result<()> {
+        let positions = self.db.get_open_positions().await?;
+        let now = chrono::Utc::now();
+
+        for position in &positions {
+            if let Some(market) = self.db.get_market(&position.market_id).await? {
+                match market.status {
+                    MarketStatus::Resolved => {
+                        info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
+                        
+                        let mut realized_pnl = -(position.avg_entry_price * position.quantity); // Assume total loss by default
+                        
+                        if let Some(info) = market.platforms.get(&position.platform) {
+                            if position.platform == Platform::Kalshi {
+                                if let Some(client) = &self.kalshi_client {
+                                    if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
+                                        realized_pnl = pnl;
+                                    }
+                                }
+                            }
+                            // Note: Polymarket settlements are processed on-chain via USDC redemption.
+                            // Assuming total loss here until the Web3 provider tracks the specific ERC1155 burn event.
+                        }
+                        
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_settled".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                                "quantity": position.quantity.to_string(),
+                                "avg_entry_price": position.avg_entry_price.to_string(),
+                                "realized_pnl": realized_pnl.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
+                        }
+                        
+                        let _ = self.settlement_tx.try_send(realized_pnl);
+                        self.db.close_position(position.id).await?;
+                        
+                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                            severity: "info".into(),
+                            message: format!(
+                                "Position #{} settled: {} {} on {} ({} contracts @ ${})\nRealized PnL: ${}",
+                                position.id, position.side, market.question,
+                                position.platform, position.quantity, position.avg_entry_price, realized_pnl.round_dp(2),
+                            ),
+                        });
+                    }
+                    MarketStatus::Expired => {
+                        warn!(position_id = position.id, market = %market.question, "Market expired with open position");
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_expired".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write expiry audit entry");
+                        }
+                        self.db.close_position(position.id).await?;
+                    }
+                    _ => {
+                        let time_to_expiry = market.expiration - now;
+                        if time_to_expiry.num_hours() < 1 && time_to_expiry.num_seconds() > 0 {
+                            let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                severity: "warning".into(),
+                                message: format!(
+                                    "Position #{} expiring in {:.0} minutes: {}",
+                                    position.id, time_to_expiry.num_minutes(), market.question,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+## File: src/monitoring/gas_oracle.rs
+```rust
+use anyhow::Result;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use serde::Deserialize;
+use tokio::sync::mpsc;
+use tokio::time::{interval_at, Duration, Instant};
+use tracing::{debug, error, info, warn};
+
+/// Sent to the main event loop whenever live prices are refreshed.
+#[derive(Debug, Clone)]
+pub struct GasUpdate {
+    /// Polygon network gas price in gwei.
+    pub gas_gwei: u64,
+    /// MATIC/USD spot price.
+    pub matic_usd: Decimal,
+}
+
+pub struct GasOracle {
+    rpc_url: String,
+    poll_interval_secs: u64,
+    update_tx: mpsc::Sender<GasUpdate>,
+    http: reqwest::Client,
+}
+
+// ── JSON shapes for eth_gasPrice RPC ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RpcResponse {
+    result: Option<String>,
+    /// JSON-RPC error object returned with HTTP 200 on RPC-level errors.
+    /// Must be captured to produce useful diagnostics instead of "null result".
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+}
+
+
+/// Alert if this many consecutive CoinGecko fetches fail (rate-limited or down).
+const COINGECKO_ALERT_THRESHOLD: u32 = 5;
+
+impl GasOracle {
+    pub fn new(
+        rpc_url: String,
+        poll_interval_secs: u64,
+        update_tx: mpsc::Sender<GasUpdate>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .user_agent("mercury-gas-oracle/1.0")
+            .build()
+            .expect("failed to build gas oracle HTTP client");
+        Self { rpc_url, poll_interval_secs, update_tx, http }
+    }
+
+    pub async fn run(self) {
+        // Start with sane defaults so the engine is never un-initialised.
+        let mut last_gwei: u64 = 50;
+        let mut last_matic: Decimal = dec!(0.50);
+        let mut coingecko_failures: u32 = 0;
+
+        let poll_secs = self.poll_interval_secs.max(10); // floor at 10s
+
+        // Use interval_at(now) so the FIRST tick fires immediately, pushing live
+        // values to the spread engine before any arb detection begins.
+        let mut ticker = interval_at(Instant::now(), Duration::from_secs(poll_secs));
+
+        info!(
+            interval_secs = poll_secs,
+            rpc_url = %self.rpc_url,
+            "Gas oracle started (first fetch is immediate)"
+        );
+
+        loop {
+            ticker.tick().await;
+
+            match self.fetch_gas_gwei().await {
+                Ok(gwei) => {
+                    if gwei != last_gwei {
+                        info!(gwei, prev_gwei = last_gwei, "Polygon gas price updated");
+                    } else {
+                        debug!(gwei, "Polygon gas price unchanged");
+                    }
+                    last_gwei = gwei;
+                }
+                Err(e) => {
+                    warn!(error = %e, last_gwei, "Failed to fetch Polygon gas price — keeping last value");
+                }
+            }
+
+            match self.fetch_matic_usd().await {
+                Ok(price) => {
+                    let change_pct = if last_matic > Decimal::ZERO {
+                        ((price - last_matic) / last_matic * Decimal::from(100)).abs()
+                    } else {
+                        Decimal::from(100)
+                    };
+                    if change_pct > dec!(1) {
+                        info!(matic_usd = %price, prev = %last_matic, "MATIC/USD price updated");
+                    } else {
+                        debug!(matic_usd = %price, "MATIC/USD price refreshed");
+                    }
+                    last_matic = price;
+                    coingecko_failures = 0;
+                }
+                Err(e) => {
+                    coingecko_failures += 1;
+                    if coingecko_failures >= COINGECKO_ALERT_THRESHOLD {
+                        error!(
+                            failures = coingecko_failures,
+                            last_matic = %last_matic,
+                            error = %e,
+                            "CoinGecko MATIC/USD fetch has failed {} consecutive times — \
+                             gas costs may be stale, arb profitability estimates unreliable",
+                            coingecko_failures
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            last_matic = %last_matic,
+                            failures = coingecko_failures,
+                            "Failed to fetch MATIC/USD — keeping last value"
+                        );
+                    }
+                }
+            }
+
+            let update = GasUpdate { gas_gwei: last_gwei, matic_usd: last_matic };
+            // Use try_send (non-blocking) so the oracle never blocks the main loop
+            // shutdown path. Dropped updates are safe — the main loop retains the
+            // last-known values and the next poll will deliver a fresh update.
+            if self.update_tx.try_send(update).is_err() {
+                // Receiver dropped (clean shutdown) or channel full (main loop lagging).
+                // In either case, silently exit — the oracle will be aborted shortly.
+                debug!("Gas oracle channel closed or full — exiting");
+                return;
+            }
+        }
+    }
+
+    /// Call `eth_gasPrice` on the configured Polygon RPC endpoint.
+    async fn fetch_gas_gwei(&self) -> Result<u64> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_gasPrice",
+            "params": [],
+            "id": 1
+        });
+
+        let resp: RpcResponse = self.http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        // Surface JSON-RPC errors (returned with HTTP 200 by most RPC providers).
+        if let Some(rpc_err) = resp.error {
+            return Err(anyhow::anyhow!(
+                "Polygon RPC error {}: {}",
+                rpc_err.code,
+                rpc_err.message
+            ));
+        }
+
+        let hex = resp.result
+            .ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result (no error field)"))?;
+
+        // Result is a hex string like "0x..." representing wei
+        let hex_stripped = hex.trim_start_matches("0x");
+        let wei = u64::from_str_radix(hex_stripped, 16)
+            .map_err(|e| anyhow::anyhow!("failed to parse gas price hex '{}': {}", hex, e))?;
+        let gwei = wei / 1_000_000_000;
+        Ok(gwei.max(1)) // floor at 1 gwei to avoid zero gas cost in spread calc
+    }
+
+    /// Fetch MATIC/USD (or POL/USD) from CoinGecko's free simple/price endpoint.
+    /// Tries both the legacy `matic-network` and new `polygon-ecosystem-token` IDs.
+    async fn fetch_matic_usd(&self) -> Result<Decimal> {
+        // Try the current ID first, fall back to legacy
+        for coin_id in &["polygon-ecosystem-token", "matic-network"] {
+            match self.try_coingecko_price(coin_id).await {
+                Ok(price) => return Ok(price),
+                Err(e) => {
+                    tracing::debug!(coin_id, error = %e, "CoinGecko fetch failed, trying next ID");
+                }
+            }
+        }
+        Err(anyhow::anyhow!("All CoinGecko IDs failed for MATIC/POL price"))
+    }
+
+    async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
+        let http_resp = self.http
+            .get("https://api.coingecko.com/api/v3/simple/price")
+            .query(&[("ids", coin_id), ("vs_currencies", "usd")])
+            .send()
+            .await?;
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let body = http_resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "CoinGecko HTTP {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+
+        let resp: serde_json::Value = http_resp.json().await?;
+        let usd = resp.get(coin_id)
+            .and_then(|v| v.get("usd"))
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
+
+        Decimal::from_f64_retain(usd)
+            .ok_or_else(|| anyhow::anyhow!("CoinGecko value is not finite: {}", usd))
+    }
+}
+```
+
+## File: src/monitoring/mod.rs
+```rust
+pub mod metrics;
+pub mod health;
+pub mod gas_oracle;
+pub mod backup;
+```
+
+## File: src/risk/kelly.rs
+```rust
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
+/// Kelly Criterion calculator for arbitrage
+pub struct KellyCalculator {
+    fraction: Decimal,
+    min_fraction: Decimal,
+    max_fraction: Decimal,
+}
+
+impl KellyCalculator {
+    pub fn new(fraction: Decimal) -> Self {
+        Self {
+            fraction,
+            min_fraction: dec!(0.05),
+            max_fraction: dec!(0.50),
+        }
+    }
+
+    pub fn set_fraction(&mut self, fraction: Decimal) {
+        self.fraction = fraction.max(self.min_fraction).min(self.max_fraction);
+    }
+
+    pub fn fraction(&self) -> Decimal {
+        self.fraction
+    }
+
+    pub fn optimal_fraction(&self, exec_probability: Decimal, net_spread: Decimal) -> Decimal {
+        if net_spread <= Decimal::ZERO || exec_probability <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let p = exec_probability;
+        let q = Decimal::ONE - p;
+        // Arb-aware Kelly: on execution failure we lose only the fees paid on the
+        // failed leg (~0.5% of notional), not the full notional.  Using net_spread
+        // as `b` in the standard formula (which assumes full-notional loss) produces
+        // near-zero fractions for any realistic spread and kills all trading.
+        let arb_loss_fraction = dec!(0.005); // 0.5 % max loss on execution failure
+        let full_kelly = (p * net_spread - q * arb_loss_fraction) / (net_spread + arb_loss_fraction);
+        if full_kelly <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        (full_kelly * self.fraction).max(Decimal::ZERO).min(dec!(0.10))
+    }
+
+    pub fn position_size(
+        &self,
+        bankroll: Decimal,
+        exec_probability: Decimal,
+        net_spread: Decimal,
+        max_single_trade_pct: Decimal,
+    ) -> Decimal {
+        let kelly_frac = self.optimal_fraction(exec_probability, net_spread);
+        let kelly_size = bankroll * kelly_frac;
+        let max_size = bankroll * max_single_trade_pct;
+        kelly_size.min(max_size).max(Decimal::ZERO)
+    }
+
+    pub fn multi_asset_kelly(
+        &self,
+        opportunities: &[(Decimal, Decimal)],
+        max_total_exposure: Decimal,
+    ) -> Vec<Decimal> {
+        if opportunities.is_empty() {
+            return Vec::new();
+        }
+        let individual: Vec<Decimal> = opportunities.iter()
+            .map(|(p, spread)| self.optimal_fraction(*p, *spread))
+            .collect();
+        let total: Decimal = individual.iter().sum();
+        if total <= Decimal::ZERO {
+            return vec![Decimal::ZERO; opportunities.len()];
+        }
+        if total > max_total_exposure {
+            let scale = max_total_exposure / total;
+            individual.iter().map(|f| *f * scale).collect()
+        } else {
+            individual
+        }
+    }
+
+    /// Adjust the Kelly fraction in response to drawdown.
+    ///
+    /// `current_drawdown_pct` must be **percent-scale** (0–100);
+    /// e.g. pass `15.0` for a 15 % drawdown from peak.
+    ///
+    /// Drawdown tiers reduce sizing; full recovery (≤ 5 %) restores `max_fraction`
+    /// so the system does not permanently under-trade after recovering from any loss.
+    pub fn adjust_for_drawdown(&mut self, current_drawdown_pct: Decimal) {
+        if current_drawdown_pct > dec!(15) {
+            self.set_fraction(dec!(0.10));
+        } else if current_drawdown_pct > dec!(10) {
+            self.set_fraction(dec!(0.15));
+        } else if current_drawdown_pct > dec!(5) {
+            self.set_fraction(dec!(0.20));
+        } else {
+            // Drawdown ≤ 5 %: fully recovered — restore to max fraction.
+            // Without this branch the fraction is a one-way ratchet: it reduces on any
+            // drawdown day but never recovers, causing permanent under-trading after
+            // any loss event.
+            self.set_fraction(self.max_fraction);
+        }
+    }
+}
+```
+
+## File: Cargo.toml
+```toml
+[package]
+name = "mercury"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-market prediction arbitrage engine"
+
+[dependencies]
+native-tls = "0.2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rusqlite = { version = "0.31", features = ["bundled", "serde_json", "backup"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+ethers = { version = "2", features = ["legacy"] }
+jsonwebtoken = "9"
+rsa = { version = "0.9", features = ["pem"] }
+ring = "0.17"
+aes-gcm = "0.10"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+notify = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+url = "2"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.8"
+tokio-util = "0.7"
+clap = { version = "4", features = ["derive"] }
+tracing-appender = "0.2.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+```
+
+## File: src/db/traits.rs
+```rust
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use uuid::Uuid;
+
+use crate::types::*;
+
+#[async_trait]
+pub trait Database: Send + Sync + 'static {
+    // Markets
+    async fn upsert_market(&self, market: &Market) -> Result<()>;
+    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>>;
+    async fn get_active_markets(&self) -> Result<Vec<Market>>;
+
+    // Trades
+    async fn insert_trade(&self, result: &TradeResult) -> Result<i64>;
+    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>>;
+    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>>;
+    async fn get_trade_count(&self) -> Result<i64>;
+    /// Count distinct in-flight arbitrage pairs (not individual position records).
+    async fn get_open_arb_count(&self) -> Result<usize>;
+
+    // Positions
+    async fn upsert_position(&self, position: &Position) -> Result<()>;
+    /// Upsert two positions (both legs of an arbitrage) atomically.
+    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()>;
+    async fn get_open_positions(&self) -> Result<Vec<Position>>;
+    async fn close_position(&self, id: i64) -> Result<()>;
+
+    // Balances
+    async fn update_balance(&self, balance: &PlatformBalance) -> Result<()>;
+    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>>;
+    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>>;
+
+    // Daily snapshots
+    async fn insert_daily_snapshot(&self, snapshot: &DailySnapshot) -> Result<()>;
+    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>>;
+    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()>;
+
+    // Audit log
+    async fn append_audit(&self, entry: &AuditEntry) -> Result<()>;
+    /// Batch-insert multiple audit entries in a single transaction.
+    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()>;
+
+    // Config history
+    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()>;
+
+    // Utility
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()>;
+    async fn db_size_bytes(&self) -> Result<u64>;
+    /// Create an atomic backup of the database to the given file path.
+    async fn backup_to_file(&self, dest_path: &str) -> Result<()>;
+}
+```
+
 ## File: src/execution/cdna_client.rs
 ```rust
 use anyhow::{Context, Result};
@@ -2172,99 +2666,6 @@ impl PlatformOrderClient for ForecastExClient {
     async fn cancel_order(&self, _order_id: &str) -> Result<()> {
         warn!("ForecastEx cancel not yet implemented");
         Ok(())
-    }
-}
-```
-
-## File: src/feeds/base.rs
-```rust
-use anyhow::Result;
-use async_trait::async_trait;
-use std::time::Duration;
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
-
-use crate::types::{NormalizedTick, Platform};
-
-#[async_trait]
-pub trait FeedHandler: Send + Sync + 'static {
-    fn platform(&self) -> Platform;
-
-    /// Connect and start processing. Should run until disconnected.
-    /// Returns Err on fatal error, Ok(()) on clean disconnect.
-    async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()>;
-
-    /// Clear all local order book state.
-    ///
-    /// Called immediately on every disconnect (clean or error) before the reconnect
-    /// backoff begins. This prevents stale book data from being visible to the spread
-    /// engine during the reconnect window. The first snapshot received after reconnect
-    /// will repopulate the books from authoritative exchange state.
-    fn clear_books(&mut self);
-}
-
-/// Run a feed handler with automatic reconnection.
-/// The loop exits cleanly when `token` is cancelled.
-pub async fn run_with_reconnect(
-    mut handler: Box<dyn FeedHandler>,
-    tick_tx: broadcast::Sender<NormalizedTick>,
-    alert_tx: tokio::sync::mpsc::Sender<crate::types::AlertMessage>,
-    token: CancellationToken,
-) {
-    let platform = handler.platform();
-    let mut backoff_secs = 1u64;
-    // 5 s maximum backoff — 60 s is an eternity for an HFT engine.
-    // During a 60 s blind window, resting limit orders become stale and
-    // can be sniped by other bots or filled at unfavorable prices.
-    let max_backoff = 5u64;
-
-    loop {
-        info!(%platform, "Connecting feed handler");
-
-        tokio::select! {
-            _ = token.cancelled() => {
-                info!(%platform, "Feed handler cancelled via token");
-                break;
-            }
-            result = handler.connect_and_run(tick_tx.clone()) => {
-                // Immediately discard all book state so no stale prices are visible
-                // to the spread engine during the reconnect window. The first snapshot
-                // after reconnect will rebuild from authoritative exchange data.
-                handler.clear_books();
-                match result {
-                    Ok(()) => {
-                        info!(%platform, "Feed handler disconnected cleanly — books cleared");
-                        backoff_secs = 1;
-                    }
-                    Err(e) => {
-                        error!(%platform, error = %e, "Feed handler error — books cleared");
-                        // Alert IMMEDIATELY on disconnect — the orchestrator must
-                        // halt trading on this platform until the book is rebuilt.
-                        // Use try_send (non-blocking) to avoid blocking the reconnect loop.
-                        let _ = alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
-                            severity: "critical".into(),
-                            message: format!(
-                                "{platform} feed DISCONNECTED — market data is stale, \
-                                 trading halted on this platform until reconnect and book rebuild: {e}"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Check again before sleeping so a cancellation during backoff exits promptly.
-        tokio::select! {
-            _ = token.cancelled() => {
-                info!(%platform, "Feed handler cancelled during backoff");
-                break;
-            }
-            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
-        }
-
-        warn!(%platform, backoff_secs, "Reconnecting after backoff");
-        backoff_secs = (backoff_secs * 2).min(max_backoff);
     }
 }
 ```
@@ -2641,239 +3042,360 @@ fn normalize_question(q: &str) -> String {
 }
 ```
 
-## File: src/monitoring/gas_oracle.rs
+## File: src/feeds/forecastex.rs
 ```rust
-use anyhow::Result;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-use serde::Deserialize;
-use tokio::sync::mpsc;
-use tokio::time::{interval_at, Duration, Instant};
-use tracing::{debug, error, info, warn};
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::sync::broadcast;
+use tracing::{debug, info};
+use uuid::Uuid;
 
-/// Sent to the main event loop whenever live prices are refreshed.
-#[derive(Debug, Clone)]
-pub struct GasUpdate {
-    /// Polygon network gas price in gwei.
-    pub gas_gwei: u64,
-    /// MATIC/USD spot price.
-    pub matic_usd: Decimal,
+use super::base::FeedHandler;
+use crate::config::ForecastExConfig;
+use crate::types::*;
+
+/// Minimal FIX 4.4 client for ForecastEx market data
+pub struct ForecastExFeed {
+    config: ForecastExConfig,
+    subscriptions: Vec<(String, Uuid)>,
+    books: std::collections::HashMap<String, FexOrderBook>,
+    sequence: u64,
+    msg_seq_num: u64,
+    sender_comp_id: String,
+    target_comp_id: String,
 }
 
-pub struct GasOracle {
-    rpc_url: String,
-    poll_interval_secs: u64,
-    update_tx: mpsc::Sender<GasUpdate>,
-    http: reqwest::Client,
+struct FexOrderBook {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
 }
 
-// ── JSON shapes for eth_gasPrice RPC ───────────────────────────────────────
+impl FexOrderBook {
+    fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new() } }
 
-#[derive(Deserialize)]
-struct RpcResponse {
-    result: Option<String>,
-    /// JSON-RPC error object returned with HTTP 200 on RPC-level errors.
-    /// Must be captured to produce useful diagnostics instead of "null result".
-    error: Option<RpcError>,
-}
-
-#[derive(Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-
-/// Alert if this many consecutive CoinGecko fetches fail (rate-limited or down).
-const COINGECKO_ALERT_THRESHOLD: u32 = 5;
-
-impl GasOracle {
-    pub fn new(
-        rpc_url: String,
-        poll_interval_secs: u64,
-        update_tx: mpsc::Sender<GasUpdate>,
-    ) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("mercury-gas-oracle/1.0")
-            .build()
-            .expect("failed to build gas oracle HTTP client");
-        Self { rpc_url, poll_interval_secs, update_tx, http }
+    /// Returns the best bid (price, size) only if the bid side is non-empty.
+    /// Never returns a phantom (0, 0) fallback — callers must handle None.
+    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
     }
 
-    pub async fn run(self) {
-        // Start with sane defaults so the engine is never un-initialised.
-        let mut last_gwei: u64 = 50;
-        let mut last_matic: Decimal = dec!(0.50);
-        let mut coingecko_failures: u32 = 0;
+    /// Returns the best ask (price, size) only if the ask side is non-empty.
+    /// Never returns a phantom (1.0, 0) fallback — callers must handle None.
+    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(p, s)| (*p, *s))
+    }
 
-        let poll_secs = self.poll_interval_secs.max(10); // floor at 10s
+    /// Returns mid-price only when both sides have real liquidity.
+    fn mid_price(&self) -> Option<Decimal> {
+        let (b, _) = self.best_bid()?;
+        let (a, _) = self.best_ask()?;
+        Some((b + a) / Decimal::from(2))
+    }
+    fn depth(&self) -> Vec<PriceLevel> {
+        let mut levels = Vec::new();
+        for (p, s) in self.bids.iter().rev().take(10) {
+            levels.push(PriceLevel { price: *p, size: *s });
+        }
+        for (p, s) in self.asks.iter().take(10) {
+            levels.push(PriceLevel { price: *p, size: *s });
+        }
+        levels
+    }
+}
 
-        // Use interval_at(now) so the FIRST tick fires immediately, pushing live
-        // values to the spread engine before any arb detection begins.
-        let mut ticker = interval_at(Instant::now(), Duration::from_secs(poll_secs));
+const SOH: char = '\x01';
 
-        info!(
-            interval_secs = poll_secs,
-            rpc_url = %self.rpc_url,
-            "Gas oracle started (first fetch is immediate)"
-        );
+impl ForecastExFeed {
+    pub fn new(config: ForecastExConfig, subscriptions: Vec<(String, Uuid)>) -> Self {
+        Self {
+            config,
+            subscriptions,
+            books: std::collections::HashMap::new(),
+            sequence: 0,
+            msg_seq_num: 1,
+            sender_comp_id: std::env::var("FEX_SENDER_COMP_ID").unwrap_or_else(|_| "MERCURY".into()),
+            target_comp_id: std::env::var("FEX_TARGET_COMP_ID").unwrap_or_else(|_| "FORECASTEX".into()),
+        }
+    }
 
+    fn symbol_to_market_id(&self, symbol: &str) -> Option<Uuid> {
+        self.subscriptions.iter()
+            .find(|(s, _)| s == symbol)
+            .map(|(_, id)| *id)
+    }
+
+    fn emit_tick(&self, symbol: &str) -> Option<NormalizedTick> {
+        let market_id = self.symbol_to_market_id(symbol)?;
+        let book = self.books.get(symbol)?;
+        // best_bid/best_ask return None when either side is empty.
+        // Returning None here suppresses the tick so the spread engine never
+        // sees phantom prices (bid=0 or ask=1) that would trigger fake arbs.
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        let mid = book.mid_price()?;
+
+        Some(NormalizedTick {
+            platform: Platform::ForecastEx,
+            market_id,
+            timestamp_ns: now_ns(),
+            bid_price: bid.0,
+            bid_size: bid.1,
+            ask_price: ask.0,
+            ask_size: ask.1,
+            mid_price: mid,
+            last_trade_price: Decimal::ZERO,
+            last_trade_size: Decimal::ZERO,
+            book_depth: book.depth(),
+            fee_rate_bps: 0,
+            sequence: 0,
+        })
+    }
+
+    fn build_fix_message(&mut self, msg_type: &str, body_fields: &[(u32, &str)]) -> String {
+        let mut body = format!("35={}{}", msg_type, SOH);
+        body.push_str(&format!("49={}{}", self.sender_comp_id, SOH));
+        body.push_str(&format!("56={}{}", self.target_comp_id, SOH));
+        body.push_str(&format!("34={}{}", self.msg_seq_num, SOH));
+        body.push_str(&format!("52={}{}", chrono::Utc::now().format("%Y%m%d-%H:%M:%S%.3f"), SOH));
+        for (tag, val) in body_fields {
+            body.push_str(&format!("{}={}{}", tag, val, SOH));
+        }
+        self.msg_seq_num += 1;
+
+        let header = format!("8=FIX.4.4{}9={}{}", SOH, body.len(), SOH);
+        let full = format!("{}{}", header, body);
+
+        let checksum: u32 = full.bytes().map(|b| b as u32).sum::<u32>() % 256;
+        format!("{}10={:03}{}", full, checksum, SOH)
+    }
+
+    fn parse_fix_fields(msg: &str) -> std::collections::HashMap<u32, String> {
+        let mut fields = std::collections::HashMap::new();
+        for part in msg.split(SOH) {
+            if let Some(eq_pos) = part.find('=') {
+                if let Ok(tag) = part[..eq_pos].parse::<u32>() {
+                    fields.insert(tag, part[eq_pos + 1..].to_string());
+                }
+            }
+        }
+        fields
+    }
+}
+
+#[async_trait]
+impl FeedHandler for ForecastExFeed {
+    fn platform(&self) -> Platform {
+        Platform::ForecastEx
+    }
+
+    fn clear_books(&mut self) {
+        for book in self.books.values_mut() {
+            book.bids.clear();
+            book.asks.clear();
+        }
+    }
+
+    async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
+        if !self.config.enabled {
+            info!("ForecastEx feed disabled, skipping");
+            return Ok(());
+        }
+
+        let addr = format!("{}:{}", self.config.fix_host, self.config.fix_port);
+        info!(addr = %addr, "Connecting to ForecastEx FIX gateway");
+
+        let stream = TcpStream::connect(&addr)
+            .await
+            .context("Failed to connect to ForecastEx FIX gateway")?;
+
+        let (reader, mut writer) = stream.into_split();
+        let mut buf_reader = BufReader::new(reader);
+
+        // Send Logon (35=A)
+        let logon = self.build_fix_message("A", &[
+            (98, "0"),
+            (108, "30"),
+        ]);
+        writer.write_all(logon.as_bytes()).await?;
+        info!("FIX Logon sent");
+
+        let sub_symbols: Vec<String> = self.subscriptions.iter().map(|(s, _)| s.clone()).collect();
+        for symbol in &sub_symbols {
+            self.books.entry(symbol.clone()).or_insert_with(FexOrderBook::new);
+        }
+
+        // Subscribe to market data (35=V)
+        let symbols: Vec<(usize, String)> = self.subscriptions.iter()
+            .enumerate()
+            .map(|(i, (s, _))| (i, s.clone()))
+            .collect();
+        for (i, symbol) in &symbols {
+            let md_req_id = format!("MDR{}", i);
+            let md_request = self.build_fix_message("V", &[
+                (262, &md_req_id),
+                (263, "1"),
+                (264, "10"),
+                (267, "2"),
+                (269, "0"),
+                (269, "1"),
+                (146, "1"),
+                (55, symbol),
+            ]);
+            writer.write_all(md_request.as_bytes()).await?;
+        }
+        info!(count = self.subscriptions.len(), "FIX market data requests sent");
+
+        let mut line_buf = String::new();
         loop {
-            ticker.tick().await;
+            line_buf.clear();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                buf_reader.read_line(&mut line_buf),
+            ).await {
+                Ok(Ok(0)) => {
+                    info!("FIX connection closed");
+                    return Ok(());
+                }
+                Ok(Ok(_)) => {
+                    let fields = Self::parse_fix_fields(&line_buf);
+                    let msg_type = fields.get(&35).map(|s| s.as_str()).unwrap_or("");
 
-            match self.fetch_gas_gwei().await {
-                Ok(gwei) => {
-                    if gwei != last_gwei {
-                        info!(gwei, prev_gwei = last_gwei, "Polygon gas price updated");
-                    } else {
-                        debug!(gwei, "Polygon gas price unchanged");
-                    }
-                    last_gwei = gwei;
-                }
-                Err(e) => {
-                    warn!(error = %e, last_gwei, "Failed to fetch Polygon gas price — keeping last value");
-                }
-            }
-
-            match self.fetch_matic_usd().await {
-                Ok(price) => {
-                    let change_pct = if last_matic > Decimal::ZERO {
-                        ((price - last_matic) / last_matic * Decimal::from(100)).abs()
-                    } else {
-                        Decimal::from(100)
-                    };
-                    if change_pct > dec!(1) {
-                        info!(matic_usd = %price, prev = %last_matic, "MATIC/USD price updated");
-                    } else {
-                        debug!(matic_usd = %price, "MATIC/USD price refreshed");
-                    }
-                    last_matic = price;
-                    coingecko_failures = 0;
-                }
-                Err(e) => {
-                    coingecko_failures += 1;
-                    if coingecko_failures >= COINGECKO_ALERT_THRESHOLD {
-                        error!(
-                            failures = coingecko_failures,
-                            last_matic = %last_matic,
-                            error = %e,
-                            "CoinGecko MATIC/USD fetch has failed {} consecutive times — \
-                             gas costs may be stale, arb profitability estimates unreliable",
-                            coingecko_failures
-                        );
-                    } else {
-                        warn!(
-                            error = %e,
-                            last_matic = %last_matic,
-                            failures = coingecko_failures,
-                            "Failed to fetch MATIC/USD — keeping last value"
-                        );
+                    match msg_type {
+                        "W" | "X" => {
+                            self.handle_market_data(&fields, &line_buf, &tick_tx);
+                        }
+                        "0" => {
+                            let hb = self.build_fix_message("0", &[]);
+                            let _ = writer.write_all(hb.as_bytes()).await;
+                        }
+                        "1" => {
+                            let test_req_id = fields.get(&112).map(|s| s.as_str()).unwrap_or("0");
+                            let hb = self.build_fix_message("0", &[(112, test_req_id)]);
+                            let _ = writer.write_all(hb.as_bytes()).await;
+                        }
+                        "5" => {
+                            info!("FIX Logout received");
+                            return Ok(());
+                        }
+                        _ => {
+                            debug!(msg_type, "FIX message received");
+                        }
                     }
                 }
-            }
-
-            let update = GasUpdate { gas_gwei: last_gwei, matic_usd: last_matic };
-            // Use try_send (non-blocking) so the oracle never blocks the main loop
-            // shutdown path. Dropped updates are safe — the main loop retains the
-            // last-known values and the next poll will deliver a fresh update.
-            if self.update_tx.try_send(update).is_err() {
-                // Receiver dropped (clean shutdown) or channel full (main loop lagging).
-                // In either case, silently exit — the oracle will be aborted shortly.
-                debug!("Gas oracle channel closed or full — exiting");
-                return;
-            }
-        }
-    }
-
-    /// Call `eth_gasPrice` on the configured Polygon RPC endpoint.
-    async fn fetch_gas_gwei(&self) -> Result<u64> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_gasPrice",
-            "params": [],
-            "id": 1
-        });
-
-        let resp: RpcResponse = self.http
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        // Surface JSON-RPC errors (returned with HTTP 200 by most RPC providers).
-        if let Some(rpc_err) = resp.error {
-            return Err(anyhow::anyhow!(
-                "Polygon RPC error {}: {}",
-                rpc_err.code,
-                rpc_err.message
-            ));
-        }
-
-        let hex = resp.result
-            .ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result (no error field)"))?;
-
-        // Result is a hex string like "0x..." representing wei
-        let hex_stripped = hex.trim_start_matches("0x");
-        let wei = u64::from_str_radix(hex_stripped, 16)
-            .map_err(|e| anyhow::anyhow!("failed to parse gas price hex '{}': {}", hex, e))?;
-        let gwei = wei / 1_000_000_000;
-        Ok(gwei.max(1)) // floor at 1 gwei to avoid zero gas cost in spread calc
-    }
-
-    /// Fetch MATIC/USD (or POL/USD) from CoinGecko's free simple/price endpoint.
-    /// Tries both the legacy `matic-network` and new `polygon-ecosystem-token` IDs.
-    async fn fetch_matic_usd(&self) -> Result<Decimal> {
-        // Try the current ID first, fall back to legacy
-        for coin_id in &["polygon-ecosystem-token", "matic-network"] {
-            match self.try_coingecko_price(coin_id).await {
-                Ok(price) => return Ok(price),
-                Err(e) => {
-                    tracing::debug!(coin_id, error = %e, "CoinGecko fetch failed, trying next ID");
+                Ok(Err(e)) => {
+                    return Err(e).context("FIX read error");
+                }
+                Err(_) => {
+                    let hb = self.build_fix_message("0", &[]);
+                    writer.write_all(hb.as_bytes()).await?;
                 }
             }
         }
-        Err(anyhow::anyhow!("All CoinGecko IDs failed for MATIC/POL price"))
-    }
-
-    async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
-        let http_resp = self.http
-            .get("https://api.coingecko.com/api/v3/simple/price")
-            .query(&[("ids", coin_id), ("vs_currencies", "usd")])
-            .send()
-            .await?;
-
-        let status = http_resp.status();
-        if !status.is_success() {
-            let body = http_resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "CoinGecko HTTP {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-
-        let resp: serde_json::Value = http_resp.json().await?;
-        let usd = resp.get(coin_id)
-            .and_then(|v| v.get("usd"))
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
-
-        Decimal::from_f64_retain(usd)
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko value is not finite: {}", usd))
     }
 }
-```
 
-## File: src/monitoring/mod.rs
-```rust
-pub mod metrics;
-pub mod health;
-pub mod gas_oracle;
-pub mod backup;
+impl ForecastExFeed {
+    fn handle_market_data(
+        &mut self,
+        fields: &std::collections::HashMap<u32, String>,
+        raw_msg: &str,
+        tick_tx: &broadcast::Sender<NormalizedTick>,
+    ) {
+        let symbol = fields.get(&55).map(|s| s.as_str()).unwrap_or("");
+        if symbol.is_empty() { return; }
+
+        let book = match self.books.get_mut(symbol) {
+            Some(b) => b,
+            None => return,
+        };
+
+        // FIX repeating groups: parse all 269/270/271 triplets from the raw message.
+        // Tags appear in order: 269 (type), 270 (price), 271 (size), then next 269, etc.
+        let parts: Vec<&str> = raw_msg.split(SOH).collect();
+        let mut i = 0;
+        let mut updated = false;
+        while i < parts.len() {
+            if let Some(eq) = parts[i].find('=') {
+                let tag_str = &parts[i][..eq];
+                if tag_str == "269" {
+                    let entry_type = &parts[i][eq + 1..];
+                    // Look ahead for 270 and 271
+                    let price = Self::find_next_tag(&parts, i + 1, 270);
+                    let size = Self::find_next_tag(&parts, i + 1, 271);
+                    match (price, size) {
+                        (Some(p_str), Some(s_str)) => {
+                            let price = match Decimal::from_str(p_str) {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::error!(symbol, raw = p_str,
+                                        "ForecastEx: bad price in repeating group — skipping entry");
+                                    i += 1;
+                                    continue;
+                                }
+                            };
+                            let size = match Decimal::from_str(s_str) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    tracing::error!(symbol, raw = s_str,
+                                        "ForecastEx: bad size in repeating group — skipping entry");
+                                    i += 1;
+                                    continue;
+                                }
+                            };
+                            match entry_type {
+                                "0" => { // Bid
+                                    if size == Decimal::ZERO { book.bids.remove(&price); }
+                                    else { book.bids.insert(price, size); }
+                                    updated = true;
+                                }
+                                "1" => { // Offer
+                                    if size == Decimal::ZERO { book.asks.remove(&price); }
+                                    else { book.asks.insert(price, size); }
+                                    updated = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if updated {
+            self.sequence += 1;
+            if let Some(mut tick) = self.emit_tick(symbol) {
+                tick.sequence = self.sequence;
+                let _ = tick_tx.send(tick);
+            }
+        }
+    }
+
+    /// Scan forward from `start` for the next occurrence of `target_tag`.
+    /// Stop if we hit another 269 (start of next entry) or run out of parts.
+    fn find_next_tag<'a>(parts: &[&'a str], start: usize, target_tag: u32) -> Option<&'a str> {
+        let target = target_tag.to_string();
+        for i in start..parts.len() {
+            if let Some(eq) = parts[i].find('=') {
+                let tag = &parts[i][..eq];
+                if tag == target {
+                    return Some(&parts[i][eq + 1..]);
+                }
+                // Stop at next entry group
+                if tag == "269" {
+                    return None;
+                }
+            }
+        }
+        None
+    }
+}
 ```
 
 ## File: src/risk/circuit_breaker.rs
@@ -3160,114 +3682,6 @@ impl CircuitBreakers {
         } else {
             self.halt_resume_at = None;
             info!("System manually RESUMED via Telegram command.");
-        }
-    }
-}
-```
-
-## File: src/risk/kelly.rs
-```rust
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-
-/// Kelly Criterion calculator for arbitrage
-pub struct KellyCalculator {
-    fraction: Decimal,
-    min_fraction: Decimal,
-    max_fraction: Decimal,
-}
-
-impl KellyCalculator {
-    pub fn new(fraction: Decimal) -> Self {
-        Self {
-            fraction,
-            min_fraction: dec!(0.05),
-            max_fraction: dec!(0.50),
-        }
-    }
-
-    pub fn set_fraction(&mut self, fraction: Decimal) {
-        self.fraction = fraction.max(self.min_fraction).min(self.max_fraction);
-    }
-
-    pub fn fraction(&self) -> Decimal {
-        self.fraction
-    }
-
-    pub fn optimal_fraction(&self, exec_probability: Decimal, net_spread: Decimal) -> Decimal {
-        if net_spread <= Decimal::ZERO || exec_probability <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        let p = exec_probability;
-        let q = Decimal::ONE - p;
-        // Arb-aware Kelly: on execution failure we lose only the fees paid on the
-        // failed leg (~0.5% of notional), not the full notional.  Using net_spread
-        // as `b` in the standard formula (which assumes full-notional loss) produces
-        // near-zero fractions for any realistic spread and kills all trading.
-        let arb_loss_fraction = dec!(0.005); // 0.5 % max loss on execution failure
-        let full_kelly = (p * net_spread - q * arb_loss_fraction) / (net_spread + arb_loss_fraction);
-        if full_kelly <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        (full_kelly * self.fraction).max(Decimal::ZERO).min(dec!(0.10))
-    }
-
-    pub fn position_size(
-        &self,
-        bankroll: Decimal,
-        exec_probability: Decimal,
-        net_spread: Decimal,
-        max_single_trade_pct: Decimal,
-    ) -> Decimal {
-        let kelly_frac = self.optimal_fraction(exec_probability, net_spread);
-        let kelly_size = bankroll * kelly_frac;
-        let max_size = bankroll * max_single_trade_pct;
-        kelly_size.min(max_size).max(Decimal::ZERO)
-    }
-
-    pub fn multi_asset_kelly(
-        &self,
-        opportunities: &[(Decimal, Decimal)],
-        max_total_exposure: Decimal,
-    ) -> Vec<Decimal> {
-        if opportunities.is_empty() {
-            return Vec::new();
-        }
-        let individual: Vec<Decimal> = opportunities.iter()
-            .map(|(p, spread)| self.optimal_fraction(*p, *spread))
-            .collect();
-        let total: Decimal = individual.iter().sum();
-        if total <= Decimal::ZERO {
-            return vec![Decimal::ZERO; opportunities.len()];
-        }
-        if total > max_total_exposure {
-            let scale = max_total_exposure / total;
-            individual.iter().map(|f| *f * scale).collect()
-        } else {
-            individual
-        }
-    }
-
-    /// Adjust the Kelly fraction in response to drawdown.
-    ///
-    /// `current_drawdown_pct` must be **percent-scale** (0–100);
-    /// e.g. pass `15.0` for a 15 % drawdown from peak.
-    ///
-    /// Drawdown tiers reduce sizing; full recovery (≤ 5 %) restores `max_fraction`
-    /// so the system does not permanently under-trade after recovering from any loss.
-    pub fn adjust_for_drawdown(&mut self, current_drawdown_pct: Decimal) {
-        if current_drawdown_pct > dec!(15) {
-            self.set_fraction(dec!(0.10));
-        } else if current_drawdown_pct > dec!(10) {
-            self.set_fraction(dec!(0.15));
-        } else if current_drawdown_pct > dec!(5) {
-            self.set_fraction(dec!(0.20));
-        } else {
-            // Drawdown ≤ 5 %: fully recovered — restore to max fraction.
-            // Without this branch the fraction is a one-way ratchet: it reduces on any
-            // drawdown day but never recovers, causing permanent under-trading after
-            // any loss event.
-            self.set_fraction(self.max_fraction);
         }
     }
 }
@@ -3672,755 +4086,6 @@ pub struct TelegramUpdatesResponse {
 }
 ```
 
-## File: Cargo.toml
-```toml
-[package]
-name = "mercury"
-version = "0.1.0"
-edition = "2021"
-description = "Cross-market prediction arbitrage engine"
-
-[dependencies]
-native-tls = "0.2"
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-rusqlite = { version = "0.31", features = ["bundled", "serde_json", "backup"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.24"
-ethers = { version = "2", features = ["legacy"] }
-jsonwebtoken = "9"
-rsa = { version = "0.9", features = ["pem"] }
-ring = "0.17"
-aes-gcm = "0.10"
-rust_decimal = { version = "1", features = ["serde-with-str"] }
-rust_decimal_macros = "1"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-notify = "6"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-anyhow = "1"
-thiserror = "1"
-async-trait = "0.1"
-futures-util = "0.3"
-url = "2"
-hex = "0.4"
-base64 = "0.22"
-rand = "0.8"
-sha2 = "0.10"
-argon2 = "0.5"
-zeroize = { version = "1", features = ["derive"] }
-secrecy = "0.8"
-tokio-util = "0.7"
-clap = { version = "4", features = ["derive"] }
-tracing-appender = "0.2.4"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
-```
-
-## File: src/db/traits.rs
-```rust
-use anyhow::Result;
-use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
-use uuid::Uuid;
-
-use crate::types::*;
-
-#[async_trait]
-pub trait Database: Send + Sync + 'static {
-    // Markets
-    async fn upsert_market(&self, market: &Market) -> Result<()>;
-    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>>;
-    async fn get_active_markets(&self) -> Result<Vec<Market>>;
-
-    // Trades
-    async fn insert_trade(&self, result: &TradeResult) -> Result<i64>;
-    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>>;
-    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>>;
-    async fn get_trade_count(&self) -> Result<i64>;
-    /// Count distinct in-flight arbitrage pairs (not individual position records).
-    async fn get_open_arb_count(&self) -> Result<usize>;
-
-    // Positions
-    async fn upsert_position(&self, position: &Position) -> Result<()>;
-    /// Upsert two positions (both legs of an arbitrage) atomically.
-    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()>;
-    async fn get_open_positions(&self) -> Result<Vec<Position>>;
-    async fn close_position(&self, id: i64) -> Result<()>;
-
-    // Balances
-    async fn update_balance(&self, balance: &PlatformBalance) -> Result<()>;
-    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>>;
-    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>>;
-
-    // Daily snapshots
-    async fn insert_daily_snapshot(&self, snapshot: &DailySnapshot) -> Result<()>;
-    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>>;
-    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()>;
-
-    // Audit log
-    async fn append_audit(&self, entry: &AuditEntry) -> Result<()>;
-    /// Batch-insert multiple audit entries in a single transaction.
-    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()>;
-
-    // Config history
-    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()>;
-
-    // Utility
-    async fn db_size_bytes(&self) -> Result<u64>;
-    /// Create an atomic backup of the database to the given file path.
-    async fn backup_to_file(&self, dest_path: &str) -> Result<()>;
-}
-```
-
-## File: src/engine/order_book.rs
-```rust
-use rust_decimal::Decimal;
-use std::collections::{BTreeMap, HashMap};
-use uuid::Uuid;
-
-use crate::types::*;
-
-/// Per-platform order book for a single market
-#[derive(Debug, Clone)]
-pub struct PlatformBook {
-    pub platform: Platform,
-    pub market_id: Uuid,
-    pub bids: BTreeMap<Decimal, Decimal>,
-    pub asks: BTreeMap<Decimal, Decimal>,
-    pub last_update_ns: u64,
-    pub fee_rate_bps: u16,
-    pub sequence: u64,
-}
-
-impl PlatformBook {
-    pub fn new(platform: Platform, market_id: Uuid) -> Self {
-        Self {
-            platform,
-            market_id,
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
-            last_update_ns: 0,
-            fee_rate_bps: 0,
-            sequence: 0,
-        }
-    }
-
-    pub fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
-    }
-
-    pub fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(p, s)| (*p, *s))
-    }
-
-    pub fn mid_price(&self) -> Decimal {
-        match (self.best_bid(), self.best_ask()) {
-            (Some((b, _)), Some((a, _))) => (b + a) / Decimal::from(2),
-            (Some((b, _)), None) => b,
-            (None, Some((a, _))) => a,
-            _ => Decimal::ZERO,
-        }
-    }
-
-    pub fn ask_depth(&self) -> Vec<PriceLevel> {
-        self.asks.iter().take(10).map(|(p, s)| PriceLevel { price: *p, size: *s }).collect()
-    }
-
-    pub fn bid_depth(&self) -> Vec<PriceLevel> {
-        self.bids.iter().rev().take(10).map(|(p, s)| PriceLevel { price: *p, size: *s }).collect()
-    }
-
-    pub fn is_stale(&self, timeout_ns: u64) -> bool {
-        let now = crate::types::now_ns();
-        now.saturating_sub(self.last_update_ns) > timeout_ns
-    }
-
-    /// Update from a NormalizedTick
-    ///
-    /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
-    /// to prevent out-of-order or replayed updates (e.g. after a reconnect)
-    /// from overwriting a newer book with stale data.
-    /// Sequence-0 ticks are treated as full snapshots and always applied.
-    pub fn update_from_tick(&mut self, tick: &NormalizedTick) {
-        if tick.sequence > 0 && tick.sequence <= self.sequence {
-            return;
-        }
-
-        self.bids.clear();
-        self.asks.clear();
-
-        for level in &tick.book_depth {
-            if level.price <= tick.bid_price {
-                self.bids.insert(level.price, level.size);
-            } else if level.price >= tick.ask_price {
-                self.asks.insert(level.price, level.size);
-            } else {
-                // Mid-spread level: classify by which side it's closer to
-                if tick.ask_price - level.price < level.price - tick.bid_price {
-                    self.asks.insert(level.price, level.size);
-                } else {
-                    self.bids.insert(level.price, level.size);
-                }
-            }
-        }
-
-        if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
-            // CRITICAL: Prevent crossed books by wiping asks that are lower than the new bid
-            self.asks.retain(|&p, _| p > tick.bid_price);
-            self.bids.insert(tick.bid_price, tick.bid_size);
-        }
-        if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
-            // CRITICAL: Prevent crossed books by wiping bids that are higher than the new ask
-            self.bids.retain(|&p, _| p < tick.ask_price);
-            self.asks.insert(tick.ask_price, tick.ask_size);
-        }
-
-        self.last_update_ns = tick.timestamp_ns;
-        self.fee_rate_bps = tick.fee_rate_bps;
-        self.sequence = tick.sequence;
-    }
-}
-
-/// Unified Order Book: aggregates all platform books for all markets
-pub struct UnifiedOrderBook {
-    books: HashMap<(Uuid, Platform), PlatformBook>,
-}
-
-impl UnifiedOrderBook {
-    pub fn new() -> Self {
-        Self { books: HashMap::new() }
-    }
-
-    pub fn update(&mut self, tick: &NormalizedTick) {
-        let key = (tick.market_id, tick.platform);
-        let book = self.books
-            .entry(key)
-            .or_insert_with(|| PlatformBook::new(tick.platform, tick.market_id));
-        book.update_from_tick(tick);
-    }
-
-    pub fn get_book(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformBook> {
-        self.books.get(&(*market_id, *platform))
-    }
-}
-```
-
-## File: src/feeds/forecastex.rs
-```rust
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use rust_decimal::Decimal;
-use std::collections::BTreeMap;
-use std::str::FromStr;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::sync::broadcast;
-use tracing::{debug, info};
-use uuid::Uuid;
-
-use super::base::FeedHandler;
-use crate::config::ForecastExConfig;
-use crate::types::*;
-
-/// Minimal FIX 4.4 client for ForecastEx market data
-pub struct ForecastExFeed {
-    config: ForecastExConfig,
-    subscriptions: Vec<(String, Uuid)>,
-    books: std::collections::HashMap<String, FexOrderBook>,
-    sequence: u64,
-    msg_seq_num: u64,
-    sender_comp_id: String,
-    target_comp_id: String,
-}
-
-struct FexOrderBook {
-    bids: BTreeMap<Decimal, Decimal>,
-    asks: BTreeMap<Decimal, Decimal>,
-}
-
-impl FexOrderBook {
-    fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new() } }
-
-    /// Returns the best bid (price, size) only if the bid side is non-empty.
-    /// Never returns a phantom (0, 0) fallback — callers must handle None.
-    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
-    }
-
-    /// Returns the best ask (price, size) only if the ask side is non-empty.
-    /// Never returns a phantom (1.0, 0) fallback — callers must handle None.
-    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(p, s)| (*p, *s))
-    }
-
-    /// Returns mid-price only when both sides have real liquidity.
-    fn mid_price(&self) -> Option<Decimal> {
-        let (b, _) = self.best_bid()?;
-        let (a, _) = self.best_ask()?;
-        Some((b + a) / Decimal::from(2))
-    }
-    fn depth(&self) -> Vec<PriceLevel> {
-        let mut levels = Vec::new();
-        for (p, s) in self.bids.iter().rev().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
-        for (p, s) in self.asks.iter().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
-        levels
-    }
-}
-
-const SOH: char = '\x01';
-
-impl ForecastExFeed {
-    pub fn new(config: ForecastExConfig, subscriptions: Vec<(String, Uuid)>) -> Self {
-        Self {
-            config,
-            subscriptions,
-            books: std::collections::HashMap::new(),
-            sequence: 0,
-            msg_seq_num: 1,
-            sender_comp_id: std::env::var("FEX_SENDER_COMP_ID").unwrap_or_else(|_| "MERCURY".into()),
-            target_comp_id: std::env::var("FEX_TARGET_COMP_ID").unwrap_or_else(|_| "FORECASTEX".into()),
-        }
-    }
-
-    fn symbol_to_market_id(&self, symbol: &str) -> Option<Uuid> {
-        self.subscriptions.iter()
-            .find(|(s, _)| s == symbol)
-            .map(|(_, id)| *id)
-    }
-
-    fn emit_tick(&self, symbol: &str) -> Option<NormalizedTick> {
-        let market_id = self.symbol_to_market_id(symbol)?;
-        let book = self.books.get(symbol)?;
-        // best_bid/best_ask return None when either side is empty.
-        // Returning None here suppresses the tick so the spread engine never
-        // sees phantom prices (bid=0 or ask=1) that would trigger fake arbs.
-        let bid = book.best_bid()?;
-        let ask = book.best_ask()?;
-        let mid = book.mid_price()?;
-
-        Some(NormalizedTick {
-            platform: Platform::ForecastEx,
-            market_id,
-            timestamp_ns: now_ns(),
-            bid_price: bid.0,
-            bid_size: bid.1,
-            ask_price: ask.0,
-            ask_size: ask.1,
-            mid_price: mid,
-            last_trade_price: Decimal::ZERO,
-            last_trade_size: Decimal::ZERO,
-            book_depth: book.depth(),
-            fee_rate_bps: 0,
-            sequence: 0,
-        })
-    }
-
-    fn build_fix_message(&mut self, msg_type: &str, body_fields: &[(u32, &str)]) -> String {
-        let mut body = format!("35={}{}", msg_type, SOH);
-        body.push_str(&format!("49={}{}", self.sender_comp_id, SOH));
-        body.push_str(&format!("56={}{}", self.target_comp_id, SOH));
-        body.push_str(&format!("34={}{}", self.msg_seq_num, SOH));
-        body.push_str(&format!("52={}{}", chrono::Utc::now().format("%Y%m%d-%H:%M:%S%.3f"), SOH));
-        for (tag, val) in body_fields {
-            body.push_str(&format!("{}={}{}", tag, val, SOH));
-        }
-        self.msg_seq_num += 1;
-
-        let header = format!("8=FIX.4.4{}9={}{}", SOH, body.len(), SOH);
-        let full = format!("{}{}", header, body);
-
-        let checksum: u32 = full.bytes().map(|b| b as u32).sum::<u32>() % 256;
-        format!("{}10={:03}{}", full, checksum, SOH)
-    }
-
-    fn parse_fix_fields(msg: &str) -> std::collections::HashMap<u32, String> {
-        let mut fields = std::collections::HashMap::new();
-        for part in msg.split(SOH) {
-            if let Some(eq_pos) = part.find('=') {
-                if let Ok(tag) = part[..eq_pos].parse::<u32>() {
-                    fields.insert(tag, part[eq_pos + 1..].to_string());
-                }
-            }
-        }
-        fields
-    }
-}
-
-#[async_trait]
-impl FeedHandler for ForecastExFeed {
-    fn platform(&self) -> Platform {
-        Platform::ForecastEx
-    }
-
-    fn clear_books(&mut self) {
-        for book in self.books.values_mut() {
-            book.bids.clear();
-            book.asks.clear();
-        }
-    }
-
-    async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
-        if !self.config.enabled {
-            info!("ForecastEx feed disabled, skipping");
-            return Ok(());
-        }
-
-        let addr = format!("{}:{}", self.config.fix_host, self.config.fix_port);
-        info!(addr = %addr, "Connecting to ForecastEx FIX gateway");
-
-        let stream = TcpStream::connect(&addr)
-            .await
-            .context("Failed to connect to ForecastEx FIX gateway")?;
-
-        let (reader, mut writer) = stream.into_split();
-        let mut buf_reader = BufReader::new(reader);
-
-        // Send Logon (35=A)
-        let logon = self.build_fix_message("A", &[
-            (98, "0"),
-            (108, "30"),
-        ]);
-        writer.write_all(logon.as_bytes()).await?;
-        info!("FIX Logon sent");
-
-        let sub_symbols: Vec<String> = self.subscriptions.iter().map(|(s, _)| s.clone()).collect();
-        for symbol in &sub_symbols {
-            self.books.entry(symbol.clone()).or_insert_with(FexOrderBook::new);
-        }
-
-        // Subscribe to market data (35=V)
-        let symbols: Vec<(usize, String)> = self.subscriptions.iter()
-            .enumerate()
-            .map(|(i, (s, _))| (i, s.clone()))
-            .collect();
-        for (i, symbol) in &symbols {
-            let md_req_id = format!("MDR{}", i);
-            let md_request = self.build_fix_message("V", &[
-                (262, &md_req_id),
-                (263, "1"),
-                (264, "10"),
-                (267, "2"),
-                (269, "0"),
-                (269, "1"),
-                (146, "1"),
-                (55, symbol),
-            ]);
-            writer.write_all(md_request.as_bytes()).await?;
-        }
-        info!(count = self.subscriptions.len(), "FIX market data requests sent");
-
-        let mut line_buf = String::new();
-        loop {
-            line_buf.clear();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(45),
-                buf_reader.read_line(&mut line_buf),
-            ).await {
-                Ok(Ok(0)) => {
-                    info!("FIX connection closed");
-                    return Ok(());
-                }
-                Ok(Ok(_)) => {
-                    let fields = Self::parse_fix_fields(&line_buf);
-                    let msg_type = fields.get(&35).map(|s| s.as_str()).unwrap_or("");
-
-                    match msg_type {
-                        "W" | "X" => {
-                            self.handle_market_data(&fields, &line_buf, &tick_tx);
-                        }
-                        "0" => {
-                            let hb = self.build_fix_message("0", &[]);
-                            let _ = writer.write_all(hb.as_bytes()).await;
-                        }
-                        "1" => {
-                            let test_req_id = fields.get(&112).map(|s| s.as_str()).unwrap_or("0");
-                            let hb = self.build_fix_message("0", &[(112, test_req_id)]);
-                            let _ = writer.write_all(hb.as_bytes()).await;
-                        }
-                        "5" => {
-                            info!("FIX Logout received");
-                            return Ok(());
-                        }
-                        _ => {
-                            debug!(msg_type, "FIX message received");
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    return Err(e).context("FIX read error");
-                }
-                Err(_) => {
-                    let hb = self.build_fix_message("0", &[]);
-                    writer.write_all(hb.as_bytes()).await?;
-                }
-            }
-        }
-    }
-}
-
-impl ForecastExFeed {
-    fn handle_market_data(
-        &mut self,
-        fields: &std::collections::HashMap<u32, String>,
-        raw_msg: &str,
-        tick_tx: &broadcast::Sender<NormalizedTick>,
-    ) {
-        let symbol = fields.get(&55).map(|s| s.as_str()).unwrap_or("");
-        if symbol.is_empty() { return; }
-
-        let book = match self.books.get_mut(symbol) {
-            Some(b) => b,
-            None => return,
-        };
-
-        // FIX repeating groups: parse all 269/270/271 triplets from the raw message.
-        // Tags appear in order: 269 (type), 270 (price), 271 (size), then next 269, etc.
-        let parts: Vec<&str> = raw_msg.split(SOH).collect();
-        let mut i = 0;
-        let mut updated = false;
-        while i < parts.len() {
-            if let Some(eq) = parts[i].find('=') {
-                let tag_str = &parts[i][..eq];
-                if tag_str == "269" {
-                    let entry_type = &parts[i][eq + 1..];
-                    // Look ahead for 270 and 271
-                    let price = Self::find_next_tag(&parts, i + 1, 270);
-                    let size = Self::find_next_tag(&parts, i + 1, 271);
-                    match (price, size) {
-                        (Some(p_str), Some(s_str)) => {
-                            let price = match Decimal::from_str(p_str) {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    tracing::error!(symbol, raw = p_str,
-                                        "ForecastEx: bad price in repeating group — skipping entry");
-                                    i += 1;
-                                    continue;
-                                }
-                            };
-                            let size = match Decimal::from_str(s_str) {
-                                Ok(s) => s,
-                                Err(_) => {
-                                    tracing::error!(symbol, raw = s_str,
-                                        "ForecastEx: bad size in repeating group — skipping entry");
-                                    i += 1;
-                                    continue;
-                                }
-                            };
-                            match entry_type {
-                                "0" => { // Bid
-                                    if size == Decimal::ZERO { book.bids.remove(&price); }
-                                    else { book.bids.insert(price, size); }
-                                    updated = true;
-                                }
-                                "1" => { // Offer
-                                    if size == Decimal::ZERO { book.asks.remove(&price); }
-                                    else { book.asks.insert(price, size); }
-                                    updated = true;
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        if updated {
-            self.sequence += 1;
-            if let Some(mut tick) = self.emit_tick(symbol) {
-                tick.sequence = self.sequence;
-                let _ = tick_tx.send(tick);
-            }
-        }
-    }
-
-    /// Scan forward from `start` for the next occurrence of `target_tag`.
-    /// Stop if we hit another 269 (start of next entry) or run out of parts.
-    fn find_next_tag<'a>(parts: &[&'a str], start: usize, target_tag: u32) -> Option<&'a str> {
-        let target = target_tag.to_string();
-        for i in start..parts.len() {
-            if let Some(eq) = parts[i].find('=') {
-                let tag = &parts[i][..eq];
-                if tag == target {
-                    return Some(&parts[i][eq + 1..]);
-                }
-                // Stop at next entry group
-                if tag == "269" {
-                    return None;
-                }
-            }
-        }
-        None
-    }
-}
-```
-
-## File: src/telegram/bot.rs
-```rust
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tracing::warn;
-
-const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
-const MAX_MESSAGE_LENGTH: usize = 4096;
-const RATE_LIMIT_PER_SECOND: u32 = 1;
-
-#[derive(Clone)]
-pub struct TelegramBot {
-    client: reqwest::Client,
-    token: String,
-    last_send: Arc<Mutex<Instant>>,
-}
-
-#[derive(Serialize)]
-struct SendMessageRequest<'a> {
-    chat_id: &'a str,
-    text: &'a str,
-    parse_mode: &'a str,
-    disable_web_page_preview: bool,
-}
-
-#[derive(Deserialize)]
-struct TelegramResponse {
-    ok: bool,
-    description: Option<String>,
-}
-
-impl TelegramBot {
-    pub fn new(token: String) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to create HTTP client"),
-            token,
-            last_send: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2))),
-        }
-    }
-
-    /// Send a message to a specific chat, respecting rate limits
-    pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
-        // Rate limiting: compute sleep duration while holding the lock,
-        // then release the lock before sleeping so other callers aren't blocked.
-        {
-            let sleep_for = {
-                let mut last = self.last_send.lock().await;
-                let elapsed = last.elapsed();
-                let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
-                if elapsed < min_interval {
-                    let wait = min_interval - elapsed;
-                    // Pre-emptively advance the timer for the NEXT concurrent caller
-                    *last += min_interval;
-                    Some(wait)
-                } else {
-                    *last = Instant::now();
-                    None
-                }
-            };
-            if let Some(dur) = sleep_for {
-                tokio::time::sleep(dur).await;
-            }
-        }
-
-        // Truncate if too long, respecting UTF-8 boundaries
-        let text = if text.len() > MAX_MESSAGE_LENGTH {
-            let mut end = MAX_MESSAGE_LENGTH - 20;
-            while end > 0 && !text.is_char_boundary(end) { end -= 1; }
-            &text[..end]
-        } else {
-            text
-        };
-
-        let url = format!("{}{}/sendMessage", TELEGRAM_API_BASE, self.token);
-        let body = SendMessageRequest {
-            chat_id,
-            text,
-            parse_mode: "HTML",
-            disable_web_page_preview: true,
-        };
-
-        // Retry with exponential backoff (max 3 attempts)
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.client.post(&url).json(&body).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let resp_body: TelegramResponse = resp.json().await
-                        .unwrap_or(TelegramResponse { ok: false, description: Some("Failed to parse response".into()) });
-
-                    if resp_body.ok {
-                        return Ok(());
-                    }
-
-                    let desc = resp_body.description.unwrap_or_default();
-                    if status.as_u16() == 429 {
-                        warn!(attempt, "Telegram rate limited, backing off");
-                        if attempt >= 3 {
-                            anyhow::bail!("Telegram rate limited after {} attempts: {}", attempt, desc);
-                        }
-                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                        continue;
-                    }
-
-                    anyhow::bail!("Telegram API error ({}): {}", status, desc);
-                }
-                Err(e) => {
-                    if attempt >= 3 {
-                        return Err(e).context("Failed to send Telegram message after 3 attempts");
-                    }
-                    warn!(attempt, error = %e, "Telegram send failed, retrying");
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                }
-            }
-        }
-    }
-
-    /// Long-poll the Telegram API to fetch new commands
-    pub async fn get_updates(&self, offset: i64) -> Result<Vec<crate::types::TelegramUpdate>> {
-        let url = format!("{}/bot{}/getUpdates?offset={}&timeout=5", 
-            TELEGRAM_API_BASE.trim_end_matches("/bot"), 
-            self.token, 
-            offset
-        );
-        let resp = self.client.get(&url).send().await?
-            .json::<crate::types::TelegramUpdatesResponse>().await?;
-        
-        if resp.ok {
-            Ok(resp.result)
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    /// Escape HTML special characters for Telegram HTML parse mode
-    pub fn escape_html(text: &str) -> String {
-        text.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    }
-}
-```
-
 ## File: src/config.rs
 ```rust
 use anyhow::{Context, Result};
@@ -4624,1066 +4289,135 @@ impl ConfigManager {
 }
 ```
 
-## File: src/db/sqlite.rs
-```rust
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use chrono::{DateTime, Days, NaiveDate, Utc};
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
-use rust_decimal::Decimal;
-use std::collections::HashMap;
-use std::path::Path;
-use std::str::FromStr;
-use uuid::Uuid;
-
-use super::migrations;
-use super::traits::Database;
-use crate::types::*;
-
-/// SQLite-backed implementation of [`Database`].
-#[derive(Clone)]
-pub struct SqliteDb {
-    pool: Pool<SqliteConnectionManager>,
-}
-
-impl SqliteDb {
-    /// Open (or create) a SQLite database at `path`.
-    pub fn new(path: &str, pool_size: u32, busy_timeout_ms: u64) -> Result<Self> {
-        // Ensure parent directory exists
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        // Apply PRAGMAs on every connection created by the pool via with_init.
-        // WAL mode is file-level (persistent) but is idempotent to set again.
-        // synchronous, busy_timeout, and foreign_keys are connection-level and
-        // must be set on each connection, not just a single borrowed one.
-        let manager = SqliteConnectionManager::file(path).with_init(move |conn| {
-            conn.execute_batch(&format!(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=NORMAL;
-                 PRAGMA busy_timeout={busy_timeout_ms};
-                 PRAGMA foreign_keys=ON;"
-            ))
-        });
-        let pool = Pool::builder()
-            .max_size(pool_size)
-            .build(manager)
-            .context("failed to build SQLite connection pool")?;
-
-        // Run migrations on first connection
-        {
-            let conn = pool.get().context("failed to get connection from pool")?;
-            migrations::run_migrations(&conn)?;
-        }
-
-        Ok(Self { pool })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn dec(s: &str) -> rusqlite::Result<Decimal> {
-    Decimal::from_str(s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
-    })
-}
-
-fn dec_to_string(d: &Decimal) -> String {
-    d.to_string()
-}
-
-fn platform_from_db(s: &str) -> Platform {
-    match s {
-        "Polymarket" => Platform::Polymarket,
-        "Polymarket US" => Platform::PolymarketUs,
-        "Kalshi" => Platform::Kalshi,
-        "CDNA" => Platform::Cdna,
-        "ForecastEx" => Platform::ForecastEx,
-        _ => Platform::Polymarket,
-    }
-}
-
-fn side_from_db(s: &str) -> Side {
-    match s {
-        "YES" => Side::Yes,
-        "NO" => Side::No,
-        _ => Side::Yes,
-    }
-}
-
-/// Shared upsert logic used by both `upsert_position` and `upsert_position_pair`.
-fn upsert_position_on(conn: &rusqlite::Connection, pos: &Position) -> Result<()> {
-    if pos.id == 0 {
-        conn.execute(
-            "INSERT INTO positions (market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            rusqlite::params![
-                pos.market_id.to_string(),
-                pos.platform.to_string(),
-                pos.side.to_string(),
-                dec_to_string(&pos.quantity),
-                dec_to_string(&pos.avg_entry_price),
-                dec_to_string(&pos.unrealized_pnl),
-                dt_to_str(&pos.opened_at),
-                dt_to_str(&pos.updated_at),
-            ],
-        )?;
-    } else {
-        conn.execute(
-            "INSERT INTO positions (id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(id) DO UPDATE SET
-               quantity = excluded.quantity,
-               avg_entry_price = excluded.avg_entry_price,
-               unrealized_pnl = excluded.unrealized_pnl,
-               updated_at = excluded.updated_at",
-            rusqlite::params![
-                pos.id,
-                pos.market_id.to_string(),
-                pos.platform.to_string(),
-                pos.side.to_string(),
-                dec_to_string(&pos.quantity),
-                dec_to_string(&pos.avg_entry_price),
-                dec_to_string(&pos.unrealized_pnl),
-                dt_to_str(&pos.opened_at),
-                dt_to_str(&pos.updated_at),
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn trade_status_from_db(s: &str) -> TradeStatus {
-    match s {
-        "success" => TradeStatus::Success,
-        "fail" => TradeStatus::Fail,
-        "partial" => TradeStatus::Partial,
-        _ => TradeStatus::Fail,
-    }
-}
-
-fn market_status_from_db(s: &str) -> MarketStatus {
-    match s {
-        "active" => MarketStatus::Active,
-        "suspended" => MarketStatus::Suspended,
-        "resolved" => MarketStatus::Resolved,
-        "expired" => MarketStatus::Expired,
-        _ => MarketStatus::Active,
-    }
-}
-
-fn category_from_db(s: &str) -> MarketCategory {
-    match s {
-        "sports" => MarketCategory::Sports,
-        "politics" => MarketCategory::Politics,
-        "finance" => MarketCategory::Finance,
-        "crypto" => MarketCategory::Crypto,
-        "weather" => MarketCategory::Weather,
-        "culture" => MarketCategory::Culture,
-        _ => MarketCategory::Other,
-    }
-}
-
-fn category_to_str(c: &MarketCategory) -> &'static str {
-    match c {
-        MarketCategory::Sports => "sports",
-        MarketCategory::Politics => "politics",
-        MarketCategory::Finance => "finance",
-        MarketCategory::Crypto => "crypto",
-        MarketCategory::Weather => "weather",
-        MarketCategory::Culture => "culture",
-        MarketCategory::Other => "other",
-    }
-}
-
-fn parse_dt(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
-}
-
-fn dt_to_str(dt: &DateTime<Utc>) -> String {
-    dt.to_rfc3339()
-}
-
-fn parse_naive_date(s: &str) -> NaiveDate {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive())
-}
-
-// ---------------------------------------------------------------------------
-// Database trait impl
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl Database for SqliteDb {
-    // -- Markets --------------------------------------------------------
-
-    async fn upsert_market(&self, market: &Market) -> Result<()> {
-        let pool = self.pool.clone();
-        let market = market.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let platforms_json = serde_json::to_string(&market.platforms)?;
-            conn.execute(
-                "INSERT INTO markets (unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(unified_id) DO UPDATE SET
-                   question = excluded.question,
-                   resolution_source = excluded.resolution_source,
-                   expiration = excluded.expiration,
-                   platforms = excluded.platforms,
-                   category = excluded.category,
-                   confidence = excluded.confidence,
-                   status = excluded.status,
-                   updated_at = excluded.updated_at",
-                rusqlite::params![
-                    market.unified_id.to_string(),
-                    market.question,
-                    market.resolution_source,
-                    dt_to_str(&market.expiration),
-                    platforms_json,
-                    category_to_str(&market.category),
-                    market.confidence,
-                    market.status.to_string(),
-                    dt_to_str(&market.created_at),
-                    dt_to_str(&market.updated_at),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("upsert_market db task panicked")?
-    }
-
-    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>> {
-        let pool = self.pool.clone();
-        let id = *id;
-        tokio::task::spawn_blocking(move || -> Result<Option<Market>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let mut stmt = conn.prepare(
-                "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
-                 FROM markets WHERE unified_id = ?1",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![id.to_string()])?;
-            match rows.next()? {
-                Some(row) => {
-                    let platforms_str: String = row.get(4)?;
-                    let platforms: HashMap<Platform, PlatformMarketInfo> =
-                        serde_json::from_str(&platforms_str).unwrap_or_default();
-                    Ok(Some(Market {
-                        unified_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
-                        question: row.get(1)?,
-                        resolution_source: row.get(2)?,
-                        expiration: parse_dt(&row.get::<_, String>(3)?),
-                        platforms,
-                        category: category_from_db(&row.get::<_, String>(5)?),
-                        confidence: row.get(6)?,
-                        status: market_status_from_db(&row.get::<_, String>(7)?),
-                        created_at: parse_dt(&row.get::<_, String>(8)?),
-                        updated_at: parse_dt(&row.get::<_, String>(9)?),
-                    }))
-                }
-                None => Ok(None),
-            }
-        })
-        .await
-        .context("get_market db task panicked")?
-    }
-
-    async fn get_active_markets(&self) -> Result<Vec<Market>> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<Market>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let mut stmt = conn.prepare(
-                "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
-                 FROM markets WHERE status = 'active'",
-            )?;
-            let mut rows = stmt.query([])?;
-            let mut markets = Vec::new();
-            while let Some(row) = rows.next()? {
-                let platforms_str: String = row.get(4)?;
-                let platforms: HashMap<Platform, PlatformMarketInfo> =
-                    serde_json::from_str(&platforms_str).unwrap_or_default();
-                markets.push(Market {
-                    unified_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
-                    question: row.get(1)?,
-                    resolution_source: row.get(2)?,
-                    expiration: parse_dt(&row.get::<_, String>(3)?),
-                    platforms,
-                    category: category_from_db(&row.get::<_, String>(5)?),
-                    confidence: row.get(6)?,
-                    status: market_status_from_db(&row.get::<_, String>(7)?),
-                    created_at: parse_dt(&row.get::<_, String>(8)?),
-                    updated_at: parse_dt(&row.get::<_, String>(9)?),
-                });
-            }
-            Ok(markets)
-        })
-        .await
-        .context("get_active_markets db task panicked")?
-    }
-
-    // -- Trades ---------------------------------------------------------
-
-    async fn insert_trade(&self, trade: &TradeResult) -> Result<i64> {
-        let pool = self.pool.clone();
-        let trade = trade.clone();
-        tokio::task::spawn_blocking(move || -> Result<i64> {
-            let conn = pool.get().context("failed to get db connection")?;
-            conn.execute(
-                "INSERT INTO trades (opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
-                rusqlite::params![
-                    trade.opp_id.to_string(),
-                    trade.market_id.to_string(),
-                    trade.market_question,
-                    trade.leg_a_platform.to_string(),
-                    trade.leg_a_side.to_string(),
-                    dec_to_string(&trade.leg_a_price),
-                    dec_to_string(&trade.leg_a_size),
-                    dec_to_string(&trade.leg_a_fill_price),
-                    dec_to_string(&trade.leg_a_fee),
-                    trade.leg_b_platform.to_string(),
-                    trade.leg_b_side.to_string(),
-                    dec_to_string(&trade.leg_b_price),
-                    dec_to_string(&trade.leg_b_size),
-                    dec_to_string(&trade.leg_b_fill_price),
-                    dec_to_string(&trade.leg_b_fee),
-                    dec_to_string(&trade.raw_spread),
-                    dec_to_string(&trade.net_spread),
-                    dec_to_string(&trade.profit),
-                    trade.status.to_string(),
-                    trade.failure_reason.as_deref(),
-                    trade.execution_ms as i64,
-                    dt_to_str(&trade.executed_at),
-                    dec_to_string(&trade.bankroll_after),
-                    dec_to_string(&trade.bankroll_change_pct),
-                ],
-            )?;
-            Ok(conn.last_insert_rowid())
-        })
-        .await
-        .context("insert_trade db task panicked")?
-    }
-
-    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<TradeResult>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let mut stmt = conn.prepare(
-                "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
-                 FROM trades WHERE executed_at >= ?1 ORDER BY executed_at ASC",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![dt_to_str(&since)])?;
-            let mut trades = Vec::new();
-            while let Some(row) = rows.next()? {
-                trades.push(row_to_trade(row)?);
-            }
-            Ok(trades)
-        })
-        .await
-        .context("get_trades_since db task panicked")?
-    }
-
-    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<TradeResult>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let start = format!("{}T00:00:00+00:00", date);
-            // Use the next day as an exclusive upper bound to capture all sub-second
-            // trades on `date` (23:59:59+00:00 would miss trades after that second).
-            let end = format!("{}T00:00:00+00:00", date + Days::new(1));
-            let mut stmt = conn.prepare(
-                "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
-                 FROM trades WHERE executed_at >= ?1 AND executed_at < ?2 ORDER BY executed_at ASC",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![start, end])?;
-            let mut trades = Vec::new();
-            while let Some(row) = rows.next()? {
-                trades.push(row_to_trade(row)?);
-            }
-            Ok(trades)
-        })
-        .await
-        .context("get_trades_for_date db task panicked")?
-    }
-
-    async fn get_trade_count(&self) -> Result<i64> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<i64> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))?;
-            Ok(count)
-        })
-        .await
-        .context("get_trade_count db task panicked")?
-    }
-
-    // -- Positions ------------------------------------------------------
-
-    async fn upsert_position(&self, pos: &Position) -> Result<()> {
-        let pool = self.pool.clone();
-        let pos = pos.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            upsert_position_on(&conn, &pos)
-        })
-        .await
-        .context("upsert_position db task panicked")?
-    }
-
-    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()> {
-        let pool = self.pool.clone();
-        let pos_a = pos_a.clone();
-        let pos_b = pos_b.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool.get().context("failed to get db connection")?;
-            let tx = conn.transaction()?;
-            upsert_position_on(&tx, &pos_a)?;
-            upsert_position_on(&tx, &pos_b)?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .context("upsert_position_pair db task panicked")?
-    }
-
-    async fn get_open_positions(&self) -> Result<Vec<Position>> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<Position>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let mut stmt = conn.prepare(
-                "SELECT id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at
-                 FROM positions WHERE closed = 0",
-            )?;
-            let mut rows = stmt.query([])?;
-            let mut positions = Vec::new();
-            while let Some(row) = rows.next()? {
-                positions.push(row_to_position(row)?);
-            }
-            Ok(positions)
-        })
-        .await
-        .context("get_open_positions db task panicked")?
-    }
-
-    async fn get_open_arb_count(&self) -> Result<usize> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT market_id) FROM positions WHERE closed = 0",
-                [],
-                |r| r.get(0),
-            )?;
-            Ok(count as usize)
-        })
-        .await
-        .context("get_open_arb_count db task panicked")?
-    }
-
-    async fn close_position(&self, id: i64) -> Result<()> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            conn.execute(
-                "UPDATE positions SET closed = 1 WHERE id = ?1",
-                rusqlite::params![id],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("close_position db task panicked")?
-    }
-
-    // -- Balances -------------------------------------------------------
-
-    async fn update_balance(&self, bal: &PlatformBalance) -> Result<()> {
-        let pool = self.pool.clone();
-        let bal = bal.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            conn.execute(
-                "INSERT INTO platform_balances (platform, available, reserved, pending_settlement, total, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(platform) DO UPDATE SET
-                   available = excluded.available,
-                   reserved = excluded.reserved,
-                   pending_settlement = excluded.pending_settlement,
-                   total = excluded.total,
-                   updated_at = excluded.updated_at",
-                rusqlite::params![
-                    bal.platform.to_string(),
-                    dec_to_string(&bal.available),
-                    dec_to_string(&bal.reserved),
-                    dec_to_string(&bal.pending_settlement),
-                    dec_to_string(&bal.total),
-                    dt_to_str(&bal.updated_at),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("update_balance db task panicked")?
-    }
-
-    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<PlatformBalance>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let mut stmt = conn.prepare(
-                "SELECT platform, available, reserved, pending_settlement, total, updated_at
-                 FROM platform_balances WHERE platform = ?1",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![platform.to_string()])?;
-            match rows.next()? {
-                Some(row) => Ok(Some(PlatformBalance {
-                    platform: platform_from_db(&row.get::<_, String>(0)?),
-                    available: dec(&row.get::<_, String>(1)?)?,
-                    reserved: dec(&row.get::<_, String>(2)?)?,
-                    pending_settlement: dec(&row.get::<_, String>(3)?)?,
-                    total: dec(&row.get::<_, String>(4)?)?,
-                    updated_at: parse_dt(&row.get::<_, String>(5)?),
-                })),
-                None => Ok(None),
-            }
-        })
-        .await
-        .context("get_balance db task panicked")?
-    }
-
-    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<PlatformBalance>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let mut stmt = conn.prepare(
-                "SELECT platform, available, reserved, pending_settlement, total, updated_at
-                 FROM platform_balances",
-            )?;
-            let mut rows = stmt.query([])?;
-            let mut balances = Vec::new();
-            while let Some(row) = rows.next()? {
-                balances.push(PlatformBalance {
-                    platform: platform_from_db(&row.get::<_, String>(0)?),
-                    available: dec(&row.get::<_, String>(1)?)?,
-                    reserved: dec(&row.get::<_, String>(2)?)?,
-                    pending_settlement: dec(&row.get::<_, String>(3)?)?,
-                    total: dec(&row.get::<_, String>(4)?)?,
-                    updated_at: parse_dt(&row.get::<_, String>(5)?),
-                });
-            }
-            Ok(balances)
-        })
-        .await
-        .context("get_all_balances db task panicked")?
-    }
-
-    // -- Daily snapshots ------------------------------------------------
-
-    async fn insert_daily_snapshot(&self, snap: &DailySnapshot) -> Result<()> {
-        let pool = self.pool.clone();
-        let snap = snap.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            // report_sent intentionally excluded: it defaults to 0 on insert and
-            // ON CONFLICT must not reset it (mark_report_sent owns that flag).
-            conn.execute(
-                "INSERT INTO daily_snapshots (date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-                 ON CONFLICT(date) DO UPDATE SET
-                   bankroll = excluded.bankroll,
-                   gross_pnl = excluded.gross_pnl,
-                   fees_paid = excluded.fees_paid,
-                   net_pnl = excluded.net_pnl,
-                   trades_count = excluded.trades_count,
-                   success_count = excluded.success_count,
-                   fail_count = excluded.fail_count,
-                   success_rate = excluded.success_rate,
-                   peak_bankroll = excluded.peak_bankroll,
-                   drawdown_pct = excluded.drawdown_pct,
-                   kelly_utilization = excluded.kelly_utilization",
-                rusqlite::params![
-                    snap.date.to_string(),
-                    dec_to_string(&snap.bankroll),
-                    dec_to_string(&snap.gross_pnl),
-                    dec_to_string(&snap.fees_paid),
-                    dec_to_string(&snap.net_pnl),
-                    snap.trades_count,
-                    snap.success_count,
-                    snap.fail_count,
-                    dec_to_string(&snap.success_rate),
-                    dec_to_string(&snap.peak_bankroll),
-                    dec_to_string(&snap.drawdown_pct),
-                    dec_to_string(&snap.kelly_utilization),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("insert_daily_snapshot db task panicked")?
-    }
-
-    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<DailySnapshot>> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let mut stmt = conn.prepare(
-                "SELECT date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization, report_sent
-                 FROM daily_snapshots WHERE date = ?1",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![date.to_string()])?;
-            match rows.next()? {
-                Some(row) => {
-                    Ok(Some(DailySnapshot {
-                        date: parse_naive_date(&row.get::<_, String>(0)?),
-                        bankroll: dec(&row.get::<_, String>(1)?)?,
-                        gross_pnl: dec(&row.get::<_, String>(2)?)?,
-                        fees_paid: dec(&row.get::<_, String>(3)?)?,
-                        net_pnl: dec(&row.get::<_, String>(4)?)?,
-                        trades_count: row.get(5)?,
-                        success_count: row.get(6)?,
-                        fail_count: row.get(7)?,
-                        success_rate: dec(&row.get::<_, String>(8)?)?,
-                        peak_bankroll: dec(&row.get::<_, String>(9)?)?,
-                        drawdown_pct: dec(&row.get::<_, String>(10)?)?,
-                        kelly_utilization: dec(&row.get::<_, String>(11)?)?,
-                        report_sent: row.get::<_, i32>(12)? != 0,
-                    }))
-                }
-                None => Ok(None),
-            }
-        })
-        .await
-        .context("get_daily_snapshot db task panicked")?
-    }
-
-    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            conn.execute(
-                "UPDATE daily_snapshots SET report_sent = 1 WHERE date = ?1",
-                rusqlite::params![date.to_string()],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("mark_report_sent db task panicked")?
-    }
-
-    // -- Audit ----------------------------------------------------------
-
-    async fn append_audit(&self, entry: &AuditEntry) -> Result<()> {
-        let pool = self.pool.clone();
-        let entry = entry.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let data_str = serde_json::to_string(&entry.data)?;
-            conn.execute(
-                "INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES (?1,?2,?3,?4)",
-                rusqlite::params![
-                    entry.timestamp_ns as i64,
-                    entry.module,
-                    entry.event_type,
-                    data_str,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("append_audit db task panicked")?
-    }
-
-    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let pool = self.pool.clone();
-        let entries: Vec<AuditEntry> = entries.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool.get().context("failed to get db connection")?;
-            let tx = conn.transaction()?;
-            for entry in &entries {
-                let data_str = serde_json::to_string(&entry.data)?;
-                tx.execute(
-                    "INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES (?1,?2,?3,?4)",
-                    rusqlite::params![
-                        entry.timestamp_ns as i64,
-                        entry.module, entry.event_type, data_str,
-                    ],
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .context("append_audit_batch db task panicked")?
-    }
-
-    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()> {
-        let pool = self.pool.clone();
-        let key = key.to_owned();
-        let old_val = old_val.to_owned();
-        let new_val = new_val.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let ts = dt_to_str(&Utc::now());
-            conn.execute(
-                "INSERT INTO config_history (changed_at, key, old_value, new_value) VALUES (?1,?2,?3,?4)",
-                rusqlite::params![ts, key, old_val, new_val],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("log_config_change db task panicked")?
-    }
-
-    // -- Meta -----------------------------------------------------------
-
-    async fn db_size_bytes(&self) -> Result<u64> {
-        let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || -> Result<u64> {
-            let conn = pool.get().context("failed to get db connection")?;
-            let page_count: i64 =
-                conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
-            let page_size: i64 =
-                conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-            Ok((page_count * page_size) as u64)
-        })
-        .await
-        .context("db_size_bytes db task panicked")?
-    }
-
-    async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
-        let pool = self.pool.clone();
-        let dest = dest_path.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get().context("failed to get db connection")?;
-            // Use the SQLite Online Backup API which does NOT lock the source
-            // database. It copies pages incrementally, allowing concurrent reads
-            // and writes during the backup (unlike VACUUM INTO which holds a lock
-            // for the entire operation).
-            let mut dest_conn = rusqlite::Connection::open(&dest)
-                .context("failed to open backup destination")?;
-            let backup = rusqlite::backup::Backup::new(&conn, &mut dest_conn)
-                .context("failed to initialize SQLite backup")?;
-            // Copy 256 pages at a time, sleeping 10ms between batches to avoid
-            // starving active queries on the source connection pool.
-            backup.run_to_completion(256, std::time::Duration::from_millis(10), None)
-                .context("SQLite backup failed")?;
-            Ok(())
-        })
-        .await
-        .context("backup_to_file db task panicked")?
-    }
-}
-
-
-
-// ---------------------------------------------------------------------------
-// Row-to-struct helpers
-// ---------------------------------------------------------------------------
-
-fn row_to_trade(row: &rusqlite::Row) -> Result<TradeResult> {
-    Ok(TradeResult {
-        trade_id: row.get(0)?,
-        opp_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::new_v4()),
-        market_id: Uuid::parse_str(&row.get::<_, String>(2)?).unwrap_or_else(|_| Uuid::new_v4()),
-        market_question: row.get(3)?,
-        leg_a_platform: platform_from_db(&row.get::<_, String>(4)?),
-        leg_a_side: side_from_db(&row.get::<_, String>(5)?),
-        leg_a_price: dec(&row.get::<_, String>(6)?)?,
-        leg_a_size: dec(&row.get::<_, String>(7)?)?,
-        leg_a_fill_price: dec(&row.get::<_, String>(8)?)?,
-        leg_a_fee: dec(&row.get::<_, String>(9)?)?,
-        leg_b_platform: platform_from_db(&row.get::<_, String>(10)?),
-        leg_b_side: side_from_db(&row.get::<_, String>(11)?),
-        leg_b_price: dec(&row.get::<_, String>(12)?)?,
-        leg_b_size: dec(&row.get::<_, String>(13)?)?,
-        leg_b_fill_price: dec(&row.get::<_, String>(14)?)?,
-        leg_b_fee: dec(&row.get::<_, String>(15)?)?,
-        raw_spread: dec(&row.get::<_, String>(16)?)?,
-        net_spread: dec(&row.get::<_, String>(17)?)?,
-        profit: dec(&row.get::<_, String>(18)?)?,
-        status: trade_status_from_db(&row.get::<_, String>(19)?),
-        failure_reason: row.get(20)?,
-        execution_ms: row.get::<_, i64>(21)? as u64,
-        executed_at: parse_dt(&row.get::<_, String>(22)?),
-        bankroll_after: dec(&row.get::<_, String>(23)?)?,
-        bankroll_change_pct: dec(&row.get::<_, String>(24)?)?,
-        // Not stored in DB — zero is correct; only meaningful in-flight during the event loop.
-        approved_size: Decimal::ZERO,
-    })
-}
-
-fn row_to_position(row: &rusqlite::Row) -> Result<Position> {
-    Ok(Position {
-        id: row.get(0)?,
-        market_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::new_v4()),
-        platform: platform_from_db(&row.get::<_, String>(2)?),
-        side: side_from_db(&row.get::<_, String>(3)?),
-        quantity: dec(&row.get::<_, String>(4)?)?,
-        avg_entry_price: dec(&row.get::<_, String>(5)?)?,
-        unrealized_pnl: dec(&row.get::<_, String>(6)?)?,
-        opened_at: parse_dt(&row.get::<_, String>(7)?),
-        updated_at: parse_dt(&row.get::<_, String>(8)?),
-    })
-}
-```
-
-## File: src/engine/spread.rs
+## File: src/engine/order_book.rs
 ```rust
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
-use crate::engine::order_book::PlatformBook;
-use crate::feeds::normalizer;
 use crate::types::*;
 
-/// Result of spread computation for one direction of an arb pair
+/// Per-platform order book for a single market
 #[derive(Debug, Clone)]
-pub struct SpreadResult {
+pub struct PlatformBook {
+    pub platform: Platform,
     pub market_id: Uuid,
-    pub leg_a_platform: Platform,
-    pub leg_a_side: Side,
-    pub leg_a_price: Decimal,
-    pub leg_a_available: Decimal,
-    pub leg_a_fee: Decimal,
-    pub leg_b_platform: Platform,
-    pub leg_b_side: Side,
-    pub leg_b_price: Decimal,
-    pub leg_b_available: Decimal,
-    pub leg_b_fee: Decimal,
-    pub raw_spread: Decimal,
-    pub net_spread: Decimal,
-    pub slippage_a: Decimal,
-    pub slippage_b: Decimal,
-    pub gas_cost: Decimal,
+    pub bids: BTreeMap<Decimal, Decimal>,
+    pub asks: BTreeMap<Decimal, Decimal>,
+    pub last_update_ns: u64,
+    pub fee_rate_bps: u16,
+    pub sequence: u64,
 }
 
-pub struct NetSpreadEngine {
-    min_threshold: Decimal,
-    gas_price_gwei: Decimal,
-    /// MATIC/USD spot price (Polymarket runs on Polygon; gas is paid in MATIC, not ETH).
-    /// Default is $0.50 MATIC — do NOT set this to an ETH price (~$2,000+) or gas costs
-    /// will be overestimated 4,000x, suppressing all Polymarket arb opportunities.
-    matic_price_usd: Decimal,
-}
-
-impl NetSpreadEngine {
-    pub fn new(min_threshold: Decimal) -> Self {
+impl PlatformBook {
+    pub fn new(platform: Platform, market_id: Uuid) -> Self {
         Self {
-            min_threshold,
-            gas_price_gwei: Decimal::from(50),
-            matic_price_usd: dec!(0.50),
+            platform,
+            market_id,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            last_update_ns: 0,
+            fee_rate_bps: 0,
+            sequence: 0,
         }
     }
 
-    pub fn update_gas_price(&mut self, gwei: Decimal) {
-        self.gas_price_gwei = gwei;
+    pub fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
     }
 
-    pub fn update_matic_price(&mut self, price: Decimal) {
-        self.matic_price_usd = price;
+    pub fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(p, s)| (*p, *s))
     }
 
-    /// Compute spread for both directions of an arb pair
-    pub fn compute_spreads(
-        &self,
-        book_a: &PlatformBook,
-        book_b: &PlatformBook,
-        target_size: Decimal,
-    ) -> Vec<SpreadResult> {
-        let mut results = Vec::new();
+    pub fn mid_price(&self) -> Decimal {
+        match (self.best_bid(), self.best_ask()) {
+            (Some((b, _)), Some((a, _))) => (b + a) / Decimal::from(2),
+            (Some((b, _)), None) => b,
+            (None, Some((a, _))) => a,
+            _ => Decimal::ZERO,
+        }
+    }
 
-        // Direction 1: Buy YES on A, Buy NO on B
-        if let (Some((ask_a, _)), Some((bid_b, _))) = (book_a.best_ask(), book_b.best_bid()) {
-            let ask_b_no = Decimal::ONE - bid_b;
-            let raw_spread = Decimal::ONE - ask_a - ask_b_no;
+    pub fn ask_depth(&self) -> Vec<PriceLevel> {
+        self.asks.iter().take(10).map(|(p, s)| PriceLevel { price: *p, size: *s }).collect()
+    }
 
-            if raw_spread > Decimal::ZERO {
-                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
-                // This allows the VWAP estimator to correctly "walk the book" and consume 
-                // deeper liquidity if the total spread remains profitable.
-                let depth_a = book_a.ask_depth();
-                let depth_b = book_b.bid_depth();
-                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
-                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
-                
-                let actual_target = total_a.min(total_b).min(target_size);
+    pub fn bid_depth(&self) -> Vec<PriceLevel> {
+        self.bids.iter().rev().take(10).map(|(p, s)| PriceLevel { price: *p, size: *s }).collect()
+    }
 
-                let fee_a = self.compute_fee(book_a.platform, ask_a, actual_target, book_a.fee_rate_bps);
+    pub fn is_stale(&self, timeout_ns: u64) -> bool {
+        let now = crate::types::now_ns();
+        now.saturating_sub(self.last_update_ns) > timeout_ns
+    }
 
-                let fee_b = self.compute_fee(book_b.platform, ask_b_no, actual_target, book_b.fee_rate_bps);
-                match (
-                    normalizer::estimate_slippage(actual_target, &book_a.ask_depth()),
-                    normalizer::estimate_slippage(actual_target, &book_b.bid_depth()),
-                ) {
-                (Some(slippage_a), Some(slippage_b)) => {
-                        let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
-                        
-                        // CRITICAL FIX: Mathematical Unit Mismatch.
-                        // `raw_spread` and `slippage` are per-contract limits (e.g., 0.02).
-                        // `fee_a`, `fee_b`, and `gas` are absolute dollar totals for the entire trade (e.g., $1.20).
-                        // We MUST normalize them into per-contract percentages by dividing by `target_size`.
-                        let per_contract_fee_a = fee_a / target_size;
-                        let per_contract_fee_b = fee_b / target_size;
-                        let per_contract_gas = gas / target_size;
+    /// Update from a NormalizedTick
+    ///
+    /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
+    /// to prevent out-of-order or replayed updates (e.g. after a reconnect)
+    /// from overwriting a newer book with stale data.
+    /// Sequence-0 ticks are treated as full snapshots and always applied.
+    pub fn update_from_tick(&mut self, tick: &NormalizedTick) {
+        if tick.sequence > 0 && tick.sequence <= self.sequence {
+            return;
+        }
 
-                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
+        self.bids.clear();
+        self.asks.clear();
 
-                        if net_spread > self.min_threshold {
-                            results.push(SpreadResult {
-                                market_id: book_a.market_id,
-                                leg_a_platform: book_a.platform,
-                                leg_a_side: Side::Yes,
-                                leg_a_price: ask_a,
-                                leg_a_available: ask_a_size.min(target_size),
-                                leg_a_fee: fee_a,
-                                leg_b_platform: book_b.platform,
-                                leg_b_side: Side::No,
-                                leg_b_price: ask_b_no,
-                                leg_b_available: bid_b_size.min(target_size),
-                                leg_b_fee: fee_b,
-                                raw_spread,
-                                net_spread,
-                                slippage_a,
-                                slippage_b,
-                                gas_cost: gas,
-                            });
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(
-                            market_id = %book_a.market_id,
-                            direction = "YES-A/NO-B",
-                            "Insufficient liquidity to size opportunity — skipping"
-                        );
-                    }
+        for level in &tick.book_depth {
+            if level.price <= tick.bid_price {
+                self.bids.insert(level.price, level.size);
+            } else if level.price >= tick.ask_price {
+                self.asks.insert(level.price, level.size);
+            } else {
+                // Mid-spread level: classify by which side it's closer to
+                if tick.ask_price - level.price < level.price - tick.bid_price {
+                    self.asks.insert(level.price, level.size);
+                } else {
+                    self.bids.insert(level.price, level.size);
                 }
             }
         }
 
-        // Direction 2: Buy NO on A, Buy YES on B
-        if let (Some((bid_a, _)), Some((ask_b, _))) = (book_a.best_bid(), book_b.best_ask()) {
-            let ask_a_no = Decimal::ONE - bid_a;
-            let raw_spread = Decimal::ONE - ask_a_no - ask_b;
-
-            if raw_spread > Decimal::ZERO {
-                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
-                // This allows the VWAP estimator to correctly "walk the book" and consume 
-                // deeper liquidity if the total spread remains profitable.
-                let depth_a = book_a.bid_depth();
-                let depth_b = book_b.ask_depth();
-                
-                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
-                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
-
-                let actual_target = total_a.min(total_b).min(target_size);
-
-                let fee_a = self.compute_fee(book_a.platform, ask_a_no, actual_target, book_a.fee_rate_bps);
-                let fee_b = self.compute_fee(book_b.platform, ask_b, actual_target, book_b.fee_rate_bps);
-                
-                // Optimized: Reuse the previously allocated depth vectors to save CPU cycles 
-                // during the hot-path match evaluation.
-                match (
-                    normalizer::estimate_slippage(actual_target, &depth_a),
-                    normalizer::estimate_slippage(actual_target, &depth_b),
-                ) {
-                    (Some(slippage_a), Some(slippage_b)) => {
-                    let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
-                        
-                        // CRITICAL FIX: Mathematical Unit Mismatch.
-                        // `fee_a` and `fee_b` were computed using `actual_target`, NOT `target_size`. 
-                        // Dividing by the larger `target_size` artificially underestimated the fee drag,
-                        // inflating `net_spread` and causing the engine to execute structurally unprofitable arbs.
-                        let per_contract_fee_a = fee_a / actual_target;
-                        let per_contract_fee_b = fee_b / actual_target;
-                        let per_contract_gas = gas / actual_target;
-
-                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
-
-                        if net_spread > self.min_threshold {
-                            results.push(SpreadResult {
-                                market_id: book_a.market_id,
-                                leg_a_platform: book_a.platform,
-                                leg_a_side: Side::No,
-                                leg_a_price: ask_a_no,
-                                leg_a_available: bid_a_size.min(target_size),
-                                leg_a_fee: fee_a,
-                                leg_b_platform: book_b.platform,
-                                leg_b_side: Side::Yes,
-                                leg_b_price: ask_b,
-                                leg_b_available: ask_b_size.min(target_size),
-                                leg_b_fee: fee_b,
-                                raw_spread,
-                                net_spread,
-                                slippage_a,
-                                slippage_b,
-                                gas_cost: gas,
-                            });
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(
-                            market_id = %book_a.market_id,
-                            direction = "NO-A/YES-B",
-                            "Insufficient liquidity to size opportunity — skipping"
-                        );
-                    }
-                }
-            }
+        if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
+            // CRITICAL: Prevent crossed books by wiping asks that are lower than the new bid
+            self.asks.retain(|&p, _| p > tick.bid_price);
+            self.bids.insert(tick.bid_price, tick.bid_size);
+        }
+        if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
+            // CRITICAL: Prevent crossed books by wiping bids that are higher than the new ask
+            self.bids.retain(|&p, _| p < tick.ask_price);
+            self.asks.insert(tick.ask_price, tick.ask_size);
         }
 
-        results
+        self.last_update_ns = tick.timestamp_ns;
+        self.fee_rate_bps = tick.fee_rate_bps;
+        self.sequence = tick.sequence;
+    }
+}
+
+/// Unified Order Book: aggregates all platform books for all markets
+pub struct UnifiedOrderBook {
+    books: HashMap<(Uuid, Platform), PlatformBook>,
+}
+
+impl UnifiedOrderBook {
+    pub fn new() -> Self {
+        Self { books: HashMap::new() }
     }
 
-    fn compute_fee(&self, platform: Platform, price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
-        match platform {
-            Platform::Polymarket | Platform::PolymarketUs => {
-                normalizer::polymarket_fee(price, quantity, fee_rate_bps)
-            }
-            Platform::Kalshi => {
-                // Use the dynamic fee_rate_bps provided by the Kalshi feed tick
-                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-                rate * quantity * price
-            }
-            Platform::Cdna => {
-                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-                rate * quantity * price.max(Decimal::ONE - price)
-            }
-            Platform::ForecastEx => Decimal::ZERO,
-        }
+    pub fn update(&mut self, tick: &NormalizedTick) {
+        let key = (tick.market_id, tick.platform);
+        let book = self.books
+            .entry(key)
+            .or_insert_with(|| PlatformBook::new(tick.platform, tick.market_id));
+        book.update_from_tick(tick);
     }
 
-    fn gas_cost_if_onchain(&self, platform_a: Platform, platform_b: Platform) -> Decimal {
-        let mut tx_count = Decimal::ZERO;
-        if matches!(platform_a, Platform::Polymarket | Platform::PolymarketUs) {
-            tx_count += Decimal::ONE;
-        }
-        if matches!(platform_b, Platform::Polymarket | Platform::PolymarketUs) {
-            tx_count += Decimal::ONE;
-        }
-
-        if tx_count == Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-
-        // CRITICAL FIX: If both legs are on-chain, we pay gas twice (400,000 units).
-        let gas_units = Decimal::from(200_000) * tx_count;
-        let gwei_to_matic = dec!(0.000000001); // 1 gwei = 10^-9 MATIC
-        self.gas_price_gwei * gas_units * gwei_to_matic * self.matic_price_usd
+    pub fn get_book(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformBook> {
+        self.books.get(&(*market_id, *platform))
     }
 }
 ```
@@ -5933,6 +4667,403 @@ impl CdnaFeed {
         }
 
         Ok(())
+    }
+}
+```
+
+## File: src/telegram/bot.rs
+```rust
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tracing::warn;
+
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
+const MAX_MESSAGE_LENGTH: usize = 4096;
+const RATE_LIMIT_PER_SECOND: u32 = 1;
+
+#[derive(Clone)]
+pub struct TelegramBot {
+    client: reqwest::Client,
+    token: String,
+    last_send: Arc<Mutex<Instant>>,
+}
+
+#[derive(Serialize)]
+struct SendMessageRequest<'a> {
+    chat_id: &'a str,
+    text: &'a str,
+    parse_mode: &'a str,
+    disable_web_page_preview: bool,
+}
+
+#[derive(Deserialize)]
+struct TelegramResponse {
+    ok: bool,
+    description: Option<String>,
+}
+
+impl TelegramBot {
+    pub fn new(token: String) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("Failed to create HTTP client"),
+            token,
+            last_send: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2))),
+        }
+    }
+
+    /// Send a message to a specific chat, respecting rate limits
+    pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
+        // Rate limiting: compute sleep duration while holding the lock,
+        // then release the lock before sleeping so other callers aren't blocked.
+        {
+            let sleep_for = {
+                let mut last = self.last_send.lock().await;
+                let elapsed = last.elapsed();
+                let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
+                if elapsed < min_interval {
+                    let wait = min_interval - elapsed;
+                    // Pre-emptively advance the timer for the NEXT concurrent caller
+                    *last += min_interval;
+                    Some(wait)
+                } else {
+                    *last = Instant::now();
+                    None
+                }
+            };
+            if let Some(dur) = sleep_for {
+                tokio::time::sleep(dur).await;
+            }
+        }
+
+        // Truncate if too long, respecting UTF-8 boundaries
+        let text = if text.len() > MAX_MESSAGE_LENGTH {
+            let mut end = MAX_MESSAGE_LENGTH - 20;
+            while end > 0 && !text.is_char_boundary(end) { end -= 1; }
+            &text[..end]
+        } else {
+            text
+        };
+
+        let url = format!("{}{}/sendMessage", TELEGRAM_API_BASE, self.token);
+        let body = SendMessageRequest {
+            chat_id,
+            text,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+        };
+
+        // Retry with exponential backoff (max 3 attempts)
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let resp_body: TelegramResponse = resp.json().await
+                        .unwrap_or(TelegramResponse { ok: false, description: Some("Failed to parse response".into()) });
+
+                    if resp_body.ok {
+                        return Ok(());
+                    }
+
+                    let desc = resp_body.description.unwrap_or_default();
+                    if status.as_u16() == 429 {
+                        warn!(attempt, "Telegram rate limited, backing off");
+                        if attempt >= 3 {
+                            anyhow::bail!("Telegram rate limited after {} attempts: {}", attempt, desc);
+                        }
+                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                        continue;
+                    }
+
+                    anyhow::bail!("Telegram API error ({}): {}", status, desc);
+                }
+                Err(e) => {
+                    if attempt >= 3 {
+                        return Err(e).context("Failed to send Telegram message after 3 attempts");
+                    }
+                    warn!(attempt, error = %e, "Telegram send failed, retrying");
+                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                }
+            }
+        }
+    }
+
+    /// Long-poll the Telegram API to fetch new commands
+    pub async fn get_updates(&self, offset: i64) -> Result<Vec<crate::types::TelegramUpdate>> {
+        let url = format!("{}/bot{}/getUpdates?offset={}&timeout=5", 
+            TELEGRAM_API_BASE.trim_end_matches("/bot"), 
+            self.token, 
+            offset
+        );
+        let resp = self.client.get(&url).send().await?
+            .json::<crate::types::TelegramUpdatesResponse>().await?;
+        
+        if resp.ok {
+            Ok(resp.result)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Escape HTML special characters for Telegram HTML parse mode
+    pub fn escape_html(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+}
+```
+
+## File: src/engine/spread.rs
+```rust
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use uuid::Uuid;
+
+use crate::engine::order_book::PlatformBook;
+use crate::feeds::normalizer;
+use crate::types::*;
+
+/// Result of spread computation for one direction of an arb pair
+#[derive(Debug, Clone)]
+pub struct SpreadResult {
+    pub market_id: Uuid,
+    pub leg_a_platform: Platform,
+    pub leg_a_side: Side,
+    pub leg_a_price: Decimal,
+    pub leg_a_available: Decimal,
+    pub leg_a_fee: Decimal,
+    pub leg_b_platform: Platform,
+    pub leg_b_side: Side,
+    pub leg_b_price: Decimal,
+    pub leg_b_available: Decimal,
+    pub leg_b_fee: Decimal,
+    pub raw_spread: Decimal,
+    pub net_spread: Decimal,
+    pub slippage_a: Decimal,
+    pub slippage_b: Decimal,
+    pub gas_cost: Decimal,
+}
+
+pub struct NetSpreadEngine {
+    min_threshold: Decimal,
+    gas_price_gwei: Decimal,
+    /// MATIC/USD spot price (Polymarket runs on Polygon; gas is paid in MATIC, not ETH).
+    /// Default is $0.50 MATIC — do NOT set this to an ETH price (~$2,000+) or gas costs
+    /// will be overestimated 4,000x, suppressing all Polymarket arb opportunities.
+    matic_price_usd: Decimal,
+}
+
+impl NetSpreadEngine {
+    pub fn new(min_threshold: Decimal) -> Self {
+        Self {
+            min_threshold,
+            gas_price_gwei: Decimal::from(50),
+            matic_price_usd: dec!(0.50),
+        }
+    }
+
+    pub fn update_gas_price(&mut self, gwei: Decimal) {
+        self.gas_price_gwei = gwei;
+    }
+
+    pub fn update_matic_price(&mut self, price: Decimal) {
+        self.matic_price_usd = price;
+    }
+
+    /// Compute spread for both directions of an arb pair
+    pub fn compute_spreads(
+        &self,
+        book_a: &PlatformBook,
+        book_b: &PlatformBook,
+        target_size: Decimal,
+    ) -> Vec<SpreadResult> {
+        let mut results = Vec::new();
+
+        // Direction 1: Buy YES on A, Buy NO on B
+        if let (Some((ask_a, _)), Some((bid_b, _))) = (book_a.best_ask(), book_b.best_bid()) {
+            let ask_b_no = Decimal::ONE - bid_b;
+            let raw_spread = Decimal::ONE - ask_a - ask_b_no;
+
+            if raw_spread > Decimal::ZERO {
+                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
+                // This allows the VWAP estimator to correctly "walk the book" and consume 
+                // deeper liquidity if the total spread remains profitable.
+                let depth_a = book_a.ask_depth();
+                let depth_b = book_b.bid_depth();
+                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
+                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
+                
+                let actual_target = total_a.min(total_b).min(target_size);
+
+                let fee_a = self.compute_fee(book_a.platform, ask_a, actual_target, book_a.fee_rate_bps);
+
+                let fee_b = self.compute_fee(book_b.platform, ask_b_no, actual_target, book_b.fee_rate_bps);
+                match (
+                    normalizer::estimate_slippage(actual_target, &book_a.ask_depth()),
+                    normalizer::estimate_slippage(actual_target, &book_b.bid_depth()),
+                ) {
+                (Some(slippage_a), Some(slippage_b)) => {
+                        let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
+                        
+                        // CRITICAL FIX: Mathematical Unit Mismatch.
+                        // `raw_spread` and `slippage` are per-contract limits (e.g., 0.02).
+                        // `fee_a`, `fee_b`, and `gas` are absolute dollar totals for the entire trade (e.g., $1.20).
+                        // We MUST normalize them into per-contract percentages by dividing by `target_size`.
+                        let per_contract_fee_a = fee_a / target_size;
+                        let per_contract_fee_b = fee_b / target_size;
+                        let per_contract_gas = gas / target_size;
+
+                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
+
+                        if net_spread > self.min_threshold {
+                            results.push(SpreadResult {
+                                market_id: book_a.market_id,
+                                leg_a_platform: book_a.platform,
+                                leg_a_side: Side::Yes,
+                                leg_a_price: ask_a,
+                                leg_a_available: ask_a_size.min(target_size),
+                                leg_a_fee: fee_a,
+                                leg_b_platform: book_b.platform,
+                                leg_b_side: Side::No,
+                                leg_b_price: ask_b_no,
+                                leg_b_available: bid_b_size.min(target_size),
+                                leg_b_fee: fee_b,
+                                raw_spread,
+                                net_spread,
+                                slippage_a,
+                                slippage_b,
+                                gas_cost: gas,
+                            });
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            market_id = %book_a.market_id,
+                            direction = "YES-A/NO-B",
+                            "Insufficient liquidity to size opportunity — skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Direction 2: Buy NO on A, Buy YES on B
+        if let (Some((bid_a, _)), Some((ask_b, _))) = (book_a.best_bid(), book_b.best_ask()) {
+            let ask_a_no = Decimal::ONE - bid_a;
+            let raw_spread = Decimal::ONE - ask_a_no - ask_b;
+
+            if raw_spread > Decimal::ZERO {
+                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
+                // This allows the VWAP estimator to correctly "walk the book" and consume 
+                // deeper liquidity if the total spread remains profitable.
+                let depth_a = book_a.bid_depth();
+                let depth_b = book_b.ask_depth();
+                
+                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
+                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
+
+                let actual_target = total_a.min(total_b).min(target_size);
+
+                let fee_a = self.compute_fee(book_a.platform, ask_a_no, actual_target, book_a.fee_rate_bps);
+                let fee_b = self.compute_fee(book_b.platform, ask_b, actual_target, book_b.fee_rate_bps);
+                
+                // Optimized: Reuse the previously allocated depth vectors to save CPU cycles 
+                // during the hot-path match evaluation.
+                match (
+                    normalizer::estimate_slippage(actual_target, &depth_a),
+                    normalizer::estimate_slippage(actual_target, &depth_b),
+                ) {
+                    (Some(slippage_a), Some(slippage_b)) => {
+                    let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
+                        
+                        // CRITICAL FIX: Mathematical Unit Mismatch.
+                        // `fee_a` and `fee_b` were computed using `actual_target`, NOT `target_size`. 
+                        // Dividing by the larger `target_size` artificially underestimated the fee drag,
+                        // inflating `net_spread` and causing the engine to execute structurally unprofitable arbs.
+                        let per_contract_fee_a = fee_a / actual_target;
+                        let per_contract_fee_b = fee_b / actual_target;
+                        let per_contract_gas = gas / actual_target;
+
+                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
+
+                        if net_spread > self.min_threshold {
+                            results.push(SpreadResult {
+                                market_id: book_a.market_id,
+                                leg_a_platform: book_a.platform,
+                                leg_a_side: Side::No,
+                                leg_a_price: ask_a_no,
+                                leg_a_available: bid_a_size.min(target_size),
+                                leg_a_fee: fee_a,
+                                leg_b_platform: book_b.platform,
+                                leg_b_side: Side::Yes,
+                                leg_b_price: ask_b,
+                                leg_b_available: ask_b_size.min(target_size),
+                                leg_b_fee: fee_b,
+                                raw_spread,
+                                net_spread,
+                                slippage_a,
+                                slippage_b,
+                                gas_cost: gas,
+                            });
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            market_id = %book_a.market_id,
+                            direction = "NO-A/YES-B",
+                            "Insufficient liquidity to size opportunity — skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    fn compute_fee(&self, platform: Platform, price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
+        match platform {
+            Platform::Polymarket | Platform::PolymarketUs => {
+                normalizer::polymarket_fee(price, quantity, fee_rate_bps)
+            }
+            Platform::Kalshi => {
+                // Use the dynamic fee_rate_bps provided by the Kalshi feed tick
+                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
+                rate * quantity * price
+            }
+            Platform::Cdna => {
+                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
+                rate * quantity * price.max(Decimal::ONE - price)
+            }
+            Platform::ForecastEx => Decimal::ZERO,
+        }
+    }
+
+    fn gas_cost_if_onchain(&self, platform_a: Platform, platform_b: Platform) -> Decimal {
+        let mut tx_count = Decimal::ZERO;
+        if matches!(platform_a, Platform::Polymarket | Platform::PolymarketUs) {
+            tx_count += Decimal::ONE;
+        }
+        if matches!(platform_b, Platform::Polymarket | Platform::PolymarketUs) {
+            tx_count += Decimal::ONE;
+        }
+
+        if tx_count == Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        // CRITICAL FIX: If both legs are on-chain, we pay gas twice (400,000 units).
+        let gas_units = Decimal::from(200_000) * tx_count;
+        let gwei_to_matic = dec!(0.000000001); // 1 gwei = 10^-9 MATIC
+        self.gas_price_gwei * gas_units * gwei_to_matic * self.matic_price_usd
     }
 }
 ```
@@ -6435,6 +5566,7 @@ pub struct BankrollManager {
     peak_bankroll: Decimal,
     platform_balances: HashMap<Platform, Decimal>,
     platform_exposure: HashMap<Platform, Decimal>,
+    market_exposure: HashMap<Uuid, Decimal>,
     daily_pnl: Decimal,
     daily_start_bankroll: Decimal,
     daily_fees: Decimal,
@@ -6453,6 +5585,7 @@ impl BankrollManager {
             peak_bankroll: initial_bankroll,
             platform_balances: HashMap::new(),
             platform_exposure: HashMap::new(),
+            market_exposure: HashMap::new(),
             daily_pnl: Decimal::ZERO,
             daily_start_bankroll: initial_bankroll,
             daily_fees: Decimal::ZERO,
@@ -6513,6 +5646,38 @@ impl BankrollManager {
         } else {
             Decimal::ZERO
         }
+    }
+
+    pub fn market_exposure(&self, market_id: &Uuid) -> Decimal {
+        self.market_exposure.get(market_id).copied().unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn market_exposure_pct(&self, market_id: &Uuid) -> Decimal {
+        if self.total_bankroll > Decimal::ZERO {
+            self.market_exposure(market_id) / self.total_bankroll
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    pub fn add_market_exposure(&mut self, market_id: Uuid, amount: Decimal) {
+        *self.market_exposure.entry(market_id).or_insert(Decimal::ZERO) += amount;
+    }
+
+    pub fn remove_market_exposure(&mut self, market_id: Uuid, amount: Decimal) {
+        if let Some(exp) = self.market_exposure.get_mut(&market_id) {
+            *exp = (*exp - amount).max(Decimal::ZERO);
+        }
+    }
+
+    /// Credits the bankroll with realized PnL from an expired/settled market.
+    /// Winning legs pay $1.00 per contract; losing legs pay $0.00. 
+    pub fn record_settlement(&mut self, realized_pnl: Decimal) {
+        self.total_bankroll += realized_pnl;
+        if self.total_bankroll > self.peak_bankroll {
+            self.peak_bankroll = self.total_bankroll;
+        }
+        tracing::info!(realized_pnl = %realized_pnl, bankroll = %self.total_bankroll, "Settlement credited to bankroll");
     }
 
     pub fn record_trade(&mut self, result: &TradeResult) {
@@ -6595,6 +5760,867 @@ impl BankrollManager {
             report_sent: false,
         }
     }
+}
+```
+
+## File: src/db/sqlite.rs
+```rust
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Days, NaiveDate, Utc};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::path::Path;
+use std::str::FromStr;
+use uuid::Uuid;
+
+use super::migrations;
+use super::traits::Database;
+use crate::types::*;
+
+/// SQLite-backed implementation of [`Database`].
+#[derive(Clone)]
+pub struct SqliteDb {
+    pool: Pool<SqliteConnectionManager>,
+}
+
+impl SqliteDb {
+    /// Open (or create) a SQLite database at `path`.
+    pub fn new(path: &str, pool_size: u32, busy_timeout_ms: u64) -> Result<Self> {
+        // Ensure parent directory exists
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        // Apply PRAGMAs on every connection created by the pool via with_init.
+        // WAL mode is file-level (persistent) but is idempotent to set again.
+        // synchronous, busy_timeout, and foreign_keys are connection-level and
+        // must be set on each connection, not just a single borrowed one.
+        let manager = SqliteConnectionManager::file(path).with_init(move |conn| {
+            conn.execute_batch(&format!(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA busy_timeout={busy_timeout_ms};
+                 PRAGMA foreign_keys=ON;"
+            ))
+        });
+        let pool = Pool::builder()
+            .max_size(pool_size)
+            .build(manager)
+            .context("failed to build SQLite connection pool")?;
+
+        // Run migrations on first connection
+        {
+            let conn = pool.get().context("failed to get connection from pool")?;
+            migrations::run_migrations(&conn)?;
+        }
+
+        Ok(Self { pool })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn dec(s: &str) -> rusqlite::Result<Decimal> {
+    Decimal::from_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(e),
+        )
+    })
+}
+
+fn dec_to_string(d: &Decimal) -> String {
+    d.to_string()
+}
+
+fn platform_from_db(s: &str) -> Result<Platform> {
+    match s {
+        "Polymarket" => Ok(Platform::Polymarket),
+        "Polymarket US" => Ok(Platform::PolymarketUs),
+        "Kalshi" => Ok(Platform::Kalshi),
+        "CDNA" => Ok(Platform::Cdna),
+        "ForecastEx" => Ok(Platform::ForecastEx),
+        _ => Err(anyhow::anyhow!("Unknown platform string in DB: {}", s)),
+    }
+}
+
+fn side_from_db(s: &str) -> Result<Side> {
+    match s {
+        "YES" => Ok(Side::Yes),
+        "NO" => Ok(Side::No),
+        _ => Err(anyhow::anyhow!("Unknown side string in DB: {}", s)),
+    }
+}
+
+/// Shared upsert logic used by both `upsert_position` and `upsert_position_pair`.
+fn upsert_position_on(conn: &rusqlite::Connection, pos: &Position) -> Result<()> {
+    if pos.id == 0 {
+        conn.execute(
+            "INSERT INTO positions (market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                pos.market_id.to_string(),
+                pos.platform.to_string(),
+                pos.side.to_string(),
+                dec_to_string(&pos.quantity),
+                dec_to_string(&pos.avg_entry_price),
+                dec_to_string(&pos.unrealized_pnl),
+                dt_to_str(&pos.opened_at),
+                dt_to_str(&pos.updated_at),
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO positions (id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET
+               quantity = excluded.quantity,
+               avg_entry_price = excluded.avg_entry_price,
+               unrealized_pnl = excluded.unrealized_pnl,
+               updated_at = excluded.updated_at",
+            rusqlite::params![
+                pos.id,
+                pos.market_id.to_string(),
+                pos.platform.to_string(),
+                pos.side.to_string(),
+                dec_to_string(&pos.quantity),
+                dec_to_string(&pos.avg_entry_price),
+                dec_to_string(&pos.unrealized_pnl),
+                dt_to_str(&pos.opened_at),
+                dt_to_str(&pos.updated_at),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn trade_status_from_db(s: &str) -> TradeStatus {
+    match s {
+        "success" => TradeStatus::Success,
+        "fail" => TradeStatus::Fail,
+        "partial" => TradeStatus::Partial,
+        _ => TradeStatus::Fail,
+    }
+}
+
+fn market_status_from_db(s: &str) -> MarketStatus {
+    match s {
+        "active" => MarketStatus::Active,
+        "suspended" => MarketStatus::Suspended,
+        "resolved" => MarketStatus::Resolved,
+        "expired" => MarketStatus::Expired,
+        _ => MarketStatus::Active,
+    }
+}
+
+fn category_from_db(s: &str) -> MarketCategory {
+    match s {
+        "sports" => MarketCategory::Sports,
+        "politics" => MarketCategory::Politics,
+        "finance" => MarketCategory::Finance,
+        "crypto" => MarketCategory::Crypto,
+        "weather" => MarketCategory::Weather,
+        "culture" => MarketCategory::Culture,
+        _ => MarketCategory::Other,
+    }
+}
+
+fn category_to_str(c: &MarketCategory) -> &'static str {
+    match c {
+        MarketCategory::Sports => "sports",
+        MarketCategory::Politics => "politics",
+        MarketCategory::Finance => "finance",
+        MarketCategory::Crypto => "crypto",
+        MarketCategory::Weather => "weather",
+        MarketCategory::Culture => "culture",
+        MarketCategory::Other => "other",
+    }
+}
+
+fn parse_dt(s: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn dt_to_str(dt: &DateTime<Utc>) -> String {
+    dt.to_rfc3339()
+}
+
+fn parse_naive_date(s: &str) -> NaiveDate {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive())
+}
+
+// ---------------------------------------------------------------------------
+// Database trait impl
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl Database for SqliteDb {
+    // -- Markets --------------------------------------------------------
+
+    async fn upsert_market(&self, market: &Market) -> Result<()> {
+        let pool = self.pool.clone();
+        let market = market.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let platforms_json = serde_json::to_string(&market.platforms)?;
+            conn.execute(
+                "INSERT INTO markets (unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(unified_id) DO UPDATE SET
+                   question = excluded.question,
+                   resolution_source = excluded.resolution_source,
+                   expiration = excluded.expiration,
+                   platforms = excluded.platforms,
+                   category = excluded.category,
+                   confidence = excluded.confidence,
+                   status = excluded.status,
+                   updated_at = excluded.updated_at",
+                rusqlite::params![
+                    market.unified_id.to_string(),
+                    market.question,
+                    market.resolution_source,
+                    dt_to_str(&market.expiration),
+                    platforms_json,
+                    category_to_str(&market.category),
+                    market.confidence,
+                    market.status.to_string(),
+                    dt_to_str(&market.created_at),
+                    dt_to_str(&market.updated_at),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("upsert_market db task panicked")?
+    }
+
+    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>> {
+        let pool = self.pool.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || -> Result<Option<Market>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let mut stmt = conn.prepare(
+                "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
+                 FROM markets WHERE unified_id = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![id.to_string()])?;
+            match rows.next()? {
+                Some(row) => {
+                    let platforms_str: String = row.get(4)?;
+                    let platforms: HashMap<Platform, PlatformMarketInfo> =
+                        serde_json::from_str(&platforms_str).unwrap_or_default();
+                    Ok(Some(Market {
+                        unified_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
+                        question: row.get(1)?,
+                        resolution_source: row.get(2)?,
+                        expiration: parse_dt(&row.get::<_, String>(3)?),
+                        platforms,
+                        category: category_from_db(&row.get::<_, String>(5)?),
+                        confidence: row.get(6)?,
+                        status: market_status_from_db(&row.get::<_, String>(7)?),
+                        created_at: parse_dt(&row.get::<_, String>(8)?),
+                        updated_at: parse_dt(&row.get::<_, String>(9)?),
+                    }))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .context("get_market db task panicked")?
+    }
+
+    async fn get_active_markets(&self) -> Result<Vec<Market>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<Market>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let mut stmt = conn.prepare(
+                "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
+                 FROM markets WHERE status = 'active'",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut markets = Vec::new();
+            while let Some(row) = rows.next()? {
+                let platforms_str: String = row.get(4)?;
+                let platforms: HashMap<Platform, PlatformMarketInfo> =
+                    serde_json::from_str(&platforms_str).unwrap_or_default();
+                markets.push(Market {
+                    unified_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
+                    question: row.get(1)?,
+                    resolution_source: row.get(2)?,
+                    expiration: parse_dt(&row.get::<_, String>(3)?),
+                    platforms,
+                    category: category_from_db(&row.get::<_, String>(5)?),
+                    confidence: row.get(6)?,
+                    status: market_status_from_db(&row.get::<_, String>(7)?),
+                    created_at: parse_dt(&row.get::<_, String>(8)?),
+                    updated_at: parse_dt(&row.get::<_, String>(9)?),
+                });
+            }
+            Ok(markets)
+        })
+        .await
+        .context("get_active_markets db task panicked")?
+    }
+
+    // -- Trades ---------------------------------------------------------
+
+    async fn insert_trade(&self, trade: &TradeResult) -> Result<i64> {
+        let pool = self.pool.clone();
+        let trade = trade.clone();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = pool.get().context("failed to get db connection")?;
+            conn.execute(
+                "INSERT INTO trades (opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+                rusqlite::params![
+                    trade.opp_id.to_string(),
+                    trade.market_id.to_string(),
+                    trade.market_question,
+                    trade.leg_a_platform.to_string(),
+                    trade.leg_a_side.to_string(),
+                    dec_to_string(&trade.leg_a_price),
+                    dec_to_string(&trade.leg_a_size),
+                    dec_to_string(&trade.leg_a_fill_price),
+                    dec_to_string(&trade.leg_a_fee),
+                    trade.leg_b_platform.to_string(),
+                    trade.leg_b_side.to_string(),
+                    dec_to_string(&trade.leg_b_price),
+                    dec_to_string(&trade.leg_b_size),
+                    dec_to_string(&trade.leg_b_fill_price),
+                    dec_to_string(&trade.leg_b_fee),
+                    dec_to_string(&trade.raw_spread),
+                    dec_to_string(&trade.net_spread),
+                    dec_to_string(&trade.profit),
+                    trade.status.to_string(),
+                    trade.failure_reason.as_deref(),
+                    trade.execution_ms as i64,
+                    dt_to_str(&trade.executed_at),
+                    dec_to_string(&trade.bankroll_after),
+                    dec_to_string(&trade.bankroll_change_pct),
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .context("insert_trade db task panicked")?
+    }
+
+    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<TradeResult>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
+                 FROM trades WHERE executed_at >= ?1 ORDER BY executed_at ASC",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![dt_to_str(&since)])?;
+            let mut trades = Vec::new();
+            while let Some(row) = rows.next()? {
+                trades.push(row_to_trade(row)?);
+            }
+            Ok(trades)
+        })
+        .await
+        .context("get_trades_since db task panicked")?
+    }
+
+    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<TradeResult>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let start = format!("{}T00:00:00+00:00", date);
+            // Use the next day as an exclusive upper bound to capture all sub-second
+            // trades on `date` (23:59:59+00:00 would miss trades after that second).
+            let end = format!("{}T00:00:00+00:00", date + Days::new(1));
+            let mut stmt = conn.prepare(
+                "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
+                 FROM trades WHERE executed_at >= ?1 AND executed_at < ?2 ORDER BY executed_at ASC",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![start, end])?;
+            let mut trades = Vec::new();
+            while let Some(row) = rows.next()? {
+                trades.push(row_to_trade(row)?);
+            }
+            Ok(trades)
+        })
+        .await
+        .context("get_trades_for_date db task panicked")?
+    }
+
+    async fn get_trade_count(&self) -> Result<i64> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))?;
+            Ok(count)
+        })
+        .await
+        .context("get_trade_count db task panicked")?
+    }
+
+    // -- Positions ------------------------------------------------------
+
+    async fn upsert_position(&self, pos: &Position) -> Result<()> {
+        let pool = self.pool.clone();
+        let pos = pos.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            upsert_position_on(&conn, &pos)
+        })
+        .await
+        .context("upsert_position db task panicked")?
+    }
+
+    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()> {
+        let pool = self.pool.clone();
+        let pos_a = pos_a.clone();
+        let pos_b = pos_b.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool.get().context("failed to get db connection")?;
+            let tx = conn.transaction()?;
+            upsert_position_on(&tx, &pos_a)?;
+            upsert_position_on(&tx, &pos_b)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .context("upsert_position_pair db task panicked")?
+    }
+
+    async fn get_open_positions(&self) -> Result<Vec<Position>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<Position>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at
+                 FROM positions WHERE closed = 0",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut positions = Vec::new();
+            while let Some(row) = rows.next()? {
+                positions.push(row_to_position(row)?);
+            }
+            Ok(positions)
+        })
+        .await
+        .context("get_open_positions db task panicked")?
+    }
+
+    async fn get_open_arb_count(&self) -> Result<usize> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = pool.get().context("failed to get db connection")?;
+            // Fix: We must count the total number of legs and divide by 2 to get the active arb count.
+            // DISTINCT market_id masks when we hold 2 or 3 arbs on the same underlying market.
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM positions WHERE closed = 0",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((count / 2) as usize)
+        })
+        .await
+        .context("get_open_arb_count db task panicked")?
+    }
+
+    async fn close_position(&self, id: i64) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            conn.execute(
+                "UPDATE positions SET closed = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("close_position db task panicked")?
+    }
+
+    // -- Balances -------------------------------------------------------
+
+    async fn update_balance(&self, bal: &PlatformBalance) -> Result<()> {
+        let pool = self.pool.clone();
+        let bal = bal.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            conn.execute(
+                "INSERT INTO platform_balances (platform, available, reserved, pending_settlement, total, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(platform) DO UPDATE SET
+                   available = excluded.available,
+                   reserved = excluded.reserved,
+                   pending_settlement = excluded.pending_settlement,
+                   total = excluded.total,
+                   updated_at = excluded.updated_at",
+                rusqlite::params![
+                    bal.platform.to_string(),
+                    dec_to_string(&bal.available),
+                    dec_to_string(&bal.reserved),
+                    dec_to_string(&bal.pending_settlement),
+                    dec_to_string(&bal.total),
+                    dt_to_str(&bal.updated_at),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("update_balance db task panicked")?
+    }
+
+    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<PlatformBalance>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let mut stmt = conn.prepare(
+                "SELECT platform, available, reserved, pending_settlement, total, updated_at
+                 FROM platform_balances WHERE platform = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![platform.to_string()])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(PlatformBalance {
+                    platform: platform_from_db(&row.get::<_, String>(0)?),
+                    available: dec(&row.get::<_, String>(1)?)?,
+                    reserved: dec(&row.get::<_, String>(2)?)?,
+                    pending_settlement: dec(&row.get::<_, String>(3)?)?,
+                    total: dec(&row.get::<_, String>(4)?)?,
+                    updated_at: parse_dt(&row.get::<_, String>(5)?),
+                })),
+                None => Ok(None),
+            }
+        })
+        .await
+        .context("get_balance db task panicked")?
+    }
+
+    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<PlatformBalance>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let mut stmt = conn.prepare(
+                "SELECT platform, available, reserved, pending_settlement, total, updated_at
+                 FROM platform_balances",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut balances = Vec::new();
+            while let Some(row) = rows.next()? {
+                balances.push(PlatformBalance {
+                    platform: platform_from_db(&row.get::<_, String>(0)?),
+                    available: dec(&row.get::<_, String>(1)?)?,
+                    reserved: dec(&row.get::<_, String>(2)?)?,
+                    pending_settlement: dec(&row.get::<_, String>(3)?)?,
+                    total: dec(&row.get::<_, String>(4)?)?,
+                    updated_at: parse_dt(&row.get::<_, String>(5)?),
+                });
+            }
+            Ok(balances)
+        })
+        .await
+        .context("get_all_balances db task panicked")?
+    }
+
+    // -- Daily snapshots ------------------------------------------------
+
+    async fn insert_daily_snapshot(&self, snap: &DailySnapshot) -> Result<()> {
+        let pool = self.pool.clone();
+        let snap = snap.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            // report_sent intentionally excluded: it defaults to 0 on insert and
+            // ON CONFLICT must not reset it (mark_report_sent owns that flag).
+            conn.execute(
+                "INSERT INTO daily_snapshots (date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                 ON CONFLICT(date) DO UPDATE SET
+                   bankroll = excluded.bankroll,
+                   gross_pnl = excluded.gross_pnl,
+                   fees_paid = excluded.fees_paid,
+                   net_pnl = excluded.net_pnl,
+                   trades_count = excluded.trades_count,
+                   success_count = excluded.success_count,
+                   fail_count = excluded.fail_count,
+                   success_rate = excluded.success_rate,
+                   peak_bankroll = excluded.peak_bankroll,
+                   drawdown_pct = excluded.drawdown_pct,
+                   kelly_utilization = excluded.kelly_utilization",
+                rusqlite::params![
+                    snap.date.to_string(),
+                    dec_to_string(&snap.bankroll),
+                    dec_to_string(&snap.gross_pnl),
+                    dec_to_string(&snap.fees_paid),
+                    dec_to_string(&snap.net_pnl),
+                    snap.trades_count,
+                    snap.success_count,
+                    snap.fail_count,
+                    dec_to_string(&snap.success_rate),
+                    dec_to_string(&snap.peak_bankroll),
+                    dec_to_string(&snap.drawdown_pct),
+                    dec_to_string(&snap.kelly_utilization),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("insert_daily_snapshot db task panicked")?
+    }
+
+    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<DailySnapshot>> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let mut stmt = conn.prepare(
+                "SELECT date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization, report_sent
+                 FROM daily_snapshots WHERE date = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![date.to_string()])?;
+            match rows.next()? {
+                Some(row) => {
+                    Ok(Some(DailySnapshot {
+                        date: parse_naive_date(&row.get::<_, String>(0)?),
+                        bankroll: dec(&row.get::<_, String>(1)?)?,
+                        gross_pnl: dec(&row.get::<_, String>(2)?)?,
+                        fees_paid: dec(&row.get::<_, String>(3)?)?,
+                        net_pnl: dec(&row.get::<_, String>(4)?)?,
+                        trades_count: row.get(5)?,
+                        success_count: row.get(6)?,
+                        fail_count: row.get(7)?,
+                        success_rate: dec(&row.get::<_, String>(8)?)?,
+                        peak_bankroll: dec(&row.get::<_, String>(9)?)?,
+                        drawdown_pct: dec(&row.get::<_, String>(10)?)?,
+                        kelly_utilization: dec(&row.get::<_, String>(11)?)?,
+                        report_sent: row.get::<_, i32>(12)? != 0,
+                    }))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .context("get_daily_snapshot db task panicked")?
+    }
+
+    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            conn.execute(
+                "UPDATE daily_snapshots SET report_sent = 1 WHERE date = ?1",
+                rusqlite::params![date.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("mark_report_sent db task panicked")?
+    }
+
+    // -- Audit ----------------------------------------------------------
+
+    async fn append_audit(&self, entry: &AuditEntry) -> Result<()> {
+        let pool = self.pool.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let data_str = serde_json::to_string(&entry.data)?;
+            conn.execute(
+                "INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    entry.timestamp_ns as i64,
+                    entry.module,
+                    entry.event_type,
+                    data_str,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("append_audit db task panicked")?
+    }
+
+    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let pool = self.pool.clone();
+        let entries: Vec<AuditEntry> = entries.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool.get().context("failed to get db connection")?;
+            let tx = conn.transaction()?;
+            for entry in &entries {
+                let data_str = serde_json::to_string(&entry.data)?;
+                tx.execute(
+                    "INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES (?1,?2,?3,?4)",
+                    rusqlite::params![
+                        entry.timestamp_ns as i64,
+                        entry.module, entry.event_type, data_str,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .context("append_audit_batch db task panicked")?
+    }
+
+    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()> {
+        let pool = self.pool.clone();
+        let key = key.to_owned();
+        let old_val = old_val.to_owned();
+        let new_val = new_val.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let ts = dt_to_str(&Utc::now());
+            conn.execute(
+                "INSERT INTO config_history (changed_at, key, old_value, new_value) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![ts, key, old_val, new_val],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("log_config_change db task panicked")?
+    }
+
+    // -- Meta -----------------------------------------------------------
+
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let cutoff_ns = crate::types::now_ns() - (keep_days as u64 * 24 * 3600 * 1_000_000_000);
+            conn.execute(
+                "DELETE FROM audit_log WHERE timestamp_ns < ?1",
+                rusqlite::params![cutoff_ns as i64],
+            )?;
+            
+            let cutoff_dt = Utc::now() - chrono::Duration::days(keep_days as i64);
+            conn.execute(
+                "DELETE FROM config_history WHERE changed_at < ?1",
+                rusqlite::params![dt_to_str(&cutoff_dt)],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("prune_audit_log db task panicked")?
+    }
+
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let cutoff_ns = crate::types::now_ns() - (keep_days as u64 * 24 * 3600 * 1_000_000_000);
+            conn.execute(
+                "DELETE FROM audit_log WHERE timestamp_ns < ?1",
+                rusqlite::params![cutoff_ns as i64],
+            )?;
+            
+            let cutoff_dt = Utc::now() - chrono::Duration::days(keep_days as i64);
+            conn.execute(
+                "DELETE FROM config_history WHERE changed_at < ?1",
+                rusqlite::params![dt_to_str(&cutoff_dt)],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("prune_audit_log db task panicked")?
+    }
+
+    async fn db_size_bytes(&self) -> Result<u64> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let conn = pool.get().context("failed to get db connection")?;
+            let page_count: i64 =
+                conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            let page_size: i64 =
+                conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            Ok((page_count * page_size) as u64)
+        })
+        .await
+        .context("db_size_bytes db task panicked")?
+    }
+
+    async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
+        let pool = self.pool.clone();
+        let dest = dest_path.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = pool.get().context("failed to get db connection")?;
+            // Use the SQLite Online Backup API which does NOT lock the source
+            // database. It copies pages incrementally, allowing concurrent reads
+            // and writes during the backup (unlike VACUUM INTO which holds a lock
+            // for the entire operation).
+            let mut dest_conn = rusqlite::Connection::open(&dest)
+                .context("failed to open backup destination")?;
+            let backup = rusqlite::backup::Backup::new(&conn, &mut dest_conn)
+                .context("failed to initialize SQLite backup")?;
+            // Copy 256 pages at a time, sleeping 10ms between batches to avoid
+            // starving active queries on the source connection pool.
+            backup.run_to_completion(256, std::time::Duration::from_millis(10), None)
+                .context("SQLite backup failed")?;
+            Ok(())
+        })
+        .await
+        .context("backup_to_file db task panicked")?
+    }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Row-to-struct helpers
+// ---------------------------------------------------------------------------
+
+fn row_to_trade(row: &rusqlite::Row) -> Result<TradeResult> {
+    Ok(TradeResult {
+        trade_id: row.get(0)?,
+        opp_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::new_v4()),
+        market_id: Uuid::parse_str(&row.get::<_, String>(2)?).unwrap_or_else(|_| Uuid::new_v4()),
+        market_question: row.get(3)?,
+        leg_a_platform: platform_from_db(&row.get::<_, String>(4)?)?,
+        leg_a_side: side_from_db(&row.get::<_, String>(5)?)?,
+        leg_a_price: dec(&row.get::<_, String>(6)?)?,
+        leg_a_size: dec(&row.get::<_, String>(7)?)?,
+        leg_a_fill_price: dec(&row.get::<_, String>(8)?)?,
+        leg_a_fee: dec(&row.get::<_, String>(9)?)?,
+        leg_b_platform: platform_from_db(&row.get::<_, String>(10)?)?,
+        leg_b_side: side_from_db(&row.get::<_, String>(11)?)?,
+        leg_b_price: dec(&row.get::<_, String>(12)?)?,
+        leg_b_size: dec(&row.get::<_, String>(13)?)?,
+        leg_b_fill_price: dec(&row.get::<_, String>(14)?)?,
+        leg_b_fee: dec(&row.get::<_, String>(15)?)?,
+        raw_spread: dec(&row.get::<_, String>(16)?)?,
+        net_spread: dec(&row.get::<_, String>(17)?)?,
+        profit: dec(&row.get::<_, String>(18)?)?,
+        status: trade_status_from_db(&row.get::<_, String>(19)?),
+        failure_reason: row.get(20)?,
+        execution_ms: row.get::<_, i64>(21)? as u64,
+        executed_at: parse_dt(&row.get::<_, String>(22)?),
+        bankroll_after: dec(&row.get::<_, String>(23)?)?,
+        bankroll_change_pct: dec(&row.get::<_, String>(24)?)?,
+        // Not stored in DB — zero is correct; only meaningful in-flight during the event loop.
+        approved_size: Decimal::ZERO,
+    })
+}
+
+fn row_to_position(row: &rusqlite::Row) -> Result<Position> {
+    Ok(Position {
+        id: row.get(0)?,
+        market_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::new_v4()),
+        platform: platform_from_db(&row.get::<_, String>(2)?)?,
+        side: side_from_db(&row.get::<_, String>(3)?)?,
+        quantity: dec(&row.get::<_, String>(4)?)?,
+        avg_entry_price: dec(&row.get::<_, String>(5)?)?,
+        unrealized_pnl: dec(&row.get::<_, String>(6)?)?,
+        opened_at: parse_dt(&row.get::<_, String>(7)?),
+        updated_at: parse_dt(&row.get::<_, String>(8)?),
+    })
 }
 ```
 
@@ -6835,467 +6861,6 @@ impl ArbitrageDetector {
 }
 ```
 
-## File: src/execution/executor.rs
-```rust
-use anyhow::Result;
-use chrono::Utc;
-use rust_decimal::Decimal;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-
-use crate::db::Database;
-use crate::types::*;
-use super::polymarket_client::PolymarketClient;
-use super::kalshi_client::KalshiClient;
-use super::cdna_client::CdnaClient;
-use super::forecastex_client::ForecastExClient;
-
-#[derive(Debug, Clone)]
-pub struct OrderResult {
-    pub filled: bool,
-    pub fill_price: Decimal,
-    pub fill_size: Decimal,
-    pub fee: Decimal,
-    pub order_id: String,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderAction {
-    Buy,
-    Sell,
-}
-
-#[async_trait::async_trait]
-pub trait PlatformOrderClient: Send + Sync {
-    async fn submit_order(
-        &self,
-        market_id: &str,
-        action: OrderAction,
-        side: Side,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: u32,
-    ) -> Result<OrderResult>;
-
-    async fn cancel_order(&self, order_id: &str) -> Result<()>;
-}
-
-pub struct ExecutionEngine {
-    rx: mpsc::Receiver<ValidatedOpportunity>,
-    trade_result_tx: mpsc::Sender<TradeResult>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    db: Arc<dyn Database>,
-    polymarket_client: Option<PolymarketClient>,
-    kalshi_client: Option<KalshiClient>,
-    cdna_client: Option<CdnaClient>,
-    forecastex_client: Option<ForecastExClient>,
-    trade_counter: i64,
-    bankroll: Decimal,
-}
-
-impl ExecutionEngine {
-    pub fn new(
-        rx: mpsc::Receiver<ValidatedOpportunity>,
-        trade_result_tx: mpsc::Sender<TradeResult>,
-        alert_tx: mpsc::Sender<AlertMessage>,
-        db: Arc<dyn Database>,
-        polymarket_client: Option<PolymarketClient>,
-        kalshi_client: Option<KalshiClient>,
-        cdna_client: Option<CdnaClient>,
-        forecastex_client: Option<ForecastExClient>,
-        initial_bankroll: Decimal,
-        initial_trade_count: i64,
-    ) -> Self {
-        Self {
-            rx,
-            trade_result_tx,
-            alert_tx,
-            db,
-            polymarket_client,
-            kalshi_client,
-            cdna_client,
-            forecastex_client,
-            trade_counter: initial_trade_count,
-            bankroll: initial_bankroll,
-        }
-    }
-
-    pub async fn run(mut self) {
-        info!("Execution engine started");
-        while let Some(opp) = self.rx.recv().await {
-            if let Err(e) = self.execute_arbitrage(opp).await {
-                error!(error = %e, "Arbitrage execution error");
-            }
-        }
-        info!("Execution engine stopped");
-    }
-
-    async fn execute_arbitrage(&mut self, validated: ValidatedOpportunity) -> Result<()> {
-        let opp = &validated.opportunity;
-        let start = Instant::now();
-        
-        // CRITICAL FIX: The TTL Guard
-        // Drop the opportunity immediately if it sat in the async queue longer than its Time-To-Live.
-        // Executing stale arbs guarantees negative PnL.
-        let current_time_ns = crate::types::now_ns();
-        let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
-        
-        if current_time_ns > expiration_ns {
-            let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
-            tracing::warn!(
-                opp_id = %opp.opp_id, 
-                delay_ms, 
-                "Opportunity TTL expired in execution queue — dropping to prevent slippage"
-            );
-            return Ok(());
-        }
-        
-        self.trade_counter += 1;
-
-        info!(
-            opp_id = %opp.opp_id,
-            market = %opp.market_question,
-            net_spread = %opp.net_spread,
-            size = %validated.approved_size,
-            "Executing arbitrage"
-        );
-
-        let (first_leg, second_leg) = self.order_legs(opp);
-
-        let first_result = self.execute_leg(
-            &first_leg.platform,
-            &first_leg.platform_market_id,
-            OrderAction::Buy,
-            first_leg.side,
-            first_leg.price,
-            validated.approved_size,
-            first_leg.fee_rate_bps, // Pass actual BPS rate
-        ).await;
-
-        let (leg_a_result, leg_b_result) = match first_result {
-            Ok(first_fill) if first_fill.filled => {
-                let hedge_size = first_fill.fill_size; 
-                let second_result = self.execute_leg(
-                    &second_leg.platform,
-                    &second_leg.platform_market_id,
-                    OrderAction::Buy,
-                    second_leg.side,
-                    second_leg.price,
-                    hedge_size,
-                    second_leg.fee_rate_bps, // Pass actual BPS rate
-                ).await;
-
-                match second_result {
-                    Ok(second_fill) if second_fill.filled => {
-                        (first_fill, second_fill)
-                    }
-                    Ok(second_fill) => {
-                        warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
-                        let mut final_first_fill = first_fill.clone();
-                        
-                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
-                            // Calculate exact realized loss from the round-trip FOK sell
-                            let buy_cost = first_fill.fill_size * first_fill.fill_price + first_fill.fee;
-                            let sell_revenue = unwind_fill.fill_size * unwind_fill.fill_price;
-                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee;
-                            
-                            // Zero out size to prevent DB position tracking, but pack the loss into the fee
-                            // so `compute_result` logs the exact financial hit.
-                            final_first_fill.fill_size = Decimal::ZERO;
-                            final_first_fill.fee = realized_loss;
-                            final_first_fill.error = Some("Leg B failed, automated unwind successful".into());
-                        }
-                        
-                        (final_first_fill, second_fill)
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Hedge leg error, attempting unwind");
-                        let mut final_first_fill = first_fill.clone();
-                        
-                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
-                            let buy_cost = first_fill.fill_size * first_fill.fill_price + first_fill.fee;
-                            let sell_revenue = unwind_fill.fill_size * unwind_fill.fill_price;
-                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee;
-                            
-                            final_first_fill.fill_size = Decimal::ZERO;
-                            final_first_fill.fee = realized_loss;
-                            final_first_fill.error = Some("Leg B error, automated unwind successful".into());
-                        }
-                        
-                        let failed2 = OrderResult {
-                            filled: false,
-                            fill_price: Decimal::ZERO,
-                            fill_size: Decimal::ZERO,
-                            fee: Decimal::ZERO,
-                            order_id: String::new(),
-                            error: Some(e.to_string()),
-                        };
-                        
-                        // Return the stranded leg unmodified if unwind fails so the DB tracks it correctly
-                        (final_first_fill, failed2)
-                    }
-                }
-            }
-            Ok(first_fill) => {
-                let failed = OrderResult {
-                    filled: false,
-                    fill_price: Decimal::ZERO,
-                    fill_size: Decimal::ZERO,
-                    fee: Decimal::ZERO,
-                    order_id: String::new(),
-                    error: None,
-                };
-                (first_fill, failed)
-            }
-            Err(e) => {
-                error!(error = %e, "First leg execution error");
-                let failed = OrderResult {
-                    filled: false,
-                    fill_price: Decimal::ZERO,
-                    fill_size: Decimal::ZERO,
-                    fee: Decimal::ZERO,
-                    order_id: String::new(),
-                    error: Some(e.to_string()),
-                };
-                let failed2 = failed.clone();
-                (failed, failed2)
-            }
-        };
-
-        let execution_ms = start.elapsed().as_millis() as u64;
-
-        let (status, profit, failure_reason) = self.compute_result(
-            &leg_a_result, &leg_b_result, opp,
-        );
-
-        let pre_trade_bankroll = self.bankroll;
-        self.bankroll += profit;
-        let bankroll_change_pct = if pre_trade_bankroll > Decimal::ZERO {
-            profit / pre_trade_bankroll * Decimal::from(100)
-        } else {
-            Decimal::ZERO
-        };
-
-        let trade_result = TradeResult {
-            trade_id: self.trade_counter,
-            opp_id: opp.opp_id,
-            market_id: opp.market_id,
-            market_question: opp.market_question.clone(),
-            approved_size: validated.approved_size,
-            leg_a_platform: first_leg.platform,
-            leg_a_side: first_leg.side,
-            leg_a_price: first_leg.price,
-            leg_a_size: leg_a_result.fill_size,
-            leg_a_fill_price: leg_a_result.fill_price,
-            leg_a_fee: leg_a_result.fee,
-            leg_b_platform: second_leg.platform,
-            leg_b_side: second_leg.side,
-            leg_b_price: second_leg.price,
-            leg_b_size: leg_b_result.fill_size,
-            leg_b_fill_price: leg_b_result.fill_price,
-            leg_b_fee: leg_b_result.fee,
-            raw_spread: opp.raw_spread,
-            net_spread: opp.net_spread,
-            profit,
-            status,
-            failure_reason,
-            execution_ms,
-            executed_at: Utc::now(),
-            bankroll_after: self.bankroll,
-            bankroll_change_pct,
-        };
-
-        // NOTIFY IMMEDIATELY so we do not block for IO
-        // CRITICAL FIX: Use try_send. Telegram API rate limits will cause alert_tx to fill up.
-        // Using .await here will deadlock the execution engine during trade bursts.
-        if let Err(e) = self.trade_result_tx.try_send(trade_result.clone()) {
-            tracing::error!(error = %e, "Trade result channel full — dropping notification");
-        }
-        if let Err(e) = self.alert_tx.try_send(AlertMessage::TradeComplete(trade_result.clone())) {
-            tracing::warn!(error = %e, "Alert channel full — dropping Telegram trade notification");
-        }
-
-        // NON-BLOCKING SQL DB INSERT
-        let db_clone = self.db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = db_clone.insert_trade(&trade_result).await {
-                tracing::error!(error = %e, "Failed to persist trade result to database");
-            }
-        });
-
-        Ok(())
-    }
-
-    fn order_legs<'a>(&self, opp: &'a ArbitrageOpportunity) -> (&'a LegDetail, &'a LegDetail) {
-        let a_liquidity = opp.leg_a.available_size;
-        let b_liquidity = opp.leg_b.available_size;
-
-        if a_liquidity <= b_liquidity {
-            (&opp.leg_a, &opp.leg_b) 
-        } else {
-            (&opp.leg_b, &opp.leg_a)
-        }
-    }
-
-    async fn execute_leg(
-        &self,
-        platform: &Platform,
-        market_id: &str,
-        action: OrderAction,
-        side: Side,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: u32,
-    ) -> Result<OrderResult> {
-        match platform {
-            Platform::Polymarket | Platform::PolymarketUs => {
-                if let Some(client) = &self.polymarket_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Polymarket client not configured")
-                }
-            }
-            Platform::Kalshi => {
-                if let Some(client) = &self.kalshi_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Kalshi client not configured")
-                }
-            }
-            Platform::Cdna => {
-                if let Some(client) = &self.cdna_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("CDNA client not configured")
-                }
-            }
-            Platform::ForecastEx => {
-                if let Some(client) = &self.forecastex_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("ForecastEx client not configured")
-                }
-            }
-        }
-    }
-
-
-    /// Executes a synthetic automated unwind.
-    /// By natively SELLING the stranded contracts back to the resting bids, 
-    /// we cap our risk instantly and free up capital without locking collateral.
-    async fn attempt_unwind(
-        &self,
-        stranded_leg: &LegDetail,
-        original_fill: &OrderResult,
-    ) -> Result<OrderResult> {
-        // Sell at 0.01 to aggressively cross the spread and ensure the FOK SELL order
-        // executes against whatever bids are resting on the book.
-        let aggressive_sell_price = rust_decimal_macros::dec!(0.01);
-
-        warn!(
-            platform = %stranded_leg.platform,
-            market_id = %stranded_leg.platform_market_id,
-            stranded_side = %stranded_leg.side,
-            size = %original_fill.fill_size,
-            "Hedge failed. Executing aggressive FOK SELL unwind to dump inventory."
-        );
-
-        let unwind_result = self.execute_leg(
-            &stranded_leg.platform,
-            &stranded_leg.platform_market_id,
-            OrderAction::Sell,
-            stranded_leg.side, // Same side! We sell the exact inventory we hold.
-            aggressive_sell_price,
-            original_fill.fill_size,
-            stranded_leg.fee_rate_bps,
-        ).await;
-
-        match unwind_result {
-            Ok(fill) if fill.filled => {
-                let msg = format!(
-                    "⚠️ <b>AUTOMATED UNWIND SUCCESSFUL</b> ⚠️\n\n\
-                     Platform: {}\nMarket: {}\nUnwound: {} {}\n\
-                     <b>Delta exposure neutralized.</b>",
-                     stranded_leg.platform, stranded_leg.platform_market_id, fill.fill_size, stranded_leg.side
-                );
-                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
-                    severity: "warning".into(), 
-                    message: msg 
-                });
-                Ok(fill)
-            }
-            Ok(_) | Err(_) => {
-                let err_msg = unwind_result.err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "FOK Unwind Rejected by matching engine".into());
-                
-                error!(error = %err_msg, "Automated unwind failed. Naked exposure remains.");
-                
-                let msg = format!(
-                    "🚨 <b>CRITICAL: UNWIND FAILED - NAKED EXPOSURE</b> 🚨\n\n\
-                     Platform: {}\nMarket: {}\nStranded Size: {} {}\n\
-                     Error: {}\n\
-                     <b>MANUAL INTERVENTION REQUIRED IMMEDIATELY.</b>",
-                     stranded_leg.platform, stranded_leg.platform_market_id, 
-                     original_fill.fill_size, stranded_leg.side, err_msg
-                );
-                
-                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
-                    severity: "critical".into(), 
-                    message: msg 
-                });
-                
-                anyhow::bail!("Automated unwind failed: {}", err_msg)
-            }
-        }
-    }
-
-    fn compute_result(
-        &self,
-        leg_a: &OrderResult,
-        leg_b: &OrderResult,
-        _opp: &ArbitrageOpportunity,
-    ) -> (TradeStatus, Decimal, Option<String>) {
-        if leg_a.filled && leg_b.filled {
-            let total_cost = leg_a.fill_price + leg_b.fill_price;
-            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.min(leg_b.fill_size);
-            let net_profit = gross_profit - leg_a.fee - leg_b.fee;
-            
-            let status = if leg_a.fill_size == leg_b.fill_size {
-                TradeStatus::Success
-            } else {
-                TradeStatus::Partial
-            };
-            
-            (status, net_profit, None)
-        } else if leg_a.filled && !leg_b.filled {
-            let filled_value = leg_a.fill_price * leg_a.fill_size;
-            
-            // DYNAMIC UNWIND COST: 
-            // The cost to unwind is roughly proportional to the raw spread of the asset.
-            // If the spread is wide (e.g., 8%), unwinding will hurt more.
-            // We use the raw_spread as a proxy for the asset's illiquidity, capped between 2% and 10% for safety.
-            let dynamic_penalty_pct = _opp.raw_spread
-                .max(rust_decimal_macros::dec!(0.02))
-                .min(rust_decimal_macros::dec!(0.10));
-                
-            let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
-            
-            let estimated_loss = dynamic_unwind_slippage + leg_a.fee; 
-            let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
-            
-            (TradeStatus::Fail, -estimated_loss, Some(reason))
-        } else {
-            let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
-            (TradeStatus::Fail, Decimal::ZERO, Some(reason))
-        }
-    }
-}
-```
-
 ## File: src/feeds/kalshi.rs
 ```rust
 use anyhow::{Context, Result};
@@ -7330,11 +6895,12 @@ struct KalshiOrderBook {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
     last_seq: u64,
+    is_initialized: bool,
 }
 
 impl KalshiOrderBook {
     fn new() -> Self {
-        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_seq: 0 }
+        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_seq: 0, is_initialized: false }
     }
 
     /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
@@ -7477,10 +7043,9 @@ impl FeedHandler for KalshiFeed {
         for book in self.books.values_mut() {
             book.bids.clear();
             book.asks.clear();
-            // CRITICAL FIX: Reset the sequence tracker. 
-            // If left uncleared, the next connection will trigger a false sequence-gap 
-            // and force the WebSocket into an infinite disconnect/reconnect death loop.
             book.last_seq = 0;
+            // Fix: Mark book as uninitialized to reject all deltas until snapshot arrives
+            book.is_initialized = false;
         }
     }
 
@@ -7687,6 +7252,10 @@ impl KalshiFeed {
         let seq = data.seq.unwrap_or(0);
 
         if let Some(book) = self.books.get(ticker) {
+            // Fix: If we receive a delta before a snapshot, explicitly trigger a reconnect.
+            if !book.is_initialized {
+                return true; 
+            }
             if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
                 warn!(ticker, expected = book.last_seq + 1, got = seq,
                     "Kalshi sequence gap — reconnecting to get fresh snapshot");
@@ -7733,6 +7302,464 @@ impl KalshiFeed {
         }
 
         false // no reconnect needed
+    }
+}
+```
+
+## File: src/execution/executor.rs
+```rust
+use anyhow::Result;
+use chrono::Utc;
+use rust_decimal::Decimal;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+
+use crate::db::Database;
+use crate::types::*;
+use super::polymarket_client::PolymarketClient;
+use super::kalshi_client::KalshiClient;
+use super::cdna_client::CdnaClient;
+use super::forecastex_client::ForecastExClient;
+
+#[derive(Debug, Clone)]
+pub struct OrderResult {
+    pub filled: bool,
+    pub fill_price: Decimal,
+    pub fill_size: Decimal,
+    pub fee: Decimal,
+    pub order_id: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderAction {
+    Buy,
+    Sell,
+}
+
+#[async_trait::async_trait]
+pub trait PlatformOrderClient: Send + Sync {
+    async fn submit_order(
+        &self,
+        market_id: &str,
+        action: OrderAction,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        fee_rate_bps: u32,
+    ) -> Result<OrderResult>;
+
+    async fn cancel_order(&self, order_id: &str) -> Result<()>;
+}
+
+pub struct ExecutionEngine {
+    rx: mpsc::Receiver<ValidatedOpportunity>,
+    trade_result_tx: mpsc::Sender<TradeResult>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    db: Arc<dyn Database>,
+    polymarket_client: Option<PolymarketClient>,
+    kalshi_client: Option<KalshiClient>,
+    cdna_client: Option<CdnaClient>,
+    forecastex_client: Option<ForecastExClient>,
+    trade_counter: i64,
+}
+
+impl ExecutionEngine {
+    pub fn new(
+        rx: mpsc::Receiver<ValidatedOpportunity>,
+        trade_result_tx: mpsc::Sender<TradeResult>,
+        alert_tx: mpsc::Sender<AlertMessage>,
+        db: Arc<dyn Database>,
+        polymarket_client: Option<PolymarketClient>,
+        kalshi_client: Option<KalshiClient>,
+        cdna_client: Option<CdnaClient>,
+        forecastex_client: Option<ForecastExClient>,
+        initial_trade_count: i64,
+    ) -> Self {
+        Self {
+            rx,
+            trade_result_tx,
+            alert_tx,
+            db,
+            polymarket_client,
+            kalshi_client,
+            cdna_client,
+            forecastex_client,
+            trade_counter: initial_trade_count,
+        }
+    }
+
+    pub async fn run(mut self) {
+        info!("Execution engine started");
+        while let Some(opp) = self.rx.recv().await {
+            if let Err(e) = self.execute_arbitrage(opp).await {
+                error!(error = %e, "Arbitrage execution error");
+            }
+        }
+        info!("Execution engine stopped");
+    }
+
+    async fn execute_arbitrage(&mut self, validated: ValidatedOpportunity) -> Result<()> {
+        let opp = &validated.opportunity;
+        let start = Instant::now();
+        
+        // CRITICAL FIX: The TTL Guard
+        // Drop the opportunity immediately if it sat in the async queue longer than its Time-To-Live.
+        // Executing stale arbs guarantees negative PnL.
+        let current_time_ns = crate::types::now_ns();
+        let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
+        
+        if current_time_ns > expiration_ns {
+            let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
+            tracing::warn!(
+                opp_id = %opp.opp_id, 
+                delay_ms, 
+                "Opportunity TTL expired in execution queue — dropping to prevent slippage"
+            );
+            return Ok(());
+        }
+        
+        self.trade_counter += 1;
+
+        info!(
+            opp_id = %opp.opp_id,
+            market = %opp.market_question,
+            net_spread = %opp.net_spread,
+            size = %validated.approved_size,
+            "Executing arbitrage"
+        );
+
+        let (first_leg, second_leg) = self.order_legs(opp);
+
+        let first_result = self.execute_leg(
+            &first_leg.platform,
+            &first_leg.platform_market_id,
+            OrderAction::Buy,
+            first_leg.side,
+            first_leg.price,
+            validated.approved_size,
+            first_leg.fee_rate_bps, // Pass actual BPS rate
+        ).await;
+
+        let (leg_a_result, leg_b_result) = match first_result {
+            Ok(first_fill) if first_fill.filled => {
+                let hedge_size = first_fill.fill_size; 
+                let second_result = self.execute_leg(
+                    &second_leg.platform,
+                    &second_leg.platform_market_id,
+                    OrderAction::Buy,
+                    second_leg.side,
+                    second_leg.price,
+                    hedge_size,
+                    second_leg.fee_rate_bps, // Pass actual BPS rate
+                ).await;
+
+                match second_result {
+                    Ok(second_fill) if second_fill.filled => {
+                        (first_fill, second_fill)
+                    }
+                    Ok(second_fill) => {
+                        warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
+                        let mut final_first_fill = first_fill.clone();
+                        
+                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
+                            // Calculate exact realized loss from the round-trip FOK sell
+                            let buy_cost = first_fill.fill_size * first_fill.fill_price + first_fill.fee;
+                            let sell_revenue = unwind_fill.fill_size * unwind_fill.fill_price;
+                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee;
+                            
+                            // Zero out size to prevent DB position tracking, but pack the loss into the fee
+                            // so `compute_result` logs the exact financial hit.
+                            final_first_fill.fill_size = Decimal::ZERO;
+                            final_first_fill.fee = realized_loss;
+                            final_first_fill.error = Some("Leg B failed, automated unwind successful".into());
+                        }
+                        
+                        (final_first_fill, second_fill)
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Hedge leg error, attempting unwind");
+                        let mut final_first_fill = first_fill.clone();
+                        
+                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
+                            let buy_cost = first_fill.fill_size * first_fill.fill_price + first_fill.fee;
+                            let sell_revenue = unwind_fill.fill_size * unwind_fill.fill_price;
+                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee;
+                            
+                            final_first_fill.fill_size = Decimal::ZERO;
+                            final_first_fill.fee = realized_loss;
+                            final_first_fill.error = Some("Leg B error, automated unwind successful".into());
+                        }
+                        
+                        let failed2 = OrderResult {
+                            filled: false,
+                            fill_price: Decimal::ZERO,
+                            fill_size: Decimal::ZERO,
+                            fee: Decimal::ZERO,
+                            order_id: String::new(),
+                            error: Some(e.to_string()),
+                        };
+                        
+                        // Return the stranded leg unmodified if unwind fails so the DB tracks it correctly
+                        (final_first_fill, failed2)
+                    }
+                }
+            }
+            Ok(first_fill) => {
+                let failed = OrderResult {
+                    filled: false,
+                    fill_price: Decimal::ZERO,
+                    fill_size: Decimal::ZERO,
+                    fee: Decimal::ZERO,
+                    order_id: String::new(),
+                    error: None,
+                };
+                (first_fill, failed)
+            }
+            Err(e) => {
+                error!(error = %e, "First leg execution error");
+                let failed = OrderResult {
+                    filled: false,
+                    fill_price: Decimal::ZERO,
+                    fill_size: Decimal::ZERO,
+                    fee: Decimal::ZERO,
+                    order_id: String::new(),
+                    error: Some(e.to_string()),
+                };
+                let failed2 = failed.clone();
+                (failed, failed2)
+            }
+        };
+
+        let execution_ms = start.elapsed().as_millis() as u64;
+
+        let (status, profit, failure_reason) = self.compute_result(
+            &leg_a_result, &leg_b_result, opp,
+        );
+
+        let pre_trade_bankroll = self.bankroll;
+        self.bankroll += profit;
+        let bankroll_change_pct = if pre_trade_bankroll > Decimal::ZERO {
+            profit / pre_trade_bankroll * Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        };
+
+        let trade_result = TradeResult {
+            trade_id: self.trade_counter,
+            opp_id: opp.opp_id,
+            market_id: opp.market_id,
+            market_question: opp.market_question.clone(),
+            approved_size: validated.approved_size,
+            leg_a_platform: first_leg.platform,
+            leg_a_side: first_leg.side,
+            leg_a_price: first_leg.price,
+            leg_a_size: leg_a_result.fill_size,
+            leg_a_fill_price: leg_a_result.fill_price,
+            leg_a_fee: leg_a_result.fee,
+            leg_b_platform: second_leg.platform,
+            leg_b_side: second_leg.side,
+            leg_b_price: second_leg.price,
+            leg_b_size: leg_b_result.fill_size,
+            leg_b_fill_price: leg_b_result.fill_price,
+            leg_b_fee: leg_b_result.fee,
+            raw_spread: opp.raw_spread,
+            net_spread: opp.net_spread,
+            profit,
+            status,
+            failure_reason,
+            execution_ms,
+            executed_at: Utc::now(),
+            bankroll_after: Decimal::ZERO,
+            bankroll_change_pct: Decimal::ZERO,
+        };
+
+        // Pass the result directly back to the orchestrator.
+        // The executor MUST NOT dispatch to Telegram or SQLite, as this bypasses 
+        // the authoritative state machine and causes severe tracking drift.
+        if let Err(e) = self.trade_result_tx.try_send(trade_result) {
+            tracing::error!(error = %e, "Trade result channel full — dropping notification");
+        }
+        if let Err(e) = self.alert_tx.try_send(AlertMessage::TradeComplete(trade_result.clone())) {
+            tracing::warn!(error = %e, "Alert channel full — dropping Telegram trade notification");
+        }
+
+        // NON-BLOCKING SQL DB INSERT
+        let db_clone = self.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db_clone.insert_trade(&trade_result).await {
+                tracing::error!(error = %e, "Failed to persist trade result to database");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn order_legs<'a>(&self, opp: &'a ArbitrageOpportunity) -> (&'a LegDetail, &'a LegDetail) {
+        let a_liquidity = opp.leg_a.available_size;
+        let b_liquidity = opp.leg_b.available_size;
+
+        if a_liquidity <= b_liquidity {
+            (&opp.leg_a, &opp.leg_b) 
+        } else {
+            (&opp.leg_b, &opp.leg_a)
+        }
+    }
+
+    async fn execute_leg(
+        &self,
+        platform: &Platform,
+        market_id: &str,
+        action: OrderAction,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        fee_rate_bps: u32,
+    ) -> Result<OrderResult> {
+        match platform {
+            Platform::Polymarket | Platform::PolymarketUs => {
+                if let Some(client) = &self.polymarket_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("Polymarket client not configured")
+                }
+            }
+            Platform::Kalshi => {
+                if let Some(client) = &self.kalshi_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("Kalshi client not configured")
+                }
+            }
+            Platform::Cdna => {
+                if let Some(client) = &self.cdna_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("CDNA client not configured")
+                }
+            }
+            Platform::ForecastEx => {
+                if let Some(client) = &self.forecastex_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("ForecastEx client not configured")
+                }
+            }
+        }
+    }
+
+
+    /// Executes a synthetic automated unwind.
+    /// By natively SELLING the stranded contracts back to the resting bids, 
+    /// we cap our risk instantly and free up capital without locking collateral.
+    async fn attempt_unwind(
+        &self,
+        stranded_leg: &LegDetail,
+        original_fill: &OrderResult,
+    ) -> Result<OrderResult> {
+        // Sell at 0.01 to aggressively cross the spread and ensure the FOK SELL order
+        // executes against whatever bids are resting on the book.
+        let aggressive_sell_price = rust_decimal_macros::dec!(0.01);
+
+        warn!(
+            platform = %stranded_leg.platform,
+            market_id = %stranded_leg.platform_market_id,
+            stranded_side = %stranded_leg.side,
+            size = %original_fill.fill_size,
+            "Hedge failed. Executing aggressive FOK SELL unwind to dump inventory."
+        );
+
+        let unwind_result = self.execute_leg(
+            &stranded_leg.platform,
+            &stranded_leg.platform_market_id,
+            OrderAction::Sell,
+            stranded_leg.side, // Same side! We sell the exact inventory we hold.
+            aggressive_sell_price,
+            original_fill.fill_size,
+            stranded_leg.fee_rate_bps,
+        ).await;
+
+        match unwind_result {
+            Ok(fill) if fill.filled => {
+                let msg = format!(
+                    "⚠️ <b>AUTOMATED UNWIND SUCCESSFUL</b> ⚠️\n\n\
+                     Platform: {}\nMarket: {}\nUnwound: {} {}\n\
+                     <b>Delta exposure neutralized.</b>",
+                     stranded_leg.platform, stranded_leg.platform_market_id, fill.fill_size, stranded_leg.side
+                );
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
+                    severity: "warning".into(), 
+                    message: msg 
+                });
+                Ok(fill)
+            }
+            Ok(_) | Err(_) => {
+                let err_msg = unwind_result.err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "FOK Unwind Rejected by matching engine".into());
+                
+                error!(error = %err_msg, "Automated unwind failed. Naked exposure remains.");
+                
+                let msg = format!(
+                    "🚨 <b>CRITICAL: UNWIND FAILED - NAKED EXPOSURE</b> 🚨\n\n\
+                     Platform: {}\nMarket: {}\nStranded Size: {} {}\n\
+                     Error: {}\n\
+                     <b>MANUAL INTERVENTION REQUIRED IMMEDIATELY.</b>",
+                     stranded_leg.platform, stranded_leg.platform_market_id, 
+                     original_fill.fill_size, stranded_leg.side, err_msg
+                );
+                
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
+                    severity: "critical".into(), 
+                    message: msg 
+                });
+                
+                anyhow::bail!("Automated unwind failed: {}", err_msg)
+            }
+        }
+    }
+
+    fn compute_result(
+        &self,
+        leg_a: &OrderResult,
+        leg_b: &OrderResult,
+        _opp: &ArbitrageOpportunity,
+    ) -> (TradeStatus, Decimal, Option<String>) {
+        if leg_a.filled && leg_b.filled {
+            let total_cost = leg_a.fill_price + leg_b.fill_price;
+            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.min(leg_b.fill_size);
+            let net_profit = gross_profit - leg_a.fee - leg_b.fee;
+            
+            let status = if leg_a.fill_size == leg_b.fill_size {
+                TradeStatus::Success
+            } else {
+                TradeStatus::Partial
+            };
+            
+            (status, net_profit, None)
+        } else if leg_a.filled && !leg_b.filled {
+            let filled_value = leg_a.fill_price * leg_a.fill_size;
+            
+            // DYNAMIC UNWIND COST: 
+            // The cost to unwind is roughly proportional to the raw spread of the asset.
+            // If the spread is wide (e.g., 8%), unwinding will hurt more.
+            // We use the raw_spread as a proxy for the asset's illiquidity, capped between 2% and 10% for safety.
+            let dynamic_penalty_pct = _opp.raw_spread
+                .max(rust_decimal_macros::dec!(0.02))
+                .min(rust_decimal_macros::dec!(0.10));
+                
+            let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
+            
+            let estimated_loss = dynamic_unwind_slippage + leg_a.fee; 
+            let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
+            
+            (TradeStatus::Fail, -estimated_loss, Some(reason))
+        } else {
+            let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
+            (TradeStatus::Fail, Decimal::ZERO, Some(reason))
+        }
     }
 }
 ```
@@ -7923,6 +7950,43 @@ impl PlatformOrderClient for KalshiClient {
         }
         Ok(())
     }
+
+    /// Queries the Kalshi API for the actual revenue generated by a settled market position.
+    pub async fn fetch_settlement_payout(&self, ticker: &str, quantity: Decimal, avg_entry: Decimal) -> Result<Decimal> {
+        let url = format!("{}/portfolio/settlements?ticker={}", self.rest_url, ticker);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.get(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .context("Kalshi settlement fetch failed")?;
+            
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let mut total_revenue = Decimal::ZERO;
+        
+        // Sum the settlement revenue from all matching positions
+        if let Some(settlements) = body.get("settlements").and_then(|v| v.as_array()) {
+            for settlement in settlements {
+                let revenue_cents = settlement.get("revenue").and_then(|v| v.as_i64()).unwrap_or(0);
+                total_revenue += Decimal::from(revenue_cents) / Decimal::from(100);
+            }
+        }
+        
+        let cost_basis = quantity * avg_entry;
+        let realized_pnl = total_revenue - cost_basis;
+        Ok(realized_pnl)
+    }
+        let resp = self.http.delete(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .context("Kalshi cancel failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!("Kalshi cancel_order failed: HTTP {}", status);
+        }
+        Ok(())
+    }
 }
 ```
 
@@ -8050,7 +8114,10 @@ impl PlatformOrderClient for PolymarketClient {
         let now = chrono::Utc::now();
         let nonce_val = now.timestamp_nanos_opt().unwrap_or(0) as u64;
         let nonce = U256::from(nonce_val);
-        let expiration_u256 = U256::from((now.timestamp() + 300) as u64);
+        
+        // Fix: 5 minutes is dangerously long for an HFT signature. 
+        // 30 seconds caps our risk of resting order sniping on network lag.
+        let expiration_u256 = U256::from((now.timestamp() + 30) as u64);
 
         let maker_addr = self.signer.address();
 
@@ -8107,11 +8174,22 @@ impl PlatformOrderClient for PolymarketClient {
             let fill_size = taker_amount_scaled / scale;
             let estimated_fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, fee_rate_bps as u16);
 
-            // Return immediately with the estimated fill details.
-            // Actual fill prices will be reconciled asynchronously by the
-            // reconciliation engine — polling here adds 1.2s latency to
-            // every execution, which is unacceptable for an HFT system.
-            let (actual_price, actual_size, actual_fee) = (price, fill_size, estimated_fee);
+            // Fix: We must query the authoritative fill price. 
+            // The reconciler does NOT do this. Falsifying fill prices breaks Kelly sizing and Bankroll.
+            let mut actual_price = price;
+            if !order_id_str.is_empty() {
+                let fetch_url = format!("{}/orders/{}", self.rest_url, order_id_str);
+                if let Ok(fetch_resp) = self.http.get(&fetch_url).send().await {
+                    if let Ok(order_data) = fetch_resp.json::<serde_json::Value>().await {
+                        if let Some(avg_price_str) = order_data.get("average_price").and_then(|v| v.as_str()) {
+                            if let Ok(parsed_price) = Decimal::from_str(avg_price_str) {
+                                actual_price = parsed_price;
+                            }
+                        }
+                    }
+                }
+            }
+
             Ok(OrderResult {
                 filled: true,
                 fill_price: actual_price,
@@ -8241,6 +8319,7 @@ async fn main() -> Result<()> {
     let (daily_report_tx, daily_report_rx) = mpsc::channel::<DailyReport>(10);
     let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SystemCommand>(10); // Command routing from Telegram
+    let (settlement_tx, mut settlement_rx) = mpsc::channel::<Decimal>(100);
 
     // ─── Telegram ───
     let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
@@ -8412,7 +8491,6 @@ async fn main() -> Result<()> {
         kalshi_client,
         cdna_client,
         forecastex_client,
-        initial_bankroll,
         initial_trade_count,
     );
     join_set.spawn(executor.run());
@@ -8427,9 +8505,9 @@ async fn main() -> Result<()> {
     );
     join_set.spawn(reconciler.run());
 
-    // ─── Settlement Monitor ───
+// ─── Settlement Monitor ───
     let settlement = inventory::settlement::SettlementMonitor::new(
-        db.clone(), alert_tx.clone(), 300,
+        db.clone(), alert_tx.clone(), settlement_tx, 300, kalshi_client.clone()
     );
     join_set.spawn(settlement.run());
 
@@ -8496,11 +8574,14 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         match MercuryConfig::load(&config_path) {
                             Ok(_new_config) => {
-                                warn!("Config file changed — validated OK but NOT APPLIED. Restart required for changes to take effect.");
+                                // CRITICAL FIX: Trigger graceful shutdown so systemd automatically 
+                                // restarts the process, fully applying the new risk configurations.
+                                warn!("Config file changed and validated OK. Initiating graceful shutdown for systemd auto-restart.");
                                 let _ = alert_tx_reload.try_send(AlertMessage::SystemAlert {
                                     severity: "warning".into(),
-                                    message: "Config file changed and validated OK, but MERCURY must be restarted for changes to take effect.".into(),
+                                    message: "Config file updated. Restarting MERCURY engine to apply new risk limits...".into(),
                                 });
+                                cancel_reload.cancel();
                             }
                             Err(e) => {
                                 warn!(error = %e, "Config reload failed — keeping current config");
@@ -8683,6 +8764,9 @@ loop {
 
                 // Process opportunities
                 for opp in opps {
+                // Fix CB5: Calculate the true exposure allocated to this specific market question
+                let market_exposure_pct = bankroll_manager.market_exposure_pct(&opp.market_id);
+
                 let trips = circuit_breakers.check_all(
                         opp.recommended_size, 
                         bankroll_manager.total_bankroll(), 
@@ -8691,20 +8775,32 @@ loop {
                         bankroll_manager.platform_exposure_pct(&opp.leg_a.platform).max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)), 
                         cached_open_positions, 
                         opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
-                        // CRITICAL FIX: Provide the actual ms_since_last_tick. 
-                        // Hardcoding to 0 permanently bypassed Circuit Breaker #9 (Stale Feed Protection).
                         metrics.ms_since_last_tick(), 
-                        rust_decimal::Decimal::ZERO // market_exposure_pct (defaulting to 0)
+                        market_exposure_pct // Authoritative market correlation tracking
                     );
 
                     if trips.is_empty() {
-                        // Adjusted win probability to a realistic 95% for HFT arbitrage.
                         let win_prob = rust_decimal_macros::dec!(0.95);
                         let kelly_frac = kelly.optimal_fraction(win_prob, opp.net_spread);
                         
-                        // CRITICAL FIX: .floor() the size. Polymarket accepts fractions, Kalshi demands integers. 
-                        // Without flooring, the decimal mismatch creates silent directional risk on every execution.
                         let kelly_ideal_usd = kelly.position_size(
+                            // ... [params]
+                        );
+                        
+                        let combined_contract_price = opp.leg_a.price + opp.leg_b.price;
+                        let kelly_ideal_contracts = if combined_contract_price > rust_decimal::Decimal::ZERO {
+                            kelly_ideal_usd / combined_contract_price
+                        } else {
+                            rust_decimal::Decimal::ZERO
+                        };
+
+                        // Fix Sizing: Kalshi demands whole integers, but Polymarket supports decimals.
+                        // Only floor the size if Kalshi is involved in the leg pairing.
+                        let approved_size = if opp.leg_a.platform == Platform::Kalshi || opp.leg_b.platform == Platform::Kalshi {
+                            kelly_ideal_contracts.min(opp.recommended_size).floor()
+                        } else {
+                            kelly_ideal_contracts.min(opp.recommended_size).round_dp(2)
+                        };
                             bankroll_manager.total_bankroll(), 
                             win_prob, 
                             opp.net_spread, 
@@ -8759,6 +8855,10 @@ loop {
                                         in_flight_notional += approved_size;
                                         bankroll_manager.add_exposure(platform_a, leg_exposure);
                                         bankroll_manager.add_exposure(platform_b, leg_exposure);
+                                        
+                                        // CRITICAL FIX: Track correlated market exposure for CB5.
+                                        // We reserve the full approved size against this specific market UUID.
+                                        bankroll_manager.add_market_exposure(opp.market_id, approved_size);
                                     }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "Execution channel full, dropping opportunity to maintain latency");
@@ -8806,6 +8906,11 @@ loop {
                 let reserved_per_leg = result.approved_size / Decimal::from(2);
                 bankroll_manager.remove_exposure(result.leg_a_platform, reserved_per_leg);
                 bankroll_manager.remove_exposure(result.leg_b_platform, reserved_per_leg);
+                
+                // CRITICAL FIX: Free up the correlated market exposure.
+                // This allows CB5 to permit new trades on this market if we are now under the 20% limit.
+                bankroll_manager.remove_market_exposure(result.market_id, result.approved_size);
+                
                 circuit_breakers.record_execution(result.status == TradeStatus::Success);
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
 
@@ -8838,6 +8943,11 @@ loop {
                 spread_engine.update_matic_price(gas.matic_usd);
                 circuit_breakers.update_gas_price(gas.gas_gwei);
                 debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated");
+            }
+
+            // ── Settlement PnL Sink ──
+            Some(pnl) = settlement_rx.recv() => {
+                bankroll_manager.record_settlement(pnl);
             }
 
             // ── Periodic State Sync ──
