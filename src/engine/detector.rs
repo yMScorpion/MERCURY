@@ -1,5 +1,4 @@
 use rust_decimal::Decimal;
-use std::str::FromStr;
 use tracing::{debug};
 use uuid::Uuid;
 use rust_decimal::prelude::ToPrimitive;
@@ -72,7 +71,18 @@ impl ArbitrageDetector {
     ) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::new();
 
-        for pair in registry.get_arb_pairs().iter().filter(|p| p.market_id == *market_id) {
+    for pair in registry.get_arb_pairs().iter().filter(|p| p.market_id == *market_id) {
+            // CRITICAL FIX: The Time-to-Maturity Trap
+            // Do not evaluate spreads if the market resolves in less than 60 seconds.
+            // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 
+            // in time to dump the naked leg before the exchange locks the order book.
+            if let Some(market) = registry.get_market(&pair.market_id) {
+                let seconds_to_exp = (market.expiration - chrono::Utc::now()).num_seconds();
+                if seconds_to_exp < 60 {
+                    continue; 
+                }
+            }
+
             let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
                 Some(b) => b,
                 None => continue,
@@ -90,6 +100,13 @@ impl ArbitrageDetector {
                 match self.run_gates(&spread, book_a, book_b, pair.confidence) {
                     Ok(()) => {
                         self.stats.opportunities_passed += 1;
+
+                        // Fetch the native exchange identifiers and fee rates from the registry
+                        let info_a = registry.get_platform_info(&pair.market_id, &pair.platform_a);
+                        let info_b = registry.get_platform_info(&pair.market_id, &pair.platform_b);
+                        
+                        let (plat_id_a, fee_bps_a) = if let Some(i) = info_a { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
+                        let (plat_id_b, fee_bps_b) = if let Some(i) = info_b { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
 
                         let market_question = registry.get_market(&pair.market_id)
                             .map(|m| m.question.clone())
@@ -117,9 +134,8 @@ impl ArbitrageDetector {
                                 price: spread.leg_a_price,
                                 available_size: spread.leg_a_available,
                                 fee_estimate: spread.leg_a_fee,
-                                fee_rate_bps: 0, 
-                                // NOTE: Replace this with the actual exchange token ID from the registry when available
-                                platform_market_id: spread.market_id.to_string(), 
+                                fee_rate_bps: fee_bps_a as u32, 
+                                platform_market_id: plat_id_a, 
                             },
                             leg_b: LegDetail {
                                 platform: spread.leg_b_platform,
@@ -127,14 +143,15 @@ impl ArbitrageDetector {
                                 price: spread.leg_b_price,
                                 available_size: spread.leg_b_available,
                                 fee_estimate: spread.leg_b_fee,
-                                fee_rate_bps: 0,
-                                // NOTE: Replace this with the actual exchange token ID from the registry when available
-                                platform_market_id: spread.market_id.to_string(), 
+                                fee_rate_bps: fee_bps_b as u32,
+                                platform_market_id: plat_id_b, 
                             },
                             raw_spread: spread.raw_spread,
                             net_spread: spread.net_spread,
                             kelly_fraction: Decimal::ZERO, 
-                            recommended_size: Decimal::ZERO, 
+                            // CRITICAL FIX: Pass the actual available orderbook depth to the main loop 
+                            // so the execution engine doesn't attempt to size larger than available liquidity.
+                            recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
                             score,
                             detected_at: now_ns(),
                             ttl_ms: 5000,

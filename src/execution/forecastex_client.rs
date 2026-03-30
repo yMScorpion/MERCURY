@@ -17,10 +17,12 @@ impl ForecastExClient {
     }
 }
 
+use crate::execution::executor::OrderAction;
+
 #[async_trait::async_trait]
 impl PlatformOrderClient for ForecastExClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
-        info!(market_id, side = %side, price = %price, size = %size, "ForecastEx order rejected — FIX execution not yet implemented");
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
+        info!(market_id, action = ?action, side = %side, price = %price, size = %size, "ForecastEx order rejected — FIX execution not yet implemented");
         warn!(
             fix_host = %self.fix_host,
             fix_port = self.fix_port,

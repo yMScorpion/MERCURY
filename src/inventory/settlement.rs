@@ -55,14 +55,14 @@ impl SettlementMonitor {
                             warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
                         }
                         self.db.close_position(position.id).await?;
-                        let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                             severity: "info".into(),
                             message: format!(
                                 "Position #{} settled: {} {} on {} ({} contracts @ ${})",
                                 position.id, position.side, market.question,
                                 position.platform, position.quantity, position.avg_entry_price,
                             ),
-                        }).await;
+                        });
                     }
                     MarketStatus::Expired => {
                         warn!(position_id = position.id, market = %market.question, "Market expired with open position");
@@ -84,13 +84,13 @@ impl SettlementMonitor {
                     _ => {
                         let time_to_expiry = market.expiration - now;
                         if time_to_expiry.num_hours() < 1 && time_to_expiry.num_seconds() > 0 {
-                            let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                            let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                                 severity: "warning".into(),
                                 message: format!(
                                     "Position #{} expiring in {:.0} minutes: {}",
                                     position.id, time_to_expiry.num_minutes(), market.question,
                                 ),
-                            }).await;
+                            });
                         }
                     }
                 }

@@ -118,9 +118,18 @@ impl MarketDiscovery {
         // O(N^2) Fuzzy Matcher: Compares every Kalshi market against every Polymarket market
         for pm in &poly_markets {
             for km in &kalshi_markets {
-                // 1. Expiration check: Must be within 48 hours to be the same event
-                let exp_diff_hours = (pm.expiration - km.expiration).num_hours().abs();
-                if exp_diff_hours > 48 { continue; }
+                // 1. Dual-Tier Expiration Check
+                let exp_diff_secs = (pm.expiration - km.expiration).num_seconds().abs();
+                let is_15m_market = pm.question_normalized.contains("15 min") || km.question_normalized.contains("15 min");
+
+                if is_15m_market {
+                    // CRITICAL: 15-minute candles MUST expire at basically the exact same time (within 2 mins)
+                    // Otherwise a 14:00 candle might match with a 14:15 candle and result in naked exposure.
+                    if exp_diff_secs > 120 { continue; }
+                } else {
+                    // Standard generic markets (e.g. politics, yearly price targets)
+                    if exp_diff_secs > 48 * 3600 { continue; }
+                }
 
                 // 2. Token Overlap Jaccard Similarity
                 let tokens_a: std::collections::HashSet<&str> = pm.question_normalized.split_whitespace().collect();
@@ -131,6 +140,24 @@ impl MarketDiscovery {
 
                 // 30% overlap is the mathematical sweet spot for matching financial shorthand
                 if sim >= 0.3 {
+                    // CRITICAL FIX: Extract numerical targets to prevent mismatched strikes (e.g. $60k vs $70k)
+                    let nums_pm: Vec<f64> = pm.question_normalized.split_whitespace()
+                        .filter_map(|w| w.replace("$", "").replace(",", "").parse::<f64>().ok())
+                        .collect();
+                    let nums_km: Vec<f64> = km.question_normalized.split_whitespace()
+                        .filter_map(|w| w.replace("$", "").replace(",", "").parse::<f64>().ok())
+                        .collect();
+
+                    if nums_pm != nums_km && (!nums_pm.is_empty() || !nums_km.is_empty()) {
+                        tracing::warn!(
+                            pm_question = %pm.question,
+                            km_question = %km.question,
+                            pm_nums = ?nums_pm,
+                            km_nums = ?nums_km,
+                            "DIFFERENT NUMERICAL TARGETS in fuzzy match — verify manually before activating"
+                        );
+                    }
+
                     let unified_id = compute_unified_market_id(
                         &pm.question,
                         "cross_platform",
@@ -178,21 +205,48 @@ impl MarketDiscovery {
     }
 
 
-    fn normalize_question(q: &str) -> String {
+fn normalize_question(q: &str) -> String {
+        // 1. Single initial allocation
         let mut lower = q.to_lowercase();
-        // Standardize common crypto/finance vocabulary for higher match accuracy
-        lower = lower.replace("bitcoin", "btc");
-        lower = lower.replace("ethereum", "eth");
-        lower = lower.replace("minutes", "min");
-        lower = lower.replace("minute", "min");
         
-        lower
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<&str>>()
-            .join(" ")
+        // 2. Fast zero-allocation lookahead: Only allocate a new string if the word actually exists
+        let replacements = [
+            ("bitcoin", "btc"),
+            ("ethereum", "eth"),
+            ("solana", "sol"),
+            ("ripple", "xrp"),
+            ("dogecoin", "doge"),
+            ("binance coin", "bnb"),
+            ("minutes", "min"),
+            ("minute", "min"),
+        ];
+
+        for (from, to) in replacements {
+            if lower.contains(from) {
+                lower = lower.replace(from, to);
+            }
+        }
+
+        // 3. Single-pass iteration to strip non-alphanumeric chars and deduplicate spaces without Vecs
+        let mut result = String::with_capacity(lower.len());
+        let mut last_was_space = true;
+
+        for c in lower.chars() {
+            if c.is_alphanumeric() {
+                result.push(c);
+                last_was_space = false;
+            } else if !last_was_space {
+                result.push(' ');
+                last_was_space = true;
+            }
+        }
+
+        // Clean up trailing space if the string ended with a special character
+        if result.ends_with(' ') {
+            result.pop();
+        }
+
+        result
     }
 
     async fn fetch_polymarket_markets(&self) -> Result<Vec<DiscoveredMarket>> {
@@ -220,19 +274,15 @@ impl MarketDiscovery {
                 if question.is_empty() {
                     continue;
                 }
-                // Navigate into the tokens array to get the actual CLOB token ID (specifically the YES token)
-                let token_id = item
-                    .get("tokens")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.get(0)) // Index 0 is the YES token
-                    .and_then(|t| t.get("token_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                // Polymarket CTF requires buying the specific NO token ID to short the market.
+                // We extract both YES (index 0) and NO (index 1) token IDs and store them as a pair.
+                let yes_token = item.get("tokens").and_then(|v| v.as_array()).and_then(|arr| arr.get(0)).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("");
+                let no_token = item.get("tokens").and_then(|v| v.as_array()).and_then(|arr| arr.get(1)).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("");
                 
-                if token_id.is_empty() || token_id.starts_with("0x") {
-                    continue; // Skip if it pulled a hex condition_id; we strictly need the decimal Token ID
+                if yes_token.is_empty() || yes_token.starts_with("0x") || no_token.is_empty() {
+                    continue; 
                 }
+                let token_id = format!("{},{}", yes_token, no_token);
                 let end_date = item
                     .get("end_date_iso")
                     .and_then(|v| v.as_str())

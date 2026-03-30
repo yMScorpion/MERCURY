@@ -8,29 +8,70 @@ pub struct ReportService {
     bot: TelegramBot,
     chat_id: String,
     rx: mpsc::Receiver<DailyReport>,
+    cmd_tx: mpsc::Sender<SystemCommand>,
 }
 
 impl ReportService {
-    pub fn new(bot: TelegramBot, chat_id: String, rx: mpsc::Receiver<DailyReport>) -> Self {
-        Self { bot, chat_id, rx }
+    pub fn new(bot: TelegramBot, chat_id: String, rx: mpsc::Receiver<DailyReport>, cmd_tx: mpsc::Sender<SystemCommand>) -> Self {
+        Self { bot, chat_id, rx, cmd_tx }
     }
 
     pub async fn run(mut self) {
-        info!("Telegram report service started");
-        while let Some(report) = self.rx.recv().await {
-            let text = format_daily_report(&report);
-            if let Err(e) = self.bot.send_message(&self.chat_id, &text).await {
-                error!(error = %e, "Failed to send daily report");
+        info!("Telegram report & command service started");
+        let mut offset = 0;
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3)); // Aggressive but safe poll
+
+        loop {
+            tokio::select! {
+                Some(report) = self.rx.recv() => {
+                    let text = format_daily_report(&report);
+                    if let Err(e) = self.bot.send_message(&self.chat_id, &text).await {
+                        error!(error = %e, "Failed to send daily report");
+                    }
+                }
+                _ = poll_interval.tick() => {
+                    if let Ok(updates) = self.bot.get_updates(offset).await {
+                        for update in updates {
+                            offset = offset.max(update.update_id + 1);
+                            if let Some(msg) = update.message {
+                                if msg.chat.id.to_string() != self.chat_id { continue; } // Restrict to authorized chat
+                                if let Some(text) = msg.text {
+                                    let txt = text.to_lowercase();
+                                    if txt == "/start" {
+                                        let _ = self.cmd_tx.send(SystemCommand::StartTrading).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{25b6}\u{fe0f} MERCURY Trading Engine: <b>RESUMED</b>").await;
+                                    } else if txt == "/stop" {
+                                        let _ = self.cmd_tx.send(SystemCommand::StopTrading).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{23f8}\u{fe0f} MERCURY Trading Engine: <b>HALTED</b>").await;
+                                    } else if txt == "/enable polymarket" {
+                                        let _ = self.cmd_tx.send(SystemCommand::EnablePlatform(Platform::Polymarket)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{2705} Polymarket routing enabled").await;
+                                    } else if txt == "/disable polymarket" {
+                                        let _ = self.cmd_tx.send(SystemCommand::DisablePlatform(Platform::Polymarket)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{274c} Polymarket routing disabled").await;
+                                    } else if txt == "/enable kalshi" {
+                                        let _ = self.cmd_tx.send(SystemCommand::EnablePlatform(Platform::Kalshi)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{2705} Kalshi routing enabled").await;
+                                    } else if txt == "/disable kalshi" {
+                                        let _ = self.cmd_tx.send(SystemCommand::DisablePlatform(Platform::Kalshi)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, "\u{274c} Kalshi routing disabled").await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        info!("Telegram report service stopped");
     }
 }
 
 fn format_daily_report(report: &DailyReport) -> String {
     let s = &report.snapshot;
-    let roi = if s.bankroll > Decimal::ZERO {
-        (s.net_pnl / s.bankroll * Decimal::from(100)).round_dp(2)
+    // CRITICAL FIX: ROI must be calculated against the STARTING bankroll, not the ending bankroll.
+    let starting_bankroll = s.bankroll - s.net_pnl;
+    let roi = if starting_bankroll > Decimal::ZERO {
+        (s.net_pnl / starting_bankroll * Decimal::from(100)).round_dp(2)
     } else {
         Decimal::ZERO
     };
@@ -140,10 +181,12 @@ fn format_daily_report(report: &DailyReport) -> String {
 }
 
 fn truncate_question(q: &str, max_len: usize) -> String {
-    let escaped = TelegramBot::escape_html(q);
-    if escaped.len() <= max_len {
-        escaped
+    let truncated = if q.len() > max_len - 3 {
+        let mut end = max_len - 3;
+        while end > 0 && !q.is_char_boundary(end) { end -= 1; }
+        format!("{}...", &q[..end])
     } else {
-        format!("{}...", &escaped[..max_len - 3])
-    }
+        q.to_string()
+    };
+    TelegramBot::escape_html(&truncated)
 }

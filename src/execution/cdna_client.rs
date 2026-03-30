@@ -49,20 +49,42 @@ impl CdnaClient {
     }
 }
 
+use crate::execution::executor::OrderAction;
+
 #[async_trait::async_trait]
 impl PlatformOrderClient for CdnaClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
-        info!(market_id, side = %side, price = %price, size = %size, "Submitting CDNA order");
-        let side_str = match side { Side::Yes => "BUY", Side::No => "SELL" };
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
+        info!(market_id, action = ?action, side = %side, price = %price, size = %size, "Submitting CDNA order");
+        
+        // CRITICAL FIX: CDNA uses a single instrument where long = YES, short = NO.
+        // To natively sell (unwind) a position, we must inverse the initial order type.
+        let side_str = match (action, side) {
+            (OrderAction::Buy, Side::Yes) => "BUY",
+            (OrderAction::Buy, Side::No) => "SELL",
+            (OrderAction::Sell, Side::Yes) => "SELL", // Dump long position
+            (OrderAction::Sell, Side::No) => "BUY",   // Cover short position
+        };
+        
+        // CRITICAL FIX: CDNA is priced exclusively in YES terms.
+        // If we are Buying NO at 0.40, we must SELL the instrument at 0.60.
+        // If we are covering a short (Selling NO aggressively at 0.01), we must BUY the instrument up to 0.99.
+        let cdna_price = match (action, side) {
+            (OrderAction::Buy, Side::Yes) => price,
+            (OrderAction::Buy, Side::No) => Decimal::ONE - price,
+            (OrderAction::Sell, Side::Yes) => price, 
+            (OrderAction::Sell, Side::No) => Decimal::ONE - price, 
+        };
+        
         let path = "/private/create-order";
         let url = format!("{}{}", self.rest_url, path);
         let body_json = serde_json::json!({
             "instrument_name": market_id,
             "side": side_str,
             "type": "LIMIT",
-            "price": price.to_string(),
+            "price": cdna_price.to_string(),
             "quantity": size.to_string(),
-            "time_in_force": "IOC",
+            // Ensure FOK so partial fills don't leave orphaned legs
+            "time_in_force": "FOK", 
         });
         let body_str = body_json.to_string();
         let auth = self.auth_headers("POST", path, &body_str)?;

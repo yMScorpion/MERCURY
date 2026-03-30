@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -56,52 +56,46 @@ impl UnwindWatchdog {
         }
 
         for (market_id, legs) in &by_market {
-            // A healthy arb has exactly 2 positions (YES on one platform, NO on another).
-            // A single leg means the hedge failed — this is an orphan.
-            if legs.len() == 1 {
-                let orphan = &legs[0];
-                let age = chrono::Utc::now() - orphan.opened_at;
+            // CRITICAL FIX: Accumulate net exposure across ALL positions.
+            // If the bot runs multiple arbs on the same market, legs.len() could be 4, 5, or 6.
+            let mut total_yes = Decimal::ZERO;
+            let mut total_no = Decimal::ZERO;
+
+            for pos in legs {
+                match pos.side {
+                    Side::Yes => total_yes += pos.quantity,
+                    Side::No => total_no += pos.quantity,
+                }
+            }
+
+            let unhedged_diff = (total_yes - total_no).abs();
+
+            if unhedged_diff > Decimal::ZERO {
+                // Find the oldest position to correctly calculate the age of the imbalance
+                let oldest = legs.iter().map(|p| p.opened_at).min().unwrap_or_else(chrono::Utc::now);
+                let age = chrono::Utc::now() - oldest;
 
                 if age.num_minutes() > 5 {
                     error!(
                         market_id = %market_id,
-                        platform = %orphan.platform,
-                        side = %orphan.side,
-                        quantity = %orphan.quantity,
+                        unhedged_quantity = %unhedged_diff,
                         age_minutes = age.num_minutes(),
-                        "ORPHANED POSITION DETECTED — unhedged for {} minutes",
+                        "ORPHANED POSITION DETECTED — {} contracts unhedged for {} minutes",
+                        unhedged_diff,
                         age.num_minutes()
                     );
 
                     let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                         severity: "critical".into(),
                         message: format!(
-                            "🚨 ORPHANED POSITION: {} {} on {} ({} contracts @ ${}) \
-                             open for {} minutes with no hedge. MANUAL CLOSE REQUIRED. \
+                            "🚨 ORPHANED POSITION IMBALANCE: {} contracts unhedged \
+                             open for {} minutes. MANUAL CLOSE REQUIRED. \
                              Market ID: {}",
-                            orphan.side,
-                            orphan.platform,
-                            orphan.platform,
-                            orphan.quantity,
-                            orphan.avg_entry_price,
+                            unhedged_diff,
                             age.num_minutes(),
                             market_id,
                         ),
                     });
-                }
-            }
-
-            // Also flag positions where both legs exist but quantities are mismatched.
-            if legs.len() == 2 {
-                let diff = (legs[0].quantity - legs[1].quantity).abs();
-                if diff > Decimal::ZERO {
-                    warn!(
-                        market_id = %market_id,
-                        leg_a_qty = %legs[0].quantity,
-                        leg_b_qty = %legs[1].quantity,
-                        "Asymmetric position pair — {} contracts unhedged",
-                        diff
-                    );
                 }
             }
         }

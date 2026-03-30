@@ -66,9 +66,11 @@ impl TelegramBot {
             }
         }
 
-        // Truncate if too long
+        // Truncate if too long, respecting UTF-8 boundaries
         let text = if text.len() > MAX_MESSAGE_LENGTH {
-            &text[..MAX_MESSAGE_LENGTH - 20]
+            let mut end = MAX_MESSAGE_LENGTH - 20;
+            while end > 0 && !text.is_char_boundary(end) { end -= 1; }
+            &text[..end]
         } else {
             text
         };
@@ -115,6 +117,23 @@ impl TelegramBot {
                     tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
                 }
             }
+        }
+    }
+
+    /// Long-poll the Telegram API to fetch new commands
+    pub async fn get_updates(&self, offset: i64) -> Result<Vec<crate::types::TelegramUpdate>> {
+        let url = format!("{}/bot{}/getUpdates?offset={}&timeout=5", 
+            TELEGRAM_API_BASE.trim_end_matches("/bot"), 
+            self.token, 
+            offset
+        );
+        let resp = self.client.get(&url).send().await?
+            .json::<crate::types::TelegramUpdatesResponse>().await?;
+        
+        if resp.ok {
+            Ok(resp.result)
+        } else {
+            Ok(vec![])
         }
     }
 

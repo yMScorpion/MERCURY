@@ -269,4 +269,17 @@ impl CircuitBreakers {
         self.consecutive_failures = 0;
         info!("Trading halt reset");
     }
+
+    /// Explicitly pause or resume trading via manual Telegram command
+    pub fn manual_halt(&mut self, halt: bool) {
+        self.trading_halted = halt;
+        if halt {
+            // Effectively permanent halt until manually restarted
+            self.halt_resume_at = Some(Utc::now() + Duration::days(365));
+            info!("System manually HALTED via Telegram command.");
+        } else {
+            self.halt_resume_at = None;
+            info!("System manually RESUMED via Telegram command.");
+        }
+    }
 }

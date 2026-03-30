@@ -357,6 +357,39 @@ pub struct PlatformDayStats {
 pub fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::ZERO)
         .as_nanos() as u64
+}
+
+// ─── System Commands (Telegram Control) ───
+
+#[derive(Debug, Clone)]
+pub enum SystemCommand {
+    StartTrading,
+    StopTrading,
+    EnablePlatform(Platform),
+    DisablePlatform(Platform),
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramUpdate {
+    pub update_id: i64,
+    pub message: Option<TelegramMessage>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramMessage {
+    pub text: Option<String>,
+    pub chat: TelegramChat,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramChat {
+    pub id: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramUpdatesResponse {
+    pub ok: bool,
+    pub result: Vec<TelegramUpdate>,
 }

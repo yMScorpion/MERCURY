@@ -55,6 +55,13 @@ impl Reconciler {
             let age = chrono::Utc::now() - pos.opened_at;
             if age.num_days() > 30 {
                 warn!(position_id = pos.id, market_id = %pos.market_id, age_days = age.num_days(), "Stale position detected");
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                    severity: "critical".into(),
+                    message: format!(
+                        "🚨 STALE POSITION: Position #{} on {} has been open for {} days. Manual resolution required. Market ID: {}",
+                        pos.id, pos.platform, age.num_days(), pos.market_id
+                    ),
+                });
             }
         }
 

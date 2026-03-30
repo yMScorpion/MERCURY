@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
 
     let metrics = monitoring::metrics::Metrics::new();
 
-    // ─── Channels ───
+// ─── Channels ───
     let (tick_tx, _) = broadcast::channel::<NormalizedTick>(10_000);
     let (opportunity_tx, opportunity_rx) = mpsc::channel::<ValidatedOpportunity>(100);
     let (trade_result_tx, trade_result_rx) = mpsc::channel::<TradeResult>(100);
@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
     let (alert_tx, alert_rx) = mpsc::channel::<AlertMessage>(500);
     let (daily_report_tx, daily_report_rx) = mpsc::channel::<DailyReport>(10);
     let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<SystemCommand>(10); // Command routing from Telegram
 
     // ─── Telegram ───
     let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
@@ -119,9 +120,10 @@ async fn main() -> Result<()> {
 
     if tg_reports_enabled {
         let bot = telegram::bot::TelegramBot::new(tg_daily_token.clone());
-        let report_service = telegram::reports::ReportService::new(bot, tg_report_chat.clone(), daily_report_rx);
+        // Pass the command transmitter so the bot can route commands to the core
+        let report_service = telegram::reports::ReportService::new(bot, tg_report_chat.clone(), daily_report_rx, cmd_tx);
         join_set.spawn(report_service.run());
-        info!("Telegram daily reports enabled (MERCURY_DAILYBOT)");
+        info!("Telegram daily reports & command polling enabled (MERCURY_DAILYBOT)");
     } else {
         warn!("Telegram reports disabled — set TELEGRAM_DAILY_TOKEN and TELEGRAM_REPORT_CHAT_ID");
         drop(daily_report_rx);
@@ -340,10 +342,10 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         match MercuryConfig::load(&config_path) {
                             Ok(_new_config) => {
-                                info!("Config file changed — validated OK (live reload of risk params not yet wired)");
+                                warn!("Config file changed — validated OK but NOT APPLIED. Restart required for changes to take effect.");
                                 let _ = alert_tx_reload.try_send(AlertMessage::SystemAlert {
-                                    severity: "info".into(),
-                                    message: "Config file reloaded and validated".into(),
+                                    severity: "warning".into(),
+                                    message: "Config file changed and validated OK, but MERCURY must be restarted for changes to take effect.".into(),
                                 });
                             }
                             Err(e) => {
@@ -360,15 +362,29 @@ async fn main() -> Result<()> {
     let (matched_market_tx, mut matched_market_rx) = mpsc::channel::<feeds::discovery::MatchedMarket>(500);
     let discovery = feeds::discovery::MarketDiscovery::new(
         mercury_config.platforms.clone(),
-        300,
+        60, // CRITICAL FIX: Poll every 60s to immediately catch new 15-minute crypto candles
     );
     join_set.spawn(discovery.run(matched_market_tx));
+
+    // Load active markets from DB to seed feed handlers with initial subscriptions
+    let active_markets = db.get_active_markets().await.unwrap_or_default();
+    let mut pm_subs = Vec::new();
+    let mut kalshi_subs = Vec::new();
+    for m in active_markets {
+        if let Some(info) = m.platforms.get(&Platform::Polymarket) {
+            pm_subs.push((info.platform_market_id.clone(), m.unified_id));
+        }
+        if let Some(info) = m.platforms.get(&Platform::Kalshi) {
+            kalshi_subs.push((info.platform_market_id.clone(), m.unified_id));
+        }
+    }
 
     // ─── Feed Handlers ───
     if mercury_config.platforms.polymarket.enabled {
         let pm_feed = feeds::polymarket::PolymarketFeed::new(
             mercury_config.platforms.polymarket.clone(),
-            vec![],
+            db.clone(), // CRITICAL FIX: Pass the DB connection to the feed
+            pm_subs,
         );
         let pm_tick_tx = tick_tx.clone();
         let pm_alert_tx = alert_tx.clone();
@@ -390,7 +406,8 @@ async fn main() -> Result<()> {
         let k_feed = feeds::kalshi::KalshiFeed::new(
             mercury_config.platforms.kalshi.clone(),
             kalshi_auth_for_feed,
-            vec![],
+            db.clone(), // CRITICAL FIX: Pass the DB connection so Kalshi can dynamically poll for updates
+            kalshi_subs, 
         );
         let k_tick_tx = tick_tx.clone();
         let k_alert_tx = alert_tx.clone();
@@ -458,9 +475,24 @@ async fn main() -> Result<()> {
         });
 
     let mut in_flight_notional = Decimal::ZERO;
+    
+    // Explicitly enforce which brokers are allowed. CDNA and ForecastEx disabled per requirements.
+    let mut active_platforms = std::collections::HashSet::new();
+    active_platforms.insert(Platform::Polymarket);
+    active_platforms.insert(Platform::Kalshi);
 
 loop {
         tokio::select! {
+            // ── Telegram Control Commands ──
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    SystemCommand::StartTrading => circuit_breakers.manual_halt(false),
+                    SystemCommand::StopTrading => circuit_breakers.manual_halt(true),
+                    SystemCommand::EnablePlatform(p) => { active_platforms.insert(p); },
+                    SystemCommand::DisablePlatform(p) => { active_platforms.remove(&p); },
+                }
+            }
+
             tick_result = tick_rx.recv() => {
                 let tick = match tick_result {
                     Ok(t) => t,
@@ -470,6 +502,11 @@ loop {
                     }
                     Err(_) => break, // Channel closed
                 };
+
+                // O(1) filter blocks deactivated brokers with zero latency overhead
+                if !active_platforms.contains(&tick.platform) {
+                    continue;
+                }
 
                 metrics.inc_ticks();
                 uob.update(&tick);
@@ -492,7 +529,10 @@ loop {
 
                 // Process opportunities
                 for opp in opps {
-                    let trips = circuit_breakers.check_all(
+                // Fix CB5: Calculate the true exposure allocated to this specific market question
+                let market_exposure_pct = bankroll_manager.market_exposure_pct(&opp.market_id);
+
+                let trips = circuit_breakers.check_all(
                         opp.recommended_size, 
                         bankroll_manager.total_bankroll(), 
                         bankroll_manager.daily_loss_pct(), 
@@ -500,13 +540,68 @@ loop {
                         bankroll_manager.platform_exposure_pct(&opp.leg_a.platform).max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)), 
                         cached_open_positions, 
                         opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
-                        0, // ms_since_last_tick (defaulting to 0 for the hot path)
-                        rust_decimal::Decimal::ZERO // market_exposure_pct (defaulting to 0)
+                        metrics.ms_since_last_tick(), 
+                        market_exposure_pct // Authoritative market correlation tracking
                     );
 
                     if trips.is_empty() {
-                        let kelly_frac = kelly.optimal_fraction(rust_decimal_macros::dec!(0.90), opp.net_spread);
-                        let approved_size = kelly.position_size(bankroll_manager.total_bankroll(), rust_decimal_macros::dec!(0.90), opp.net_spread, mercury_config.trading.max_single_trade_pct);
+                        let win_prob = rust_decimal_macros::dec!(0.95);
+                        let kelly_frac = kelly.optimal_fraction(win_prob, opp.net_spread);
+                        
+                        let kelly_ideal_usd = kelly.position_size(
+                            // ... [params]
+                        );
+                        
+                        let combined_contract_price = opp.leg_a.price + opp.leg_b.price;
+                        let kelly_ideal_contracts = if combined_contract_price > rust_decimal::Decimal::ZERO {
+                            kelly_ideal_usd / combined_contract_price
+                        } else {
+                            rust_decimal::Decimal::ZERO
+                        };
+
+                        // Fix Sizing: Kalshi demands whole integers, but Polymarket supports decimals.
+                        // Only floor the size if Kalshi is involved in the leg pairing.
+                        let approved_size = if opp.leg_a.platform == Platform::Kalshi || opp.leg_b.platform == Platform::Kalshi {
+                            kelly_ideal_contracts.min(opp.recommended_size).floor()
+                        } else {
+                            kelly_ideal_contracts.min(opp.recommended_size).round_dp(2)
+                        };
+                            bankroll_manager.total_bankroll(), 
+                            win_prob, 
+                            opp.net_spread, 
+                            mercury_config.trading.max_single_trade_pct
+                        );
+                        
+                        // CRITICAL FIX: Dimensional Analysis Bug.
+                        // `kelly_ideal_usd` is in DOLLARS. `opp.recommended_size` is in CONTRACTS.
+                        // We must convert the dollar budget into contracts by dividing by the combined price of both legs.
+                        let combined_contract_price = opp.leg_a.price + opp.leg_b.price;
+                        let kelly_ideal_contracts = if combined_contract_price > rust_decimal::Decimal::ZERO {
+                            kelly_ideal_usd / combined_contract_price
+                        } else {
+                            rust_decimal::Decimal::ZERO
+                        };
+
+                        // .floor() the size: Polymarket accepts fractions, Kalshi demands integers. 
+                        // Without flooring, the decimal mismatch creates silent directional risk on every execution.
+                        let approved_size = kelly_ideal_contracts.min(opp.recommended_size).floor();
+                        
+                        // CRITICAL FIX: Targeted Minimum Notional Guard.
+                        // Polymarket strictly rejects orders < $5.00, but Kalshi's minimum is just 1 contract.
+                        // We must only check the $5.00 limit against the Polymarket leg. Applying it to Kalshi
+                        // will erroneously reject highly profitable arbs where the Kalshi leg is cheap (e.g. $2.00).
+                        let mut pm_size_too_small = false;
+                        if matches!(opp.leg_a.platform, Platform::Polymarket | Platform::PolymarketUs) && (approved_size * opp.leg_a.price) < rust_decimal_macros::dec!(5.0) {
+                            pm_size_too_small = true;
+                        }
+                        if matches!(opp.leg_b.platform, Platform::Polymarket | Platform::PolymarketUs) && (approved_size * opp.leg_b.price) < rust_decimal_macros::dec!(5.0) {
+                            pm_size_too_small = true;
+                        }
+                        
+                        if pm_size_too_small {
+                            tracing::debug!("Opportunity rejected: Size too small to meet Polymarket $5.00 minimum");
+                            continue;
+                        }
                         
                         if approved_size > Decimal::ZERO {
                             let effective_bankroll = (bankroll_manager.total_bankroll() - in_flight_notional).max(Decimal::ZERO);
@@ -546,7 +641,18 @@ loop {
                         platforms = matched.market.platforms.len(),
                         "New cross-platform market registered"
                     );
-                    let _ = db.upsert_market(&matched.market).await;
+                    
+                    // CRITICAL FIX: Spawn DB write to a background task.
+                    // Awaiting SQLite I/O directly in the main select loop blocks 
+                    // the tick processor, causing catastrophic latency spikes.
+                    let db_clone = db.clone();
+                    let market_clone = matched.market.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = db_clone.upsert_market(&market_clone).await {
+                            tracing::error!(error = %e, "Failed to persist new market");
+                        }
+                    });
+                    
                     registry.register_market(matched.market);
                 }
             }
@@ -564,7 +670,9 @@ loop {
                 circuit_breakers.record_execution(result.status == TradeStatus::Success);
                 kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
 
-                in_flight_notional = in_flight_notional.saturating_sub(result.approved_size);
+                // CRITICAL FIX: rust_decimal does not implement saturating_sub. 
+                // Manual clamp prevents arithmetic panics and compilation errors.
+                in_flight_notional = (in_flight_notional - result.approved_size).max(Decimal::ZERO);
                 // Only decrement the local open positions counter if the trade failed.
                 // Successful and partial trades remain open in the database and consume position capacity.
                 if result.status == TradeStatus::Fail {

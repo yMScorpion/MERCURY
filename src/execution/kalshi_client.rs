@@ -28,6 +28,10 @@ struct KalshiOrderRequest {
     yes_price: Option<i64>,
     no_price: Option<i64>,
     expiration_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_in_force: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -67,13 +71,19 @@ impl KalshiClient {
     }
 }
 
+use crate::execution::executor::OrderAction;
+
 #[async_trait::async_trait]
 impl PlatformOrderClient for KalshiClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
         // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
 
         // Avoid string parsing panics by directly safely converting rounded decimals
-        let price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
+        let mut price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
+        
+        // CRITICAL FIX: Kalshi explicitly rejects prices of 0 or 100.
+        price_cents = price_cents.clamp(1, 99);
+        
         let count = size.round().to_i64().unwrap_or(1);
 
         let (kalshi_side, yes_price, no_price) = match side {
@@ -81,20 +91,28 @@ impl PlatformOrderClient for KalshiClient {
             Side::No => ("no".to_string(), None, Some(price_cents)),
         };
 
-        info!(ticker = market_id, side = %kalshi_side, price_cents, count, "Submitting Kalshi order");
+        let kalshi_action = match action {
+            OrderAction::Buy => "buy".to_string(),
+            OrderAction::Sell => "sell".to_string(),
+        };
+
+        info!(ticker = market_id, action = %kalshi_action, side = %kalshi_side, price_cents, count, "Submitting Kalshi order");
 
         let url = format!("{}/portfolio/orders", self.rest_url);
         let auth_header = self.auth.auth_header().await?;
 
         let req = KalshiOrderRequest {
             ticker: market_id.to_string(),
-            action: "buy".to_string(),
+            action: kalshi_action,
             side: kalshi_side,
             order_type: "limit".to_string(),
             count,
             yes_price,
             no_price,
             expiration_ts: None,
+            client_order_id: None,
+            // CRITICAL FIX: Ensure the order is Fill-or-Kill so it doesn't rest on the book
+            time_in_force: Some("fok".to_string()), 
         };
 
         let resp = self.http

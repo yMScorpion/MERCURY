@@ -74,14 +74,14 @@ fn dec_to_string(d: &Decimal) -> String {
     d.to_string()
 }
 
-fn platform_from_db(s: &str) -> Platform {
+fn platform_from_db(s: &str) -> Result<Platform> {
     match s {
-        "Polymarket" => Platform::Polymarket,
-        "Polymarket US" => Platform::PolymarketUs,
-        "Kalshi" => Platform::Kalshi,
-        "CDNA" => Platform::Cdna,
-        "ForecastEx" => Platform::ForecastEx,
-        _ => Platform::Polymarket,
+        "Polymarket" => Ok(Platform::Polymarket),
+        "Polymarket US" => Ok(Platform::PolymarketUs),
+        "Kalshi" => Ok(Platform::Kalshi),
+        "CDNA" => Ok(Platform::Cdna),
+        "ForecastEx" => Ok(Platform::ForecastEx),
+        _ => Err(anyhow::anyhow!("Unknown platform string in DB: {}", s)),
     }
 }
 
@@ -453,12 +453,14 @@ impl Database for SqliteDb {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || -> Result<usize> {
             let conn = pool.get().context("failed to get db connection")?;
+            // Fix: We must count the total number of legs and divide by 2 to get the active arb count.
+            // DISTINCT market_id masks when we hold 2 or 3 arbs on the same underlying market.
             let count: i64 = conn.query_row(
-                "SELECT COUNT(DISTINCT market_id) FROM positions WHERE closed = 0",
+                "SELECT COUNT(*) FROM positions WHERE closed = 0",
                 [],
                 |r| r.get(0),
             )?;
-            Ok(count as usize)
+            Ok((count / 2) as usize)
         })
         .await
         .context("get_open_arb_count db task panicked")?

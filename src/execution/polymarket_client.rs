@@ -71,79 +71,59 @@ impl PolymarketClient {
             api_passphrase,
         }
     }
-    /// Poll the order status endpoint to get actual fill details.
-    /// Returns (actual_fill_price, actual_fill_size, fee) if filled.
-    async fn poll_fill(&self, order_id: &str) -> Option<(Decimal, Decimal, Decimal)> {
-        let url = format!("{}/order/{}", self.rest_url, order_id);
-        for attempt in 0..3 {
-            tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
-            let resp = match self.http
-                .get(&url)
-                .header("POLY_API_KEY", &self.api_key)
-                .header("POLY_SECRET", &self.api_secret)
-                .header("POLY_PASSPHRASE", &self.api_passphrase)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let body: serde_json::Value = match resp.json().await {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
-            if status == "FILLED" || status == "CLOSED" {
-                let avg_price = body.get("average_price")
-                    .or_else(|| body.get("price"))
-                    .and_then(|p| p.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok());
-                let filled_size = body.get("size_filled")
-                    .or_else(|| body.get("original_size"))
-                    .and_then(|s| s.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok());
-                let fee = body.get("fee")
-                    .and_then(|f| f.as_str())
-                    .and_then(|s| s.parse::<Decimal>().ok())
-                    .unwrap_or(Decimal::ZERO);
-                if let (Some(price), Some(size)) = (avg_price, filled_size) {
-                    return Some((price, size, fee));
-                }
-            }
-        }
-        None
-    }
 }
+
+use crate::execution::executor::OrderAction;
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for PolymarketClient {
-    async fn submit_order(&self, market_id: &str, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
-        let side_str = match side { Side::Yes => "BUY", Side::No => "SELL" };
-        let side_u8: u8 = match side { Side::Yes => 0, Side::No => 1 };
-        info!(market_id, side = side_str, price = %price, size = %size, fee_rate_bps, "Submitting Polymarket order");
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
+        // CRITICAL FIX: Polymarket CTF does not support naked short selling. To bet NO, we must trade 
+        // the specific NO token ID. We parse the dual-token string provided by discovery.
+        let tokens: Vec<&str> = market_id.split(',').collect();
+        let target_token_id = if side == Side::Yes { tokens[0] } else { tokens.get(1).unwrap_or(&tokens[0]) };
+        
+        let (side_str, side_u8) = match action {
+            OrderAction::Buy => ("BUY", 0u8),
+            OrderAction::Sell => ("SELL", 1u8),
+        };
+        
+        info!(target_token_id, action = side_str, side = ?side, price = %price, size = %size, fee_rate_bps, "Submitting Polymarket order");
 
-        // Scale to USDC/outcome-token base units (6 decimals)
         let scale = Decimal::from(1_000_000u64);
         
-        // Ensure maker/taker amounts invert correctly for SELL orders
-        let (maker_amount_scaled, taker_amount_scaled) = if side == Side::Yes {
-            ((size * price * scale).floor(), (size * scale).floor())
-        } else {
-            ((size * scale).floor(), (size * price * scale).floor())
+        // CRITICAL FIX: The `price` passed from the spread engine and unwind watchdog is 
+        // already native to the specific Token ID we are trading. Do not invert it again.
+        let pm_price = price;
+
+        let (maker_amount_scaled, taker_amount_scaled) = match action {
+            OrderAction::Buy => {
+                // Buying: Maker gives USDC (price * size), Taker gets Tokens (size)
+                ((size * pm_price * scale).floor(), (size * scale).floor())
+            }
+            OrderAction::Sell => {
+                // Selling: Maker gives Tokens (size), Taker gets USDC (price * size)
+                ((size * scale).floor(), (size * pm_price * scale).floor())
+            }
         };
 
         let maker_amount_u256 = U256::from_dec_str(&maker_amount_scaled.to_string()).unwrap_or(U256::zero());
         let taker_amount_u256 = U256::from_dec_str(&taker_amount_scaled.to_string()).unwrap_or(U256::zero());
         
-        let token_id_u256 = U256::from_dec_str(market_id)
-            .map_err(|_| anyhow::anyhow!("Invalid Polymarket token ID: {}", market_id))?;
+        // CRITICAL FIX: We must parse the specific `target_token_id` (e.g. "12345") 
+        // into the EIP-712 signature, not the raw comma-separated `market_id` string.
+        let token_id_u256 = U256::from_dec_str(target_token_id)
+            .map_err(|_| anyhow::anyhow!("Invalid Polymarket token ID: {}", target_token_id))?;
 
         let fee_rate_bps_u256 = U256::from(fee_rate_bps);
 
         let now = chrono::Utc::now();
         let nonce_val = now.timestamp_nanos_opt().unwrap_or(0) as u64;
         let nonce = U256::from(nonce_val);
-        let expiration_u256 = U256::from((now.timestamp() + 300) as u64);
+        
+        // Fix: 5 minutes is dangerously long for an HFT signature. 
+        // 30 seconds caps our risk of resting order sniping on network lag.
+        let expiration_u256 = U256::from((now.timestamp() + 30) as u64);
 
         let maker_addr = self.signer.address();
 
@@ -162,7 +142,8 @@ impl PlatformOrderClient for PolymarketClient {
         let taker_str = taker_amount_scaled.to_u64().unwrap_or(0).to_string();
 
         let payload = OrderPayload {
-            token_id: market_id.to_string(),
+            // CRITICAL FIX: Use the specific YES or NO target_token_id instead of the raw market_id pair
+            token_id: target_token_id.to_string(),
             maker_amount: maker_str,
             taker_amount: taker_str,
             side: side_str.to_string(),
@@ -171,7 +152,10 @@ impl PlatformOrderClient for PolymarketClient {
             expiration: expiration_u256.to_string(),
             signature,
             signature_type: 0,
-            order_type: "IOC".to_string(),
+            // CRITICAL FIX: 'IOC' permits partial fills. Because the fast-path assumes 100% execution,
+            // a 50% partial fill leaves you 50% unhedged without triggering the Unwind Watchdog. 
+            // 'FOK' (Fill Or Kill) guarantees binary success/failure.
+            order_type: "FOK".to_string(),
         };
 
         let resp = self.http
@@ -196,11 +180,22 @@ impl PlatformOrderClient for PolymarketClient {
             let fill_size = taker_amount_scaled / scale;
             let estimated_fee = crate::feeds::normalizer::polymarket_fee(price, fill_size, fee_rate_bps as u16);
 
-            // Return immediately with the estimated fill details.
-            // Actual fill prices will be reconciled asynchronously by the
-            // reconciliation engine — polling here adds 1.2s latency to
-            // every execution, which is unacceptable for an HFT system.
-            let (actual_price, actual_size, actual_fee) = (price, fill_size, estimated_fee);
+            // Fix: We must query the authoritative fill price. 
+            // The reconciler does NOT do this. Falsifying fill prices breaks Kelly sizing and Bankroll.
+            let mut actual_price = price;
+            if !order_id_str.is_empty() {
+                let fetch_url = format!("{}/orders/{}", self.rest_url, order_id_str);
+                if let Ok(fetch_resp) = self.http.get(&fetch_url).send().await {
+                    if let Ok(order_data) = fetch_resp.json::<serde_json::Value>().await {
+                        if let Some(avg_price_str) = order_data.get("average_price").and_then(|v| v.as_str()) {
+                            if let Ok(parsed_price) = Decimal::from_str(avg_price_str) {
+                                actual_price = parsed_price;
+                            }
+                        }
+                    }
+                }
+            }
+
             Ok(OrderResult {
                 filled: true,
                 fill_price: actual_price,
@@ -233,8 +228,7 @@ impl PlatformOrderClient for PolymarketClient {
         if !resp.status().is_success() {
             tracing::warn!(order_id, status = %resp.status(), "Polymarket cancel returned non-2xx");
         }
-        // IOC orders are already settled; cancel is best-effort only
-        let _ = dec!(0); // suppress unused import warning
+        // FOK orders fill entirely or not at all — cancel is best-effort for edge cases
         Ok(())
     }
 }

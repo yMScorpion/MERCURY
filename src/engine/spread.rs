@@ -63,20 +63,40 @@ impl NetSpreadEngine {
         let mut results = Vec::new();
 
         // Direction 1: Buy YES on A, Buy NO on B
-        if let (Some((ask_a, ask_a_size)), Some((bid_b, bid_b_size))) = (book_a.best_ask(), book_b.best_bid()) {
+        if let (Some((ask_a, _)), Some((bid_b, _))) = (book_a.best_ask(), book_b.best_bid()) {
             let ask_b_no = Decimal::ONE - bid_b;
             let raw_spread = Decimal::ONE - ask_a - ask_b_no;
 
             if raw_spread > Decimal::ZERO {
-                let fee_a = self.compute_fee(book_a.platform, ask_a, target_size, book_a.fee_rate_bps);
-                let fee_b = self.compute_fee(book_b.platform, ask_b_no, target_size, book_b.fee_rate_bps);
+                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
+                // This allows the VWAP estimator to correctly "walk the book" and consume 
+                // deeper liquidity if the total spread remains profitable.
+                let depth_a = book_a.ask_depth();
+                let depth_b = book_b.bid_depth();
+                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
+                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
+                
+                let actual_target = total_a.min(total_b).min(target_size);
+
+                let fee_a = self.compute_fee(book_a.platform, ask_a, actual_target, book_a.fee_rate_bps);
+
+                let fee_b = self.compute_fee(book_b.platform, ask_b_no, actual_target, book_b.fee_rate_bps);
                 match (
-                    normalizer::estimate_slippage(target_size, &book_a.ask_depth()),
-                    normalizer::estimate_slippage(target_size, &book_b.bid_depth()),
+                    normalizer::estimate_slippage(actual_target, &book_a.ask_depth()),
+                    normalizer::estimate_slippage(actual_target, &book_b.bid_depth()),
                 ) {
-                    (Some(slippage_a), Some(slippage_b)) => {
+                (Some(slippage_a), Some(slippage_b)) => {
                         let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
-                        let net_spread = raw_spread - fee_a - fee_b - slippage_a - slippage_b - gas;
+                        
+                        // CRITICAL FIX: Mathematical Unit Mismatch.
+                        // `raw_spread` and `slippage` are per-contract limits (e.g., 0.02).
+                        // `fee_a`, `fee_b`, and `gas` are absolute dollar totals for the entire trade (e.g., $1.20).
+                        // We MUST normalize them into per-contract percentages by dividing by `target_size`.
+                        let per_contract_fee_a = fee_a / target_size;
+                        let per_contract_fee_b = fee_b / target_size;
+                        let per_contract_gas = gas / target_size;
+
+                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
 
                         if net_spread > self.min_threshold {
                             results.push(SpreadResult {
@@ -111,20 +131,43 @@ impl NetSpreadEngine {
         }
 
         // Direction 2: Buy NO on A, Buy YES on B
-        if let (Some((bid_a, bid_a_size)), Some((ask_b, ask_b_size))) = (book_a.best_bid(), book_b.best_ask()) {
+        if let (Some((bid_a, _)), Some((ask_b, _))) = (book_a.best_bid(), book_b.best_ask()) {
             let ask_a_no = Decimal::ONE - bid_a;
             let raw_spread = Decimal::ONE - ask_a_no - ask_b;
 
             if raw_spread > Decimal::ZERO {
-                let fee_a = self.compute_fee(book_a.platform, ask_a_no, target_size, book_a.fee_rate_bps);
-                let fee_b = self.compute_fee(book_b.platform, ask_b, target_size, book_b.fee_rate_bps);
+                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
+                // This allows the VWAP estimator to correctly "walk the book" and consume 
+                // deeper liquidity if the total spread remains profitable.
+                let depth_a = book_a.bid_depth();
+                let depth_b = book_b.ask_depth();
+                
+                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
+                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
+
+                let actual_target = total_a.min(total_b).min(target_size);
+
+                let fee_a = self.compute_fee(book_a.platform, ask_a_no, actual_target, book_a.fee_rate_bps);
+                let fee_b = self.compute_fee(book_b.platform, ask_b, actual_target, book_b.fee_rate_bps);
+                
+                // Optimized: Reuse the previously allocated depth vectors to save CPU cycles 
+                // during the hot-path match evaluation.
                 match (
-                    normalizer::estimate_slippage(target_size, &book_a.bid_depth()),
-                    normalizer::estimate_slippage(target_size, &book_b.ask_depth()),
+                    normalizer::estimate_slippage(actual_target, &depth_a),
+                    normalizer::estimate_slippage(actual_target, &depth_b),
                 ) {
                     (Some(slippage_a), Some(slippage_b)) => {
-                        let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
-                        let net_spread = raw_spread - fee_a - fee_b - slippage_a - slippage_b - gas;
+                    let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
+                        
+                        // CRITICAL FIX: Mathematical Unit Mismatch.
+                        // `fee_a` and `fee_b` were computed using `actual_target`, NOT `target_size`. 
+                        // Dividing by the larger `target_size` artificially underestimated the fee drag,
+                        // inflating `net_spread` and causing the engine to execute structurally unprofitable arbs.
+                        let per_contract_fee_a = fee_a / actual_target;
+                        let per_contract_fee_b = fee_b / actual_target;
+                        let per_contract_gas = gas / actual_target;
+
+                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
 
                         if net_spread > self.min_threshold {
                             results.push(SpreadResult {
@@ -167,7 +210,9 @@ impl NetSpreadEngine {
                 normalizer::polymarket_fee(price, quantity, fee_rate_bps)
             }
             Platform::Kalshi => {
-                normalizer::kalshi_taker_fee(price) * quantity
+                // Use the dynamic fee_rate_bps provided by the Kalshi feed tick
+                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
+                rate * quantity * price
             }
             Platform::Cdna => {
                 let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);

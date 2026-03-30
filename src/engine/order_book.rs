@@ -126,11 +126,4 @@ impl UnifiedOrderBook {
     pub fn get_book(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformBook> {
         self.books.get(&(*market_id, *platform))
     }
-
-    pub fn get_market_books(&self, market_id: &Uuid) -> Vec<&PlatformBook> {
-        self.books.iter()
-            .filter(|((mid, _), _)| mid == market_id)
-            .map(|(_, book)| book)
-            .collect()
-    }
 }

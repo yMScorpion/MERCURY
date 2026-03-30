@@ -20,7 +20,8 @@ use std::sync::Arc;
 pub struct KalshiFeed {
     config: KalshiConfig,
     auth: Option<Arc<KalshiAuth>>,
-    subscriptions: Vec<(String, Uuid)>,
+    db: std::sync::Arc<dyn crate::db::Database>,
+    subscriptions: std::collections::HashMap<String, Uuid>,
     books: std::collections::HashMap<String, KalshiOrderBook>,
     sequence: u64,
 }
@@ -29,11 +30,12 @@ struct KalshiOrderBook {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
     last_seq: u64,
+    is_initialized: bool,
 }
 
 impl KalshiOrderBook {
     fn new() -> Self {
-        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_seq: 0 }
+        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_seq: 0, is_initialized: false }
     }
 
     /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
@@ -103,11 +105,21 @@ struct KalshiSubParams {
 }
 
 impl KalshiFeed {
-    pub fn new(config: KalshiConfig, auth: Option<KalshiAuth>, subscriptions: Vec<(String, Uuid)>) -> Self {
+    pub fn new(
+        config: KalshiConfig,
+        auth: Option<KalshiAuth>,
+        db: std::sync::Arc<dyn crate::db::Database>,
+        subscriptions: Vec<(String, Uuid)>
+    ) -> Self {
+        let mut subs_map = std::collections::HashMap::new();
+        for (ticker, market_id) in subscriptions {
+            subs_map.insert(ticker, market_id);
+        }
         Self {
             config,
             auth: auth.map(Arc::new),
-            subscriptions,
+            db,
+            subscriptions: subs_map,
             books: std::collections::HashMap::new(),
             sequence: 0,
         }
@@ -115,10 +127,10 @@ impl KalshiFeed {
 
     fn ticker_to_market_id(&self, ticker: &str) -> Option<Uuid> {
         self.subscriptions.iter()
-            .find(|(t, _)| t == ticker)
+            // CRITICAL FIX: Explicitly extract the string slice for comparison
+            .find(|(t, _)| t.as_str() == ticker)
             .map(|(_, id)| *id)
     }
-
     fn emit_tick(&self, ticker: &str) -> Option<NormalizedTick> {
         let market_id = self.ticker_to_market_id(ticker)?;
         let book = self.books.get(ticker)?;
@@ -131,7 +143,9 @@ impl KalshiFeed {
         let fee_per_contract = dec!(0.07) * mid * (Decimal::ONE - mid);
         let fee_bps = if mid > Decimal::ZERO {
             let bps = (fee_per_contract / mid) * Decimal::from(10000);
-            bps.try_into().unwrap_or(175u16)
+            // CRITICAL FIX: Decimal to u16 conversion fails if there is any fractional remainder.
+            // We must round the BPS first, otherwise it will constantly default to 175.
+            bps.round().try_into().unwrap_or(175u16)
         } else {
             175
         };
@@ -164,6 +178,9 @@ impl FeedHandler for KalshiFeed {
         for book in self.books.values_mut() {
             book.bids.clear();
             book.asks.clear();
+            book.last_seq = 0;
+            // Fix: Mark book as uninitialized to reject all deltas until snapshot arrives
+            book.is_initialized = false;
         }
     }
 
@@ -204,7 +221,7 @@ impl FeedHandler for KalshiFeed {
 
         let (mut write, mut read) = ws_stream.split();
 
-        let tickers: Vec<String> = self.subscriptions.iter().map(|(t, _)| t.clone()).collect();
+        let tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
         if !tickers.is_empty() {
             let sub = KalshiSubscribe {
                 id: 1,
@@ -223,28 +240,63 @@ impl FeedHandler for KalshiFeed {
             self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
         }
 
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Err(e) = self.handle_message(&text, &tick_tx) {
-                        warn!(error = %e, "Failed to process Kalshi message");
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+
+        loop {
+            tokio::select! {
+                msg_opt = read.next() => {
+                    let msg = match msg_opt {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    match msg {
+                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                            if let Err(e) = self.handle_message(&text, &tick_tx) {
+                                tracing::warn!(error = %e, "Failed to process Kalshi message");
+                            }
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
+                            let _ = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await;
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                            tracing::info!("Kalshi WebSocket closed");
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                        _ => {}
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    let _ = write.send(Message::Pong(data)).await;
+                _ = sync_interval.tick() => {
+                    // CRITICAL FIX: Dynamically ingest newly discovered markets to prevent Kalshi blindspots
+                    if let Ok(markets) = self.db.get_active_markets().await {
+                        let mut new_subs = Vec::new();
+                        for m in markets {
+                            if let Some(info) = m.platforms.get(&crate::types::Platform::Kalshi) {
+                                let ticker = info.platform_market_id.clone();
+                                if !self.subscriptions.contains_key(&ticker) {
+                                    self.subscriptions.insert(ticker.clone(), m.unified_id);
+                                    new_subs.push(ticker);
+                                }
+                            }
+                        }
+                        if !new_subs.is_empty() {
+                            let sub = KalshiSubscribe {
+                                id: 2,
+                                cmd: "subscribe".into(),
+                                params: KalshiSubParams {
+                                    channels: vec!["orderbook_snapshot".into(), "orderbook_delta".into()],
+                                    market_tickers: new_subs.clone(),
+                                },
+                            };
+                            if let Ok(msg_text) = serde_json::to_string(&sub) {
+                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text.into())).await;
+                                tracing::info!(count = new_subs.len(), "Dynamically subscribed to new Kalshi markets");
+                            }
+                        }
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    info!("Kalshi WebSocket closed");
-                    return Ok(());
-                }
-                Err(e) => {
-                    return Err(e).context("Kalshi WebSocket error");
-                }
-                _ => {}
             }
         }
-
-        Ok(())
     }
 }
 
@@ -310,7 +362,10 @@ impl KalshiFeed {
                         Decimal::from_str(&level[0]),
                         Decimal::from_str(&level[1]),
                     ) {
-                        book.asks.insert(p, s);
+                        // CRITICAL FIX: Kalshi sends bids for the NO token. 
+                        // A bid for NO at 0.40 is equivalent to an ask for YES at 0.60.
+                        let yes_ask_price = Decimal::ONE - p;
+                        book.asks.insert(yes_ask_price, s);
                     }
                 }
             }
@@ -332,6 +387,10 @@ impl KalshiFeed {
         let seq = data.seq.unwrap_or(0);
 
         if let Some(book) = self.books.get(ticker) {
+            // Fix: If we receive a delta before a snapshot, explicitly trigger a reconnect.
+            if !book.is_initialized {
+                return true; 
+            }
             if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
                 warn!(ticker, expected = book.last_seq + 1, got = seq,
                     "Kalshi sequence gap — reconnecting to get fresh snapshot");
@@ -355,14 +414,16 @@ impl KalshiFeed {
                     }
                 }
 
-                if let Some(ask_deltas) = &deltas.no {
+            if let Some(ask_deltas) = &deltas.no {
                     for delta in ask_deltas {
                         if let (Ok(p), Ok(s)) = (
                             Decimal::from_str(&delta[0]),
                             Decimal::from_str(&delta[1]),
                         ) {
-                            if s == Decimal::ZERO { book.asks.remove(&p); }
-                            else { book.asks.insert(p, s); }
+                            // CRITICAL FIX: Invert NO bids to YES asks
+                            let yes_ask_price = Decimal::ONE - p;
+                            if s == Decimal::ZERO { book.asks.remove(&yes_ask_price); }
+                            else { book.asks.insert(yes_ask_price, s); }
                         }
                     }
                 }

@@ -21,16 +21,6 @@ pub fn compute_unified_market_id(question: &str, resolution_source: &str, expiry
     Uuid::from_bytes(bytes)
 }
 
-/// Calculate Kalshi taker fee for a given contract price (0.01-0.99)
-pub fn kalshi_taker_fee(contract_price: Decimal) -> Decimal {
-    dec!(0.07) * contract_price * (Decimal::ONE - contract_price)
-}
-
-/// Calculate Kalshi maker fee (25% of taker fee)
-pub fn kalshi_maker_fee(contract_price: Decimal) -> Decimal {
-    kalshi_taker_fee(contract_price) * dec!(0.25)
-}
-
 /// Calculate Polymarket fee for given price and fee_rate_bps
 pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
     let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
@@ -47,8 +37,11 @@ pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> D
 /// Returns `None` when the available depth is insufficient to fill `target_size`.
 /// Returns `Some(slippage)` — the absolute VWAP deviation from best quoted price.
 pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<Decimal> {
+    // CRITICAL FIX: If target size is zero or less, we must return None.
+    // Returning Some(0) causes a fatal Divide-By-Zero panic in the spread engine 
+    // when it attempts to normalize fees (fee_a / actual_target).
     if depth.is_empty() || target_size <= Decimal::ZERO {
-        return Some(Decimal::ZERO);
+        return None; 
     }
 
     let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();
