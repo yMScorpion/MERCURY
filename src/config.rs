@@ -113,8 +113,8 @@ impl MercuryConfig {
         let t = &self.trading;
         
         // HIGH-5 FIX: Prevent zero-timeout configurations that would permanently halt trading
-        anyhow::ensure!(t.stale_data_timeout_ms >= 1000,
-            "stale_data_timeout_ms must be at least 1000ms, got {}", t.stale_data_timeout_ms);
+        anyhow::ensure!(t.stale_data_timeout_ms >= 2000,
+            "stale_data_timeout_ms must be at least 2000ms (WebSocket latency + processing), got {}", t.stale_data_timeout_ms);
         anyhow::ensure!(t.min_net_spread_threshold > Decimal::ZERO,
             "min_net_spread_threshold must be positive, got {}", t.min_net_spread_threshold);
             

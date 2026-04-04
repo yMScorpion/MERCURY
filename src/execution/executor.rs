@@ -54,7 +54,6 @@ pub struct ExecutionEngine {
     kalshi_client: Option<KalshiClient>,
     cdna_client: Option<CdnaClient>,
     forecastex_client: Option<ForecastExClient>,
-    trade_counter: i64,
     executed_opps: lru::LruCache<uuid::Uuid, ()>,
 }
 
@@ -69,7 +68,6 @@ impl ExecutionEngine {
         kalshi_client: Option<KalshiClient>,
         cdna_client: Option<CdnaClient>,
         forecastex_client: Option<ForecastExClient>,
-        initial_trade_count: i64,
     ) -> Self {
         Self {
             rx,
@@ -81,7 +79,6 @@ impl ExecutionEngine {
             kalshi_client,
             cdna_client,
             forecastex_client,
-            trade_counter: initial_trade_count,
             executed_opps: lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
         }
     }
@@ -143,8 +140,8 @@ impl ExecutionEngine {
         let current_time_ns = crate::types::now_ns();
         let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
         
-        let current_trade_id = self.trade_counter;
-        self.trade_counter += 1;
+        // Trade ID is assigned by the DB via AUTOINCREMENT. Use 0 as placeholder.
+        let current_trade_id: i64 = 0;
 
         if current_time_ns > expiration_ns {
             let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;

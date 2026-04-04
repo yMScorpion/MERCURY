@@ -21,62 +21,73 @@ pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_m
 
     loop {
         match listener.accept().await {
-            Ok((mut stream, _)) => {
-                let mut req_line = String::new();
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    let mut reader = tokio::io::BufReader::new(&mut stream);
-                    let _ = reader.read_line(&mut req_line).await;
-                    // Drain remaining headers
-                    let mut header_line = String::new();
-                    while let Ok(n) = reader.read_line(&mut header_line).await {
-                        if n <= 2 { break; }
-                        header_line.clear();
-                    }
-                }).await;
-
-                if !req_line.starts_with("GET ") {
-                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
-                    continue;
-                }
-
-                // Extract path from "GET /path HTTP/1.1"
-                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
-
-                match path {
-                    "/metrics" => {
-                        let body = render_prometheus(&metrics, stale_timeout_ms);
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                            body.len(), body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    }
-                    "/health" | "/" => {
-                        let ms_since_tick = metrics.ms_since_last_tick();
-                        let is_healthy = ms_since_tick < stale_timeout_ms
-                            || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
-
-                        let status_text = if is_healthy { "ok" } else { "degraded" };
-                        let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
-
-                        let body = format!(
-                            r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
-                            status_text,
-                            metrics.uptime_secs(),
-                            ms_since_tick,
-                        );
-                        let response = format!(
-                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                            http_status, body.len(), body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    }
-                    _ => {
-                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
-                    }
-                }
+            Ok((stream, _)) => {
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    handle_health_request(stream, &metrics, stale_timeout_ms).await;
+                });
             }
             Err(e) => error!(error = %e, "Health server accept error"),
+        }
+    }
+}
+
+async fn handle_health_request(
+    mut stream: tokio::net::TcpStream,
+    metrics: &Metrics,
+    stale_timeout_ms: u64,
+) {
+    let mut req_line = String::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut reader = tokio::io::BufReader::new(&mut stream);
+        let _ = reader.read_line(&mut req_line).await;
+        // Drain remaining headers
+        let mut header_line = String::new();
+        while let Ok(n) = reader.read_line(&mut header_line).await {
+            if n <= 2 { break; }
+            header_line.clear();
+        }
+    }).await;
+
+    if !req_line.starts_with("GET ") {
+        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+        return;
+    }
+
+    // Extract path from "GET /path HTTP/1.1"
+    let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+
+    match path {
+        "/metrics" => {
+            let body = render_prometheus(metrics, stale_timeout_ms);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+        "/health" | "/" => {
+            let ms_since_tick = metrics.ms_since_last_tick();
+            let is_healthy = ms_since_tick < stale_timeout_ms
+                || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
+
+            let status_text = if is_healthy { "ok" } else { "degraded" };
+            let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
+
+            let body = format!(
+                r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
+                status_text,
+                metrics.uptime_secs(),
+                ms_since_tick,
+            );
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                http_status, body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+        _ => {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
         }
     }
 }

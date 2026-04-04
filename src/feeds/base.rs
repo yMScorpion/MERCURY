@@ -35,10 +35,10 @@ pub async fn run_with_reconnect(
 ) {
     let platform = handler.platform();
     let mut backoff_secs = 1u64;
-    // 5 s maximum backoff — 60 s is an eternity for an HFT engine.
-    // During a 60 s blind window, resting limit orders become stale and
-    // can be sniped by other bots or filled at unfavorable prices.
-    let max_backoff = 5u64;
+    // Progressive max backoff: start with 5s, escalate to 30s after repeated failures
+    // to avoid IP bans during extended outages while staying responsive for brief glitches.
+    let mut max_backoff = 5u64;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         info!(%platform, "Connecting feed handler");
@@ -57,6 +57,8 @@ pub async fn run_with_reconnect(
                     Ok(()) => {
                         info!(%platform, "Feed handler disconnected cleanly — books cleared");
                         backoff_secs = 1;
+                        consecutive_failures = 0;
+                        max_backoff = 5;
                     }
                     Err(e) => {
                         error!(%platform, error = %e, "Feed handler error — books cleared");
@@ -84,8 +86,12 @@ pub async fn run_with_reconnect(
             _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
         }
 
-        warn!(%platform, backoff_secs, "Reconnecting after backoff");
-        // L-7 FIX: Report reconnect metrics
+        consecutive_failures += 1;
+        // After 10 consecutive failures, escalate max backoff to 30s to avoid IP bans
+        if consecutive_failures > 10 {
+            max_backoff = 30;
+        }
+        warn!(%platform, backoff_secs, consecutive_failures, "Reconnecting after backoff");
         metrics.inc_reconnects();
         backoff_secs = (backoff_secs * 2).min(max_backoff);
     }

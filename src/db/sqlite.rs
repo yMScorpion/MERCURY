@@ -651,31 +651,39 @@ impl Database for SqliteDb {
     }
 
     async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
-        // CRIT-1 FIX: Comprehensive path validation to prevent SQL injection via VACUUM INTO.
+        // Comprehensive path validation to prevent SQL injection via VACUUM INTO.
         // SQLite's VACUUM INTO does not support parameterized paths, so we must validate rigorously.
-        anyhow::ensure!(!dest_path.contains(".."), "Backup path contains directory traversal");
         anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
         anyhow::ensure!(
             dest_path.chars().all(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.')),
             "Backup path contains invalid characters: only alphanumeric, /, _, -, . allowed"
         );
-        // Block single quotes explicitly — this is the SQL injection vector for VACUUM INTO
         anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote");
-        // Block semicolons to prevent statement chaining
         anyhow::ensure!(!dest_path.contains(';'), "Backup path contains semicolon");
-        
-        // Restrict backups to known safe prefixes
-        anyhow::ensure!(
-            dest_path.starts_with("/opt/mercury/data/") 
-            || dest_path.starts_with("data/") 
-            || dest_path.starts_with("./"),
-            "Backup path must be under /opt/mercury/data/, data/, or ./, got: {}", dest_path
-        );
-        
-        // Ensure the path ends with .db to prevent writing arbitrary file extensions
         anyhow::ensure!(dest_path.ends_with(".db"), "Backup path must end with .db");
         
-        let query = format!("VACUUM INTO '{}'", dest_path);
+        // Canonicalize the path to resolve symlinks, `.`, and `..` before checking prefixes.
+        // This prevents traversal attacks like `data/./../../etc/passwd.db`.
+        let canonical = std::fs::canonicalize(
+            std::path::Path::new(dest_path).parent().unwrap_or(std::path::Path::new("."))
+        ).map_err(|e| anyhow::anyhow!("Cannot resolve backup directory: {}", e))?;
+        
+        let canonical_str = canonical.to_string_lossy();
+        anyhow::ensure!(
+            canonical_str.starts_with("/opt/mercury/data")
+            || canonical_str.starts_with("/opt/mercury/./data"),
+            "Backup path resolves outside /opt/mercury/data/: resolved to {}", canonical_str
+        );
+        
+        // Reconstruct the full path using the canonical directory + original filename
+        let filename = std::path::Path::new(dest_path)
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Backup path has no filename"))?
+            .to_string_lossy();
+        let safe_path = canonical.join(filename.as_ref());
+        let safe_path_str = safe_path.to_string_lossy();
+        
+        let query = format!("VACUUM INTO '{}'", safe_path_str);
         sqlx::query(&query).execute(&self.pool).await?;
         Ok(())
     }

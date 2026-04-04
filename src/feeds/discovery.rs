@@ -276,21 +276,58 @@ fn normalize_question(q: &str) -> String {
     }
 
     async fn fetch_polymarket_markets(&self) -> Result<Vec<DiscoveredMarket>> {
-        // Polymarket CLOB API: GET /markets
-        let url = format!("{}/markets", self.platforms_config.polymarket.rest_url);
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .query(&[("active", "true"), ("limit", "1000")])
-            .send()
-            .await
-            .context("Polymarket markets fetch failed")?
-            .json()
-            .await
-            .context("Polymarket markets parse failed")?;
-
+        let mut all_markets = Vec::new();
+        let mut cursor = String::new();
+        
+        loop {
+            let url = format!("{}/markets", self.platforms_config.polymarket.rest_url);
+            let mut query = vec![("active", "true"), ("limit", "1000")];
+            if !cursor.is_empty() {
+                query.push(("next_cursor", &cursor));
+            }
+            
+            let resp: serde_json::Value = self
+                .http
+                .get(&url)
+                .query(&query)
+                .send()
+                .await
+                .context("Polymarket markets fetch failed")?
+                .json()
+                .await
+                .context("Polymarket markets parse failed")?;
+            
+            let page_markets = self.parse_polymarket_response(&resp);
+            let page_count = page_markets.len();
+            all_markets.extend(page_markets);
+            
+            // Check for pagination cursor
+            cursor = resp.get("next_cursor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            
+            if cursor.is_empty() || page_count < 1000 {
+                break;
+            }
+            
+            // Safety: cap at 5000 markets to prevent infinite loops
+            if all_markets.len() >= 5000 {
+                tracing::warn!("Polymarket pagination capped at 5000 markets");
+                break;
+            }
+        }
+        
+        Ok(all_markets)
+    }
+    
+    fn parse_polymarket_response(&self, resp: &serde_json::Value) -> Vec<DiscoveredMarket> {
         let mut markets = Vec::new();
-        if let Some(arr) = resp.as_array() {
+        // Handle both top-level array and nested "data" array formats
+        let arr = resp.as_array()
+            .or_else(|| resp.get("data").and_then(|v| v.as_array()));
+        
+        if let Some(arr) = arr {
             for item in arr {
                 let question = item
                     .get("question")
@@ -300,6 +337,7 @@ fn normalize_question(q: &str) -> String {
                 if question.is_empty() {
                     continue;
                 }
+                
                 // Polymarket CTF requires buying the specific NO token ID to short the market.
                 // We extract both YES (index 0) and NO (index 1) token IDs and store them as a pair.
                 let yes_token = item.get("tokens").and_then(|v| v.as_array()).and_then(|arr| arr.get(0)).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("");
@@ -309,6 +347,7 @@ fn normalize_question(q: &str) -> String {
                     continue; 
                 }
                 let token_id = format!("{},{}", yes_token, no_token);
+                
                 let end_date = item
                     .get("end_date_iso")
                     .and_then(|v| v.as_str())
@@ -330,10 +369,12 @@ fn normalize_question(q: &str) -> String {
                 });
             }
         }
+        
         if markets.len() >= 1000 {
             tracing::warn!("Polymarket returned 1000 markets — results may be truncated. Consider pagination.");
         }
-        Ok(markets)
+        
+        markets
     }
 
     async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {

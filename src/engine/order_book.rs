@@ -69,6 +69,20 @@ impl PlatformBook {
             return;
         }
 
+        // Reject ticks with prices outside valid prediction market range
+        if tick.bid_price < Decimal::ZERO || tick.bid_price > Decimal::ONE
+            || tick.ask_price < Decimal::ZERO || tick.ask_price > Decimal::ONE
+        {
+            tracing::warn!(
+                platform = ?self.platform,
+                market_id = %self.market_id,
+                bid = %tick.bid_price,
+                ask = %tick.ask_price,
+                "Rejecting tick with out-of-range prices"
+            );
+            return;
+        }
+
         // Apply depth levels as incremental updates. Zero-size = remove.
         for level in tick.book_depth.iter() {
             if level.size == Decimal::ZERO {

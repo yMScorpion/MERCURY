@@ -208,9 +208,9 @@ impl NetSpreadEngine {
                 normalizer::polymarket_fee(price, quantity, fee_rate_bps)
             }
             Platform::Kalshi => {
-                // Use the dynamic fee_rate_bps provided by the Kalshi feed tick
-                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-                rate * quantity * price
+                // Delegate to the centralized normalizer to ensure consistency
+                // between spread estimation and execution fill accounting.
+                normalizer::kalshi_fee(price, quantity)
             }
             Platform::Cdna => {
                 let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);

@@ -324,8 +324,8 @@ impl KalshiFeed {
             }
             "orderbook_delta" => {
                 if let Some(data) = msg.msg {
-                    if self.handle_orderbook_delta(&data, tick_tx) {
-                        return Err(anyhow::anyhow!("Sequence gap — reconnecting for fresh snapshot"));
+                    if let Err(reason) = self.handle_orderbook_delta(&data, tick_tx) {
+                        return Err(anyhow::anyhow!("Kalshi reconnect: {}", reason));
                     }
                 }
             }
@@ -391,19 +391,19 @@ impl KalshiFeed {
         &mut self,
         data: &KalshiMsgPayload,
         tick_tx: &broadcast::Sender<NormalizedTick>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         let ticker = &data.market_ticker;
         let seq = data.seq.unwrap_or(0);
 
         if let Some(book) = self.books.get(ticker) {
             // Fix: If we receive a delta before a snapshot, explicitly trigger a reconnect.
             if !book.is_initialized {
-                return true; 
+                return Err("Delta received before snapshot — reconnect needed");
             }
             if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
                 warn!(ticker, expected = book.last_seq + 1, got = seq,
                     "Kalshi sequence gap — reconnecting to get fresh snapshot");
-                return true; // signal caller to reconnect
+                return Err("Sequence gap detected");
             }
         }
 
@@ -445,6 +445,6 @@ impl KalshiFeed {
             }
         }
 
-        false // no reconnect needed
+        Ok(())
     }
 }

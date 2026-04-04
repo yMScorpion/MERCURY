@@ -12,6 +12,20 @@ pub struct BreakerTrip {
     pub resume_at: Option<DateTime<Utc>>,
 }
 
+/// Parameters for circuit breaker evaluation. Bundles the 9 separate arguments
+/// into a single struct for readability and future extensibility.
+pub struct CheckParams {
+    pub trade_size: Decimal,
+    pub bankroll: Decimal,
+    pub daily_loss_pct: Decimal,
+    pub drawdown_pct: Decimal,
+    pub platform_exposure_pct: Decimal,
+    pub open_positions: usize,
+    pub involves_polymarket: bool,
+    pub ms_since_last_tick: u64,
+    pub market_exposure_pct: Decimal,
+}
+
 pub struct CircuitBreakers {
     max_single_trade_pct: Decimal,
     max_daily_loss_pct: Decimal,
@@ -124,34 +138,12 @@ impl CircuitBreakers {
     }
 
     /// Run all circuit breaker checks.
-    ///
-    /// # Parameters
-    /// - `trade_size`: notional value of the proposed trade
-    /// - `bankroll`: total capital
-    /// - `daily_loss_pct`: percent-scale (0–100)
-    /// - `drawdown_pct`: percent-scale (0–100)
-    /// - `platform_exposure_pct`: fraction-scale (0–1)
-    /// - `open_positions`: current number of open arb pairs
-    /// - `involves_polymarket`: whether trade touches Polymarket
-    /// - `ms_since_last_tick`: milliseconds since last feed tick (for CB9)
-    /// - `market_exposure_pct`: fraction of bankroll already on this specific market (for CB5)
-    pub fn check_all(
-        &mut self,
-        trade_size: Decimal,
-        bankroll: Decimal,
-        daily_loss_pct: Decimal,
-        drawdown_pct: Decimal,
-        platform_exposure_pct: Decimal,
-        open_positions: usize,
-        involves_polymarket: bool,
-        ms_since_last_tick: u64,
-        market_exposure_pct: Decimal,
-    ) -> Vec<BreakerTrip> {
+    pub fn check_all(&mut self, p: &CheckParams) -> Vec<BreakerTrip> {
         let mut trips = Vec::new();
 
         // CB1: Max Single Trade Size
-        if bankroll > Decimal::ZERO {
-            let trade_pct = trade_size / bankroll;
+        if p.bankroll > Decimal::ZERO {
+            let trade_pct = p.trade_size / p.bankroll;
             if trade_pct > self.max_single_trade_pct {
                 trips.push(BreakerTrip {
                     breaker_type: "CB1: Max Single Trade Size".into(),
@@ -165,18 +157,15 @@ impl CircuitBreakers {
         }
 
         // CB2: Max Daily Loss
-        // CB2: Max Daily Loss
-        // daily_loss_pct is on percent-scale (0–100), max_daily_loss_pct is fraction-scale (0–1).
-        // Convert max to percent-scale for consistent comparison.
         let max_daily_loss_percent = self.max_daily_loss_pct * Decimal::from(100);
-        if daily_loss_pct > max_daily_loss_percent {
+        if p.daily_loss_pct > max_daily_loss_percent {
             let resume = Utc::now() + Duration::hours(24);
             self.trading_halted = true;
             self.halt_resume_at = Some(resume);
             trips.push(BreakerTrip {
                 breaker_type: "CB2: Max Daily Loss".into(),
-                    details: format!("Daily loss {:.2}% exceeds {:.2}% limit",
-                    daily_loss_pct, max_daily_loss_percent),
+                details: format!("Daily loss {:.2}% exceeds {:.2}% limit",
+                    p.daily_loss_pct, max_daily_loss_percent),
                 action: "Trading halted for 24h".into(),
                 resume_at: Some(resume),
             });
@@ -184,22 +173,22 @@ impl CircuitBreakers {
 
         // CB3: Max Drawdown from Peak
         let max_drawdown_percent = self.max_drawdown_pct * Decimal::from(100);
-        if drawdown_pct > max_drawdown_percent {
+        if p.drawdown_pct > max_drawdown_percent {
             trips.push(BreakerTrip {
                 breaker_type: "CB3: Max Drawdown".into(),
                 details: format!("Drawdown {:.2}% exceeds {:.2}% limit",
-                    drawdown_pct, max_drawdown_percent),
+                    p.drawdown_pct, max_drawdown_percent),
                 action: "Reduce Kelly fraction to 0.10, alert".into(),
                 resume_at: None,
             });
         }
 
         // CB4: Max Platform Exposure
-        if platform_exposure_pct > self.max_platform_exposure_pct {
+        if p.platform_exposure_pct > self.max_platform_exposure_pct {
             trips.push(BreakerTrip {
                 breaker_type: "CB4: Max Platform Exposure".into(),
                 details: format!("Platform exposure {:.2}% exceeds {:.2}% limit",
-                    (platform_exposure_pct * Decimal::from(100)).round_dp(2),
+                    (p.platform_exposure_pct * Decimal::from(100)).round_dp(2),
                     (self.max_platform_exposure_pct * Decimal::from(100)).round_dp(2)),
                 action: "Reject new orders on overweight platform".into(),
                 resume_at: None,
@@ -207,11 +196,11 @@ impl CircuitBreakers {
         }
 
         // CB5: Max Single-Market Correlated Exposure
-        if market_exposure_pct > self.max_single_market_exposure_pct {
+        if p.market_exposure_pct > self.max_single_market_exposure_pct {
             trips.push(BreakerTrip {
                 breaker_type: "CB5: Correlated Market Exposure".into(),
                 details: format!("Market exposure {:.2}% exceeds {:.2}% limit",
-                    (market_exposure_pct * Decimal::from(100)).round_dp(2),
+                    (p.market_exposure_pct * Decimal::from(100)).round_dp(2),
                     (self.max_single_market_exposure_pct * Decimal::from(100)).round_dp(2)),
                 action: "Skip — too much capital on one question".into(),
                 resume_at: None,
@@ -250,7 +239,7 @@ impl CircuitBreakers {
         }
 
         // CB8: Gas Price Spike (Polygon)
-        if involves_polymarket && self.current_gas_gwei > self.gas_price_max_gwei {
+        if p.involves_polymarket && self.current_gas_gwei > self.gas_price_max_gwei {
             trips.push(BreakerTrip {
                 breaker_type: "CB8: Gas Price Spike".into(),
                 details: format!("Polygon gas {} gwei exceeds {} gwei limit",
@@ -263,11 +252,11 @@ impl CircuitBreakers {
         // CB9: Stale Feed Data (CRITICAL FIX 3-E)
         let uptime_ms = (Utc::now() - self.engine_start_time).num_milliseconds() as u64;
         if uptime_ms > self.stale_feed_timeout_ms {
-            if ms_since_last_tick > self.stale_feed_timeout_ms && ms_since_last_tick != u64::MAX {
+            if p.ms_since_last_tick > self.stale_feed_timeout_ms && p.ms_since_last_tick != u64::MAX {
                 trips.push(BreakerTrip {
                     breaker_type: "CB9: Stale Feed".into(),
                     details: format!("No tick received for {}ms (limit {}ms)",
-                        ms_since_last_tick, self.stale_feed_timeout_ms),
+                        p.ms_since_last_tick, self.stale_feed_timeout_ms),
                     action: "Halt trading — market data may be stale".into(),
                     resume_at: None,
                 });
@@ -275,10 +264,10 @@ impl CircuitBreakers {
         }
 
         // CB10: Max Open Positions
-        if open_positions >= self.max_open_positions {
+        if p.open_positions >= self.max_open_positions {
             trips.push(BreakerTrip {
                 breaker_type: "CB10: Max Open Positions".into(),
-                details: format!("{} positions >= {} limit", open_positions, self.max_open_positions),
+                details: format!("{} positions >= {} limit", p.open_positions, self.max_open_positions),
                 action: "Queue new opportunities until positions close".into(),
                 resume_at: None,
             });
@@ -329,17 +318,17 @@ mod tests {
         );
 
         // Trade size 600 out of 10000 bankroll is 6%, which exceeds 5% limit
-        let trips = cb.check_all(
-            dec!(600),
-            dec!(10000),
-            dec!(0),
-            dec!(0),
-            dec!(0),
-            0,
-            false,
-            100,
-            dec!(0),
-        );
+        let trips = cb.check_all(&CheckParams {
+            trade_size: dec!(600),
+            bankroll: dec!(10000),
+            daily_loss_pct: dec!(0),
+            drawdown_pct: dec!(0),
+            platform_exposure_pct: dec!(0),
+            open_positions: 0,
+            involves_polymarket: false,
+            ms_since_last_tick: 100,
+            market_exposure_pct: dec!(0),
+        });
         assert_eq!(trips.len(), 1);
         assert_eq!(trips[0].breaker_type, "CB1: Max Single Trade Size");
     }
@@ -357,18 +346,18 @@ mod tests {
         );
 
         // Platform exposure is 35% (0.35)
-        let trips = cb.check_all(
-                dec!(100),
-                dec!(10000),
-                dec!(0),
-                dec!(0),
-                dec!(0.35),
-                0,
-                false,
-                100,
-                dec!(0),
-            );
-            assert_eq!(trips.len(), 1);
-            assert_eq!(trips[0].breaker_type, "CB4: Max Platform Exposure");
-        }
+        let trips = cb.check_all(&CheckParams {
+            trade_size: dec!(100),
+            bankroll: dec!(10000),
+            daily_loss_pct: dec!(0),
+            drawdown_pct: dec!(0),
+            platform_exposure_pct: dec!(0.35),
+            open_positions: 0,
+            involves_polymarket: false,
+            ms_since_last_tick: 100,
+            market_exposure_pct: dec!(0),
+        });
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].breaker_type, "CB4: Max Platform Exposure");
     }
+}

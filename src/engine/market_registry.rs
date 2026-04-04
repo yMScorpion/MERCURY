@@ -25,6 +25,23 @@ impl MarketRegistry {
         }
     }
 
+    /// Remove markets that have expired or been resolved. Call periodically
+    /// to prevent unbounded memory growth during long-running sessions.
+    pub fn evict_stale_markets(&mut self) {
+        let now = chrono::Utc::now();
+        let stale_ids: Vec<Uuid> = self.markets.iter()
+            .filter(|(_, m)| {
+                matches!(m.status, crate::types::MarketStatus::Resolved | crate::types::MarketStatus::Expired)
+                || m.expiration < now - chrono::Duration::hours(1)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale_ids {
+            self.markets.remove(&id);
+            self.arb_pairs.remove(&id);
+        }
+    }
+
     /// Register a market. Idempotent: re-registering the same market_id updates
     /// the market definition but does not create duplicate arb pairs.
     pub fn register_market(&mut self, market: Market) {

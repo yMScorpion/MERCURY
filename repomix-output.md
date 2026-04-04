@@ -1942,6 +1942,23 @@ impl MarketRegistry {
         }
     }
 
+    /// Remove markets that have expired or been resolved. Call periodically
+    /// to prevent unbounded memory growth during long-running sessions.
+    pub fn evict_stale_markets(&mut self) {
+        let now = chrono::Utc::now();
+        let stale_ids: Vec<Uuid> = self.markets.iter()
+            .filter(|(_, m)| {
+                matches!(m.status, crate::types::MarketStatus::Resolved | crate::types::MarketStatus::Expired)
+                || m.expiration < now - chrono::Duration::hours(1)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale_ids {
+            self.markets.remove(&id);
+            self.arb_pairs.remove(&id);
+        }
+    }
+
     /// Register a market. Idempotent: re-registering the same market_id updates
     /// the market definition but does not create duplicate arb pairs.
     pub fn register_market(&mut self, market: Market) {
@@ -2070,10 +2087,10 @@ pub async fn run_with_reconnect(
 ) {
     let platform = handler.platform();
     let mut backoff_secs = 1u64;
-    // 5 s maximum backoff — 60 s is an eternity for an HFT engine.
-    // During a 60 s blind window, resting limit orders become stale and
-    // can be sniped by other bots or filled at unfavorable prices.
-    let max_backoff = 5u64;
+    // Progressive max backoff: start with 5s, escalate to 30s after repeated failures
+    // to avoid IP bans during extended outages while staying responsive for brief glitches.
+    let mut max_backoff = 5u64;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         info!(%platform, "Connecting feed handler");
@@ -2092,6 +2109,8 @@ pub async fn run_with_reconnect(
                     Ok(()) => {
                         info!(%platform, "Feed handler disconnected cleanly — books cleared");
                         backoff_secs = 1;
+                        consecutive_failures = 0;
+                        max_backoff = 5;
                     }
                     Err(e) => {
                         error!(%platform, error = %e, "Feed handler error — books cleared");
@@ -2119,8 +2138,12 @@ pub async fn run_with_reconnect(
             _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
         }
 
-        warn!(%platform, backoff_secs, "Reconnecting after backoff");
-        // L-7 FIX: Report reconnect metrics
+        consecutive_failures += 1;
+        // After 10 consecutive failures, escalate max backoff to 30s to avoid IP bans
+        if consecutive_failures > 10 {
+            max_backoff = 30;
+        }
+        warn!(%platform, backoff_secs, consecutive_failures, "Reconnecting after backoff");
         metrics.inc_reconnects();
         backoff_secs = (backoff_secs * 2).min(max_backoff);
     }
@@ -3455,62 +3478,73 @@ pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_m
 
     loop {
         match listener.accept().await {
-            Ok((mut stream, _)) => {
-                let mut req_line = String::new();
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    let mut reader = tokio::io::BufReader::new(&mut stream);
-                    let _ = reader.read_line(&mut req_line).await;
-                    // Drain remaining headers
-                    let mut header_line = String::new();
-                    while let Ok(n) = reader.read_line(&mut header_line).await {
-                        if n <= 2 { break; }
-                        header_line.clear();
-                    }
-                }).await;
-
-                if !req_line.starts_with("GET ") {
-                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
-                    continue;
-                }
-
-                // Extract path from "GET /path HTTP/1.1"
-                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
-
-                match path {
-                    "/metrics" => {
-                        let body = render_prometheus(&metrics, stale_timeout_ms);
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                            body.len(), body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    }
-                    "/health" | "/" => {
-                        let ms_since_tick = metrics.ms_since_last_tick();
-                        let is_healthy = ms_since_tick < stale_timeout_ms
-                            || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
-
-                        let status_text = if is_healthy { "ok" } else { "degraded" };
-                        let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
-
-                        let body = format!(
-                            r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
-                            status_text,
-                            metrics.uptime_secs(),
-                            ms_since_tick,
-                        );
-                        let response = format!(
-                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                            http_status, body.len(), body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    }
-                    _ => {
-                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
-                    }
-                }
+            Ok((stream, _)) => {
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    handle_health_request(stream, &metrics, stale_timeout_ms).await;
+                });
             }
             Err(e) => error!(error = %e, "Health server accept error"),
+        }
+    }
+}
+
+async fn handle_health_request(
+    mut stream: tokio::net::TcpStream,
+    metrics: &Metrics,
+    stale_timeout_ms: u64,
+) {
+    let mut req_line = String::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut reader = tokio::io::BufReader::new(&mut stream);
+        let _ = reader.read_line(&mut req_line).await;
+        // Drain remaining headers
+        let mut header_line = String::new();
+        while let Ok(n) = reader.read_line(&mut header_line).await {
+            if n <= 2 { break; }
+            header_line.clear();
+        }
+    }).await;
+
+    if !req_line.starts_with("GET ") {
+        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+        return;
+    }
+
+    // Extract path from "GET /path HTTP/1.1"
+    let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+
+    match path {
+        "/metrics" => {
+            let body = render_prometheus(metrics, stale_timeout_ms);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+        "/health" | "/" => {
+            let ms_since_tick = metrics.ms_since_last_tick();
+            let is_healthy = ms_since_tick < stale_timeout_ms
+                || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
+
+            let status_text = if is_healthy { "ok" } else { "degraded" };
+            let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
+
+            let body = format!(
+                r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
+                status_text,
+                metrics.uptime_secs(),
+                ms_since_tick,
+            );
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                http_status, body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+        _ => {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
         }
     }
 }
@@ -3584,6 +3618,20 @@ pub struct BreakerTrip {
     pub details: String,
     pub action: String,
     pub resume_at: Option<DateTime<Utc>>,
+}
+
+/// Parameters for circuit breaker evaluation. Bundles the 9 separate arguments
+/// into a single struct for readability and future extensibility.
+pub struct CheckParams {
+    pub trade_size: Decimal,
+    pub bankroll: Decimal,
+    pub daily_loss_pct: Decimal,
+    pub drawdown_pct: Decimal,
+    pub platform_exposure_pct: Decimal,
+    pub open_positions: usize,
+    pub involves_polymarket: bool,
+    pub ms_since_last_tick: u64,
+    pub market_exposure_pct: Decimal,
 }
 
 pub struct CircuitBreakers {
@@ -3698,34 +3746,12 @@ impl CircuitBreakers {
     }
 
     /// Run all circuit breaker checks.
-    ///
-    /// # Parameters
-    /// - `trade_size`: notional value of the proposed trade
-    /// - `bankroll`: total capital
-    /// - `daily_loss_pct`: percent-scale (0–100)
-    /// - `drawdown_pct`: percent-scale (0–100)
-    /// - `platform_exposure_pct`: fraction-scale (0–1)
-    /// - `open_positions`: current number of open arb pairs
-    /// - `involves_polymarket`: whether trade touches Polymarket
-    /// - `ms_since_last_tick`: milliseconds since last feed tick (for CB9)
-    /// - `market_exposure_pct`: fraction of bankroll already on this specific market (for CB5)
-    pub fn check_all(
-        &mut self,
-        trade_size: Decimal,
-        bankroll: Decimal,
-        daily_loss_pct: Decimal,
-        drawdown_pct: Decimal,
-        platform_exposure_pct: Decimal,
-        open_positions: usize,
-        involves_polymarket: bool,
-        ms_since_last_tick: u64,
-        market_exposure_pct: Decimal,
-    ) -> Vec<BreakerTrip> {
+    pub fn check_all(&mut self, p: &CheckParams) -> Vec<BreakerTrip> {
         let mut trips = Vec::new();
 
         // CB1: Max Single Trade Size
-        if bankroll > Decimal::ZERO {
-            let trade_pct = trade_size / bankroll;
+        if p.bankroll > Decimal::ZERO {
+            let trade_pct = p.trade_size / p.bankroll;
             if trade_pct > self.max_single_trade_pct {
                 trips.push(BreakerTrip {
                     breaker_type: "CB1: Max Single Trade Size".into(),
@@ -3739,18 +3765,15 @@ impl CircuitBreakers {
         }
 
         // CB2: Max Daily Loss
-        // CB2: Max Daily Loss
-        // daily_loss_pct is on percent-scale (0–100), max_daily_loss_pct is fraction-scale (0–1).
-        // Convert max to percent-scale for consistent comparison.
         let max_daily_loss_percent = self.max_daily_loss_pct * Decimal::from(100);
-        if daily_loss_pct > max_daily_loss_percent {
+        if p.daily_loss_pct > max_daily_loss_percent {
             let resume = Utc::now() + Duration::hours(24);
             self.trading_halted = true;
             self.halt_resume_at = Some(resume);
             trips.push(BreakerTrip {
                 breaker_type: "CB2: Max Daily Loss".into(),
-                    details: format!("Daily loss {:.2}% exceeds {:.2}% limit",
-                    daily_loss_pct, max_daily_loss_percent),
+                details: format!("Daily loss {:.2}% exceeds {:.2}% limit",
+                    p.daily_loss_pct, max_daily_loss_percent),
                 action: "Trading halted for 24h".into(),
                 resume_at: Some(resume),
             });
@@ -3758,22 +3781,22 @@ impl CircuitBreakers {
 
         // CB3: Max Drawdown from Peak
         let max_drawdown_percent = self.max_drawdown_pct * Decimal::from(100);
-        if drawdown_pct > max_drawdown_percent {
+        if p.drawdown_pct > max_drawdown_percent {
             trips.push(BreakerTrip {
                 breaker_type: "CB3: Max Drawdown".into(),
                 details: format!("Drawdown {:.2}% exceeds {:.2}% limit",
-                    drawdown_pct, max_drawdown_percent),
+                    p.drawdown_pct, max_drawdown_percent),
                 action: "Reduce Kelly fraction to 0.10, alert".into(),
                 resume_at: None,
             });
         }
 
         // CB4: Max Platform Exposure
-        if platform_exposure_pct > self.max_platform_exposure_pct {
+        if p.platform_exposure_pct > self.max_platform_exposure_pct {
             trips.push(BreakerTrip {
                 breaker_type: "CB4: Max Platform Exposure".into(),
                 details: format!("Platform exposure {:.2}% exceeds {:.2}% limit",
-                    (platform_exposure_pct * Decimal::from(100)).round_dp(2),
+                    (p.platform_exposure_pct * Decimal::from(100)).round_dp(2),
                     (self.max_platform_exposure_pct * Decimal::from(100)).round_dp(2)),
                 action: "Reject new orders on overweight platform".into(),
                 resume_at: None,
@@ -3781,11 +3804,11 @@ impl CircuitBreakers {
         }
 
         // CB5: Max Single-Market Correlated Exposure
-        if market_exposure_pct > self.max_single_market_exposure_pct {
+        if p.market_exposure_pct > self.max_single_market_exposure_pct {
             trips.push(BreakerTrip {
                 breaker_type: "CB5: Correlated Market Exposure".into(),
                 details: format!("Market exposure {:.2}% exceeds {:.2}% limit",
-                    (market_exposure_pct * Decimal::from(100)).round_dp(2),
+                    (p.market_exposure_pct * Decimal::from(100)).round_dp(2),
                     (self.max_single_market_exposure_pct * Decimal::from(100)).round_dp(2)),
                 action: "Skip — too much capital on one question".into(),
                 resume_at: None,
@@ -3824,7 +3847,7 @@ impl CircuitBreakers {
         }
 
         // CB8: Gas Price Spike (Polygon)
-        if involves_polymarket && self.current_gas_gwei > self.gas_price_max_gwei {
+        if p.involves_polymarket && self.current_gas_gwei > self.gas_price_max_gwei {
             trips.push(BreakerTrip {
                 breaker_type: "CB8: Gas Price Spike".into(),
                 details: format!("Polygon gas {} gwei exceeds {} gwei limit",
@@ -3837,11 +3860,11 @@ impl CircuitBreakers {
         // CB9: Stale Feed Data (CRITICAL FIX 3-E)
         let uptime_ms = (Utc::now() - self.engine_start_time).num_milliseconds() as u64;
         if uptime_ms > self.stale_feed_timeout_ms {
-            if ms_since_last_tick > self.stale_feed_timeout_ms && ms_since_last_tick != u64::MAX {
+            if p.ms_since_last_tick > self.stale_feed_timeout_ms && p.ms_since_last_tick != u64::MAX {
                 trips.push(BreakerTrip {
                     breaker_type: "CB9: Stale Feed".into(),
                     details: format!("No tick received for {}ms (limit {}ms)",
-                        ms_since_last_tick, self.stale_feed_timeout_ms),
+                        p.ms_since_last_tick, self.stale_feed_timeout_ms),
                     action: "Halt trading — market data may be stale".into(),
                     resume_at: None,
                 });
@@ -3849,10 +3872,10 @@ impl CircuitBreakers {
         }
 
         // CB10: Max Open Positions
-        if open_positions >= self.max_open_positions {
+        if p.open_positions >= self.max_open_positions {
             trips.push(BreakerTrip {
                 breaker_type: "CB10: Max Open Positions".into(),
-                details: format!("{} positions >= {} limit", open_positions, self.max_open_positions),
+                details: format!("{} positions >= {} limit", p.open_positions, self.max_open_positions),
                 action: "Queue new opportunities until positions close".into(),
                 resume_at: None,
             });
@@ -3903,17 +3926,17 @@ mod tests {
         );
 
         // Trade size 600 out of 10000 bankroll is 6%, which exceeds 5% limit
-        let trips = cb.check_all(
-            dec!(600),
-            dec!(10000),
-            dec!(0),
-            dec!(0),
-            dec!(0),
-            0,
-            false,
-            100,
-            dec!(0),
-        );
+        let trips = cb.check_all(&CheckParams {
+            trade_size: dec!(600),
+            bankroll: dec!(10000),
+            daily_loss_pct: dec!(0),
+            drawdown_pct: dec!(0),
+            platform_exposure_pct: dec!(0),
+            open_positions: 0,
+            involves_polymarket: false,
+            ms_since_last_tick: 100,
+            market_exposure_pct: dec!(0),
+        });
         assert_eq!(trips.len(), 1);
         assert_eq!(trips[0].breaker_type, "CB1: Max Single Trade Size");
     }
@@ -3931,21 +3954,21 @@ mod tests {
         );
 
         // Platform exposure is 35% (0.35)
-        let trips = cb.check_all(
-                dec!(100),
-                dec!(10000),
-                dec!(0),
-                dec!(0),
-                dec!(0.35),
-                0,
-                false,
-                100,
-                dec!(0),
-            );
-            assert_eq!(trips.len(), 1);
-            assert_eq!(trips[0].breaker_type, "CB4: Max Platform Exposure");
-        }
+        let trips = cb.check_all(&CheckParams {
+            trade_size: dec!(100),
+            bankroll: dec!(10000),
+            daily_loss_pct: dec!(0),
+            drawdown_pct: dec!(0),
+            platform_exposure_pct: dec!(0.35),
+            open_positions: 0,
+            involves_polymarket: false,
+            ms_since_last_tick: 100,
+            market_exposure_pct: dec!(0),
+        });
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].breaker_type, "CB4: Max Platform Exposure");
     }
+}
 ```
 
 ## File: src/db/traits.rs
@@ -4267,6 +4290,7 @@ impl CdnaFeed {
 ## File: src/inventory/settlement.rs
 ```rust
 use anyhow::Result;
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -4328,14 +4352,19 @@ impl SettlementMonitor {
                                 }
                             } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
                                 tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
+                                // Credit a conservative zero-PnL settlement so the locked exposure is freed.
+                                // The actual PnL (win/loss) must be manually adjusted by the operator.
+                                // Without this, exposure is permanently locked and the bankroll is understated.
+                                realized_pnl = Decimal::ZERO;
                                 let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                                     severity: "critical".into(),
-                                    message: format!("Position #{} on {} resolved. Position closed in DB, but MANUAL PnL CREDIT REQUIRED to bankroll.", position.id, position.platform),
+                                    message: format!(
+                                        "Position #{} on {} resolved. Exposure freed with $0 PnL placeholder. \
+                                         MANUAL PnL ADJUSTMENT REQUIRED — check if position won ($1/contract) or lost ($0).",
+                                        position.id, position.platform
+                                    ),
                                 });
-                                if let Err(e) = self.db.close_position(position.id).await {
-                                    tracing::error!(error = %e, "Failed to close position in DB");
-                                }
-                                continue; 
+                                // Don't continue — fall through to the settlement_tx send and close_position below
                             }
                         }
                         
@@ -5303,8 +5332,8 @@ impl MercuryConfig {
         let t = &self.trading;
         
         // HIGH-5 FIX: Prevent zero-timeout configurations that would permanently halt trading
-        anyhow::ensure!(t.stale_data_timeout_ms >= 1000,
-            "stale_data_timeout_ms must be at least 1000ms, got {}", t.stale_data_timeout_ms);
+        anyhow::ensure!(t.stale_data_timeout_ms >= 2000,
+            "stale_data_timeout_ms must be at least 2000ms (WebSocket latency + processing), got {}", t.stale_data_timeout_ms);
         anyhow::ensure!(t.min_net_spread_threshold > Decimal::ZERO,
             "min_net_spread_threshold must be positive, got {}", t.min_net_spread_threshold);
             
@@ -5744,6 +5773,20 @@ impl PlatformBook {
             return;
         }
 
+        // Reject ticks with prices outside valid prediction market range
+        if tick.bid_price < Decimal::ZERO || tick.bid_price > Decimal::ONE
+            || tick.ask_price < Decimal::ZERO || tick.ask_price > Decimal::ONE
+        {
+            tracing::warn!(
+                platform = ?self.platform,
+                market_id = %self.market_id,
+                bid = %tick.bid_price,
+                ask = %tick.ask_price,
+                "Rejecting tick with out-of-range prices"
+            );
+            return;
+        }
+
         // Apply depth levels as incremental updates. Zero-size = remove.
         for level in tick.book_depth.iter() {
             if level.size == Decimal::ZERO {
@@ -6036,9 +6079,9 @@ impl NetSpreadEngine {
                 normalizer::polymarket_fee(price, quantity, fee_rate_bps)
             }
             Platform::Kalshi => {
-                // Use the dynamic fee_rate_bps provided by the Kalshi feed tick
-                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-                rate * quantity * price
+                // Delegate to the centralized normalizer to ensure consistency
+                // between spread estimation and execution fill accounting.
+                normalizer::kalshi_fee(price, quantity)
             }
             Platform::Cdna => {
                 let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
@@ -6361,21 +6404,58 @@ fn normalize_question(q: &str) -> String {
     }
 
     async fn fetch_polymarket_markets(&self) -> Result<Vec<DiscoveredMarket>> {
-        // Polymarket CLOB API: GET /markets
-        let url = format!("{}/markets", self.platforms_config.polymarket.rest_url);
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .query(&[("active", "true"), ("limit", "1000")])
-            .send()
-            .await
-            .context("Polymarket markets fetch failed")?
-            .json()
-            .await
-            .context("Polymarket markets parse failed")?;
-
+        let mut all_markets = Vec::new();
+        let mut cursor = String::new();
+        
+        loop {
+            let url = format!("{}/markets", self.platforms_config.polymarket.rest_url);
+            let mut query = vec![("active", "true"), ("limit", "1000")];
+            if !cursor.is_empty() {
+                query.push(("next_cursor", &cursor));
+            }
+            
+            let resp: serde_json::Value = self
+                .http
+                .get(&url)
+                .query(&query)
+                .send()
+                .await
+                .context("Polymarket markets fetch failed")?
+                .json()
+                .await
+                .context("Polymarket markets parse failed")?;
+            
+            let page_markets = self.parse_polymarket_response(&resp);
+            let page_count = page_markets.len();
+            all_markets.extend(page_markets);
+            
+            // Check for pagination cursor
+            cursor = resp.get("next_cursor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            
+            if cursor.is_empty() || page_count < 1000 {
+                break;
+            }
+            
+            // Safety: cap at 5000 markets to prevent infinite loops
+            if all_markets.len() >= 5000 {
+                tracing::warn!("Polymarket pagination capped at 5000 markets");
+                break;
+            }
+        }
+        
+        Ok(all_markets)
+    }
+    
+    fn parse_polymarket_response(&self, resp: &serde_json::Value) -> Vec<DiscoveredMarket> {
         let mut markets = Vec::new();
-        if let Some(arr) = resp.as_array() {
+        // Handle both top-level array and nested "data" array formats
+        let arr = resp.as_array()
+            .or_else(|| resp.get("data").and_then(|v| v.as_array()));
+        
+        if let Some(arr) = arr {
             for item in arr {
                 let question = item
                     .get("question")
@@ -6385,6 +6465,7 @@ fn normalize_question(q: &str) -> String {
                 if question.is_empty() {
                     continue;
                 }
+                
                 // Polymarket CTF requires buying the specific NO token ID to short the market.
                 // We extract both YES (index 0) and NO (index 1) token IDs and store them as a pair.
                 let yes_token = item.get("tokens").and_then(|v| v.as_array()).and_then(|arr| arr.get(0)).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("");
@@ -6394,6 +6475,7 @@ fn normalize_question(q: &str) -> String {
                     continue; 
                 }
                 let token_id = format!("{},{}", yes_token, no_token);
+                
                 let end_date = item
                     .get("end_date_iso")
                     .and_then(|v| v.as_str())
@@ -6415,10 +6497,12 @@ fn normalize_question(q: &str) -> String {
                 });
             }
         }
+        
         if markets.len() >= 1000 {
             tracing::warn!("Polymarket returned 1000 markets — results may be truncated. Consider pagination.");
         }
-        Ok(markets)
+        
+        markets
     }
 
     async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {
@@ -6512,6 +6596,7 @@ pub struct BankrollManager {
     fail_today: i32,
     exec_success_rate: Decimal,
     exec_history: std::collections::VecDeque<(chrono::DateTime<chrono::Utc>, bool)>,
+    exec_success_count: usize,
 }
 
 impl BankrollManager {
@@ -6531,6 +6616,7 @@ impl BankrollManager {
             fail_today: 0,
             exec_success_rate: dec!(0.90),
             exec_history: std::collections::VecDeque::new(),
+            exec_success_count: 0,
         }
     }
 
@@ -6629,6 +6715,7 @@ impl BankrollManager {
             TradeStatus::Success => {
                 self.success_today += 1;
                 self.exec_history.push_back((chrono::Utc::now(), true));
+                self.exec_success_count += 1;
             }
             TradeStatus::Fail | TradeStatus::Partial => {
                 self.fail_today += 1;
@@ -6640,24 +6727,20 @@ impl BankrollManager {
             self.peak_bankroll = self.total_bankroll;
         }
 
-        // LOW-8 FIX: Evict execution tracking metrics based on time (24h) rather than a rigid 100 count.
+        // Evict stale execution history entries, tracking success count decrements
         let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
-        while let Some(&(time, _)) = self.exec_history.front() {
-            if time < cutoff {
+        while let Some(&(time, was_success)) = self.exec_history.front() {
+            if time < cutoff || self.exec_history.len() > 10000 {
                 self.exec_history.pop_front();
+                if was_success { self.exec_success_count = self.exec_success_count.saturating_sub(1); }
             } else {
                 break;
             }
         }
         
-        // MED-8 FIX: Provide a hard upper bound to prevent memory exhaustion during extreme volume
-        while self.exec_history.len() > 10000 {
-            self.exec_history.pop_front();
-        }
-        
+        // O(1) success rate calculation using running counter
         if !self.exec_history.is_empty() {
-            let successes = self.exec_history.iter().filter(|&&(_, s)| s).count();
-            self.exec_success_rate = Decimal::from(successes as u64) / Decimal::from(self.exec_history.len() as u64);
+            self.exec_success_rate = Decimal::from(self.exec_success_count as u64) / Decimal::from(self.exec_history.len() as u64);
         }
 
         info!(profit = %result.profit, bankroll = %self.total_bankroll, daily_pnl = %self.daily_pnl, "Trade recorded");
@@ -7390,8 +7473,8 @@ impl KalshiFeed {
             }
             "orderbook_delta" => {
                 if let Some(data) = msg.msg {
-                    if self.handle_orderbook_delta(&data, tick_tx) {
-                        return Err(anyhow::anyhow!("Sequence gap — reconnecting for fresh snapshot"));
+                    if let Err(reason) = self.handle_orderbook_delta(&data, tick_tx) {
+                        return Err(anyhow::anyhow!("Kalshi reconnect: {}", reason));
                     }
                 }
             }
@@ -7457,19 +7540,19 @@ impl KalshiFeed {
         &mut self,
         data: &KalshiMsgPayload,
         tick_tx: &broadcast::Sender<NormalizedTick>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         let ticker = &data.market_ticker;
         let seq = data.seq.unwrap_or(0);
 
         if let Some(book) = self.books.get(ticker) {
             // Fix: If we receive a delta before a snapshot, explicitly trigger a reconnect.
             if !book.is_initialized {
-                return true; 
+                return Err("Delta received before snapshot — reconnect needed");
             }
             if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
                 warn!(ticker, expected = book.last_seq + 1, got = seq,
                     "Kalshi sequence gap — reconnecting to get fresh snapshot");
-                return true; // signal caller to reconnect
+                return Err("Sequence gap detected");
             }
         }
 
@@ -7511,7 +7594,7 @@ impl KalshiFeed {
             }
         }
 
-        false // no reconnect needed
+        Ok(())
     }
 }
 ```
@@ -7977,13 +8060,17 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
         }
         let tls_connector = tls_builder.build().context("Failed to build TLS connector")?;
         let connector = Connector::NativeTls(tls_connector);
-        let (ws_stream, _) = connect_async_tls_with_config(
-            url,
-            None, // WebSocket config
-            false, // disable_nagle
-            Some(connector),
+        let (ws_stream, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            connect_async_tls_with_config(
+                url,
+                None,
+                false,
+                Some(connector),
+            )
         )
             .await
+            .map_err(|_| anyhow::anyhow!("Polymarket WebSocket connect timed out after 15s"))?
             .context("Failed to connect to Polymarket WebSocket")?;
 
         let (mut write, mut read) = ws_stream.split();
@@ -8023,6 +8110,11 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                     match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                             if let Err(e) = self.handle_message(&text, &tick_tx) {
+                                let err_str = e.to_string();
+                                if err_str.contains("sequence gap") {
+                                    tracing::warn!(error = %e, "Polymarket sequence gap — reconnecting");
+                                    return Err(e);
+                                }
                                 tracing::warn!(error = %e, "Failed to process Polymarket message");
                             }
                         }
@@ -8259,7 +8351,6 @@ pub struct ExecutionEngine {
     kalshi_client: Option<KalshiClient>,
     cdna_client: Option<CdnaClient>,
     forecastex_client: Option<ForecastExClient>,
-    trade_counter: i64,
     executed_opps: lru::LruCache<uuid::Uuid, ()>,
 }
 
@@ -8274,7 +8365,6 @@ impl ExecutionEngine {
         kalshi_client: Option<KalshiClient>,
         cdna_client: Option<CdnaClient>,
         forecastex_client: Option<ForecastExClient>,
-        initial_trade_count: i64,
     ) -> Self {
         Self {
             rx,
@@ -8286,7 +8376,6 @@ impl ExecutionEngine {
             kalshi_client,
             cdna_client,
             forecastex_client,
-            trade_counter: initial_trade_count,
             executed_opps: lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
         }
     }
@@ -8348,8 +8437,8 @@ impl ExecutionEngine {
         let current_time_ns = crate::types::now_ns();
         let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
         
-        let current_trade_id = self.trade_counter;
-        self.trade_counter += 1;
+        // Trade ID is assigned by the DB via AUTOINCREMENT. Use 0 as placeholder.
+        let current_trade_id: i64 = 0;
 
         if current_time_ns > expiration_ns {
             let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
@@ -9409,31 +9498,39 @@ impl Database for SqliteDb {
     }
 
     async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
-        // CRIT-1 FIX: Comprehensive path validation to prevent SQL injection via VACUUM INTO.
+        // Comprehensive path validation to prevent SQL injection via VACUUM INTO.
         // SQLite's VACUUM INTO does not support parameterized paths, so we must validate rigorously.
-        anyhow::ensure!(!dest_path.contains(".."), "Backup path contains directory traversal");
         anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
         anyhow::ensure!(
             dest_path.chars().all(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.')),
             "Backup path contains invalid characters: only alphanumeric, /, _, -, . allowed"
         );
-        // Block single quotes explicitly — this is the SQL injection vector for VACUUM INTO
         anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote");
-        // Block semicolons to prevent statement chaining
         anyhow::ensure!(!dest_path.contains(';'), "Backup path contains semicolon");
-        
-        // Restrict backups to known safe prefixes
-        anyhow::ensure!(
-            dest_path.starts_with("/opt/mercury/data/") 
-            || dest_path.starts_with("data/") 
-            || dest_path.starts_with("./"),
-            "Backup path must be under /opt/mercury/data/, data/, or ./, got: {}", dest_path
-        );
-        
-        // Ensure the path ends with .db to prevent writing arbitrary file extensions
         anyhow::ensure!(dest_path.ends_with(".db"), "Backup path must end with .db");
         
-        let query = format!("VACUUM INTO '{}'", dest_path);
+        // Canonicalize the path to resolve symlinks, `.`, and `..` before checking prefixes.
+        // This prevents traversal attacks like `data/./../../etc/passwd.db`.
+        let canonical = std::fs::canonicalize(
+            std::path::Path::new(dest_path).parent().unwrap_or(std::path::Path::new("."))
+        ).map_err(|e| anyhow::anyhow!("Cannot resolve backup directory: {}", e))?;
+        
+        let canonical_str = canonical.to_string_lossy();
+        anyhow::ensure!(
+            canonical_str.starts_with("/opt/mercury/data")
+            || canonical_str.starts_with("/opt/mercury/./data"),
+            "Backup path resolves outside /opt/mercury/data/: resolved to {}", canonical_str
+        );
+        
+        // Reconstruct the full path using the canonical directory + original filename
+        let filename = std::path::Path::new(dest_path)
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Backup path has no filename"))?
+            .to_string_lossy();
+        let safe_path = canonical.join(filename.as_ref());
+        let safe_path_str = safe_path.to_string_lossy();
+        
+        let query = format!("VACUUM INTO '{}'", safe_path_str);
         sqlx::query(&query).execute(&self.pool).await?;
         Ok(())
     }
@@ -9642,23 +9739,24 @@ async fn main() -> Result<()> {
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded");
 
-    // HARD PANIC FOR FORECAST EX
+    // HARD PANIC FOR FORECAST EX — check BEFORE allocating any resources
     if mercury_config.platforms.forecastex.enabled {
-        drop(_guard); // LOW-5 FIX: Ensure logs are completely flushed before process aborts via panic
+        drop(_guard);
         panic!("CRITICAL: ForecastEx FIX execution is not fully implemented. Do not run with forecastex.enabled = true to prevent unhedged dual-leg exposure.");
     }
 
-    let db: Arc<dyn db::Database> = Arc::new(SqliteDb::new(
+    // 1. Create the database and assign it to sqlite_db (No Arc::new here yet)
+    let sqlite_db = SqliteDb::new(
         &mercury_config.database.path,
         mercury_config.database.pool_size,
         mercury_config.database.busy_timeout_ms,
-    ).await?);
+    ).await?;
     info!("Database initialized via SQLx");
 
-    // Salva uma referência concreta para usar no shutdown
+    // 2. Salva uma referência concreta para usar no shutdown
     let db_for_shutdown = sqlite_db.clone(); 
     
-    // Converte para o Trait Object para o resto do sistema usar
+    // 3. Converte para o Trait Object para o resto do sistema usar
     let db: Arc<dyn db::Database> = Arc::new(sqlite_db);
 
     let metrics = monitoring::metrics::Metrics::new();
@@ -9758,7 +9856,6 @@ async fn main() -> Result<()> {
     );
     let mut registry = engine::market_registry::MarketRegistry::new();
 
-    let initial_trade_count = db.get_trade_count().await.unwrap_or(0);
 
     if let Ok(cum_profit) = db.get_cumulative_profit().await {
         bankroll_manager.restore_state(cum_profit);
@@ -9883,7 +9980,6 @@ async fn main() -> Result<()> {
         kalshi_client,
         cdna_client,
         forecastex_client,
-        initial_trade_count,
     );
     join_set.spawn(executor.run());
 
@@ -10240,17 +10336,18 @@ loop {
                 // Fix CB5: Calculate the true exposure allocated to this specific market question
                 let market_exposure_pct = bankroll_manager.market_exposure_pct(&opp.market_id);
 
-                let trips = circuit_breakers.check_all(
-                        opp.recommended_size, 
-                        bankroll_manager.total_bankroll(), 
-                        bankroll_manager.daily_loss_pct(), 
-                        bankroll_manager.drawdown_pct(), 
-                        bankroll_manager.platform_exposure_pct(&opp.leg_a.platform).max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)), 
-                        cached_open_positions, 
-                        opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
-                        metrics.ms_since_last_tick(), 
-                        market_exposure_pct // Authoritative market correlation tracking
-                    );
+                let trips = circuit_breakers.check_all(&risk::circuit_breaker::CheckParams {
+                    trade_size: opp.recommended_size,
+                    bankroll: bankroll_manager.total_bankroll(),
+                    daily_loss_pct: bankroll_manager.daily_loss_pct(),
+                    drawdown_pct: bankroll_manager.drawdown_pct(),
+                    platform_exposure_pct: bankroll_manager.platform_exposure_pct(&opp.leg_a.platform)
+                        .max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)),
+                    open_positions: cached_open_positions,
+                    involves_polymarket: opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
+                    ms_since_last_tick: metrics.ms_since_last_tick(),
+                    market_exposure_pct,
+                });
 
                     if trips.is_empty() {
                         let win_prob = bankroll_manager.exec_success_rate().max(rust_decimal_macros::dec!(0.5));
@@ -10335,7 +10432,11 @@ loop {
             // ── Market Discovery Results ──
             Some(matched) = matched_market_rx.recv() => {
                 let market_id = matched.market.unified_id;
-                if registry.get_market(&market_id).is_none() {
+                // Skip if already registered — discovery re-matches every cycle
+                if registry.get_market(&market_id).is_some() {
+                    continue;
+                }
+                {
                     info!(
                         market_id = %market_id,
                         question = %matched.market.question,
@@ -10487,11 +10588,15 @@ loop {
 
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
+                // Evict expired markets to prevent unbounded memory growth
+                registry.evict_stale_markets();
+                
                 if let Ok(count) = db.get_open_arb_count().await {
-                    // DB count includes all persisted open positions.
-                    // in_flight_trades are dispatched but not yet persisted.
-                    // Don't double-count: only add truly in-flight (not yet DB-persisted) trades.
-                    cached_open_positions = count.max(cached_open_positions.saturating_sub(in_flight_trades)) + in_flight_trades;
+                    // The DB count is authoritative for persisted positions.
+                    // in_flight_trades are dispatched but not yet DB-persisted.
+                    // Use DB count + in-flight as the ceiling to avoid both
+                    // over-counting (blocking trades) and under-counting (exceeding limits).
+                    cached_open_positions = count + in_flight_trades;
                 }
                 
                 // L-5 FIX: Expose DetectorStats to the logs

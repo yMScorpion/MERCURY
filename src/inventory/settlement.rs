@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -60,14 +61,19 @@ impl SettlementMonitor {
                                 }
                             } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
                                 tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
+                                // Credit a conservative zero-PnL settlement so the locked exposure is freed.
+                                // The actual PnL (win/loss) must be manually adjusted by the operator.
+                                // Without this, exposure is permanently locked and the bankroll is understated.
+                                realized_pnl = Decimal::ZERO;
                                 let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                                     severity: "critical".into(),
-                                    message: format!("Position #{} on {} resolved. Position closed in DB, but MANUAL PnL CREDIT REQUIRED to bankroll.", position.id, position.platform),
+                                    message: format!(
+                                        "Position #{} on {} resolved. Exposure freed with $0 PnL placeholder. \
+                                         MANUAL PnL ADJUSTMENT REQUIRED — check if position won ($1/contract) or lost ($0).",
+                                        position.id, position.platform
+                                    ),
                                 });
-                                if let Err(e) = self.db.close_position(position.id).await {
-                                    tracing::error!(error = %e, "Failed to close position in DB");
-                                }
-                                continue; 
+                                // Don't continue — fall through to the settlement_tx send and close_position below
                             }
                         }
                         

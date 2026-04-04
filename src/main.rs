@@ -149,9 +149,9 @@ async fn main() -> Result<()> {
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded");
 
-    // HARD PANIC FOR FORECAST EX
+    // HARD PANIC FOR FORECAST EX — check BEFORE allocating any resources
     if mercury_config.platforms.forecastex.enabled {
-        drop(_guard); // LOW-5 FIX: Ensure logs are completely flushed before process aborts via panic
+        drop(_guard);
         panic!("CRITICAL: ForecastEx FIX execution is not fully implemented. Do not run with forecastex.enabled = true to prevent unhedged dual-leg exposure.");
     }
 
@@ -266,7 +266,6 @@ async fn main() -> Result<()> {
     );
     let mut registry = engine::market_registry::MarketRegistry::new();
 
-    let initial_trade_count = db.get_trade_count().await.unwrap_or(0);
 
     if let Ok(cum_profit) = db.get_cumulative_profit().await {
         bankroll_manager.restore_state(cum_profit);
@@ -391,7 +390,6 @@ async fn main() -> Result<()> {
         kalshi_client,
         cdna_client,
         forecastex_client,
-        initial_trade_count,
     );
     join_set.spawn(executor.run());
 
@@ -748,17 +746,18 @@ loop {
                 // Fix CB5: Calculate the true exposure allocated to this specific market question
                 let market_exposure_pct = bankroll_manager.market_exposure_pct(&opp.market_id);
 
-                let trips = circuit_breakers.check_all(
-                        opp.recommended_size, 
-                        bankroll_manager.total_bankroll(), 
-                        bankroll_manager.daily_loss_pct(), 
-                        bankroll_manager.drawdown_pct(), 
-                        bankroll_manager.platform_exposure_pct(&opp.leg_a.platform).max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)), 
-                        cached_open_positions, 
-                        opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
-                        metrics.ms_since_last_tick(), 
-                        market_exposure_pct // Authoritative market correlation tracking
-                    );
+                let trips = circuit_breakers.check_all(&risk::circuit_breaker::CheckParams {
+                    trade_size: opp.recommended_size,
+                    bankroll: bankroll_manager.total_bankroll(),
+                    daily_loss_pct: bankroll_manager.daily_loss_pct(),
+                    drawdown_pct: bankroll_manager.drawdown_pct(),
+                    platform_exposure_pct: bankroll_manager.platform_exposure_pct(&opp.leg_a.platform)
+                        .max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)),
+                    open_positions: cached_open_positions,
+                    involves_polymarket: opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
+                    ms_since_last_tick: metrics.ms_since_last_tick(),
+                    market_exposure_pct,
+                });
 
                     if trips.is_empty() {
                         let win_prob = bankroll_manager.exec_success_rate().max(rust_decimal_macros::dec!(0.5));
@@ -843,7 +842,11 @@ loop {
             // ── Market Discovery Results ──
             Some(matched) = matched_market_rx.recv() => {
                 let market_id = matched.market.unified_id;
-                if registry.get_market(&market_id).is_none() {
+                // Skip if already registered — discovery re-matches every cycle
+                if registry.get_market(&market_id).is_some() {
+                    continue;
+                }
+                {
                     info!(
                         market_id = %market_id,
                         question = %matched.market.question,
@@ -995,11 +998,15 @@ loop {
 
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
+                // Evict expired markets to prevent unbounded memory growth
+                registry.evict_stale_markets();
+                
                 if let Ok(count) = db.get_open_arb_count().await {
-                    // DB count includes all persisted open positions.
-                    // in_flight_trades are dispatched but not yet persisted.
-                    // Don't double-count: only add truly in-flight (not yet DB-persisted) trades.
-                    cached_open_positions = count.max(cached_open_positions.saturating_sub(in_flight_trades)) + in_flight_trades;
+                    // The DB count is authoritative for persisted positions.
+                    // in_flight_trades are dispatched but not yet DB-persisted.
+                    // Use DB count + in-flight as the ceiling to avoid both
+                    // over-counting (blocking trades) and under-counting (exceeding limits).
+                    cached_open_positions = count + in_flight_trades;
                 }
                 
                 // L-5 FIX: Expose DetectorStats to the logs

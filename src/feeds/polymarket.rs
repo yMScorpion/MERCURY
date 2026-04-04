@@ -206,13 +206,17 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
         }
         let tls_connector = tls_builder.build().context("Failed to build TLS connector")?;
         let connector = Connector::NativeTls(tls_connector);
-        let (ws_stream, _) = connect_async_tls_with_config(
-            url,
-            None, // WebSocket config
-            false, // disable_nagle
-            Some(connector),
+        let (ws_stream, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            connect_async_tls_with_config(
+                url,
+                None,
+                false,
+                Some(connector),
+            )
         )
             .await
+            .map_err(|_| anyhow::anyhow!("Polymarket WebSocket connect timed out after 15s"))?
             .context("Failed to connect to Polymarket WebSocket")?;
 
         let (mut write, mut read) = ws_stream.split();
@@ -252,6 +256,11 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                     match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                             if let Err(e) = self.handle_message(&text, &tick_tx) {
+                                let err_str = e.to_string();
+                                if err_str.contains("sequence gap") {
+                                    tracing::warn!(error = %e, "Polymarket sequence gap — reconnecting");
+                                    return Err(e);
+                                }
                                 tracing::warn!(error = %e, "Failed to process Polymarket message");
                             }
                         }

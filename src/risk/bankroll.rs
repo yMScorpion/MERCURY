@@ -22,6 +22,7 @@ pub struct BankrollManager {
     fail_today: i32,
     exec_success_rate: Decimal,
     exec_history: std::collections::VecDeque<(chrono::DateTime<chrono::Utc>, bool)>,
+    exec_success_count: usize,
 }
 
 impl BankrollManager {
@@ -41,6 +42,7 @@ impl BankrollManager {
             fail_today: 0,
             exec_success_rate: dec!(0.90),
             exec_history: std::collections::VecDeque::new(),
+            exec_success_count: 0,
         }
     }
 
@@ -139,6 +141,7 @@ impl BankrollManager {
             TradeStatus::Success => {
                 self.success_today += 1;
                 self.exec_history.push_back((chrono::Utc::now(), true));
+                self.exec_success_count += 1;
             }
             TradeStatus::Fail | TradeStatus::Partial => {
                 self.fail_today += 1;
@@ -150,24 +153,20 @@ impl BankrollManager {
             self.peak_bankroll = self.total_bankroll;
         }
 
-        // LOW-8 FIX: Evict execution tracking metrics based on time (24h) rather than a rigid 100 count.
+        // Evict stale execution history entries, tracking success count decrements
         let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
-        while let Some(&(time, _)) = self.exec_history.front() {
-            if time < cutoff {
+        while let Some(&(time, was_success)) = self.exec_history.front() {
+            if time < cutoff || self.exec_history.len() > 10000 {
                 self.exec_history.pop_front();
+                if was_success { self.exec_success_count = self.exec_success_count.saturating_sub(1); }
             } else {
                 break;
             }
         }
         
-        // MED-8 FIX: Provide a hard upper bound to prevent memory exhaustion during extreme volume
-        while self.exec_history.len() > 10000 {
-            self.exec_history.pop_front();
-        }
-        
+        // O(1) success rate calculation using running counter
         if !self.exec_history.is_empty() {
-            let successes = self.exec_history.iter().filter(|&&(_, s)| s).count();
-            self.exec_success_rate = Decimal::from(successes as u64) / Decimal::from(self.exec_history.len() as u64);
+            self.exec_success_rate = Decimal::from(self.exec_success_count as u64) / Decimal::from(self.exec_history.len() as u64);
         }
 
         info!(profit = %result.profit, bankroll = %self.total_bankroll, daily_pnl = %self.daily_pnl, "Trade recorded");
