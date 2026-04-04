@@ -69,6 +69,7 @@ src/feeds/kalshi.rs
 src/feeds/mod.rs
 src/feeds/normalizer.rs
 src/feeds/polymarket.rs
+src/integration.rs
 src/inventory/mod.rs
 src/inventory/positions.rs
 src/inventory/reconciler.rs
@@ -92,6 +93,466 @@ src/types.rs
 ```
 
 # Files
+
+## File: src/integration.rs
+```rust
+//! Integration tests for the full MERCURY pipeline:
+//! WS tick → UnifiedOrderBook → SpreadEngine → ArbitrageDetector → Execution
+//!
+//! These tests use in-memory SQLite and mock platform clients to verify
+//! end-to-end correctness without network dependencies.
+
+#[cfg(test)]
+mod pipeline_tests {
+    use crate::db::SqliteDb;
+    use crate::engine::detector::ArbitrageDetector;
+    use crate::engine::market_registry::MarketRegistry;
+    use crate::engine::order_book::UnifiedOrderBook;
+    use crate::engine::spread::NetSpreadEngine;
+    use crate::risk::bankroll::BankrollManager;
+    use crate::risk::circuit_breaker::CircuitBreakers;
+    use crate::risk::kelly::KellyCalculator;
+    use crate::types::*;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Helper: create an in-memory SQLite DB for testing.
+    async fn test_db() -> Arc<SqliteDb> {
+        Arc::new(
+            SqliteDb::new(":memory:", 1, 5000)
+                .await
+                .expect("Failed to create in-memory test DB"),
+        )
+    }
+
+    /// Helper: register a two-platform market in the registry.
+    fn register_test_market(
+        registry: &mut MarketRegistry,
+        market_id: Uuid,
+        question: &str,
+        poly_token: &str,
+        kalshi_ticker: &str,
+    ) {
+        let mut platforms = HashMap::new();
+        platforms.insert(
+            Platform::Polymarket,
+            PlatformMarketInfo {
+                platform: Platform::Polymarket,
+                platform_market_id: poly_token.into(),
+                fee_rate_bps: 200,
+                min_order_size: dec!(1.0),
+                tick_size: dec!(0.01),
+            },
+        );
+        platforms.insert(
+            Platform::Kalshi,
+            PlatformMarketInfo {
+                platform: Platform::Kalshi,
+                platform_market_id: kalshi_ticker.into(),
+                fee_rate_bps: 175,
+                min_order_size: dec!(1.0),
+                tick_size: dec!(0.01),
+            },
+        );
+
+        registry.register_market(Market {
+            unified_id: market_id,
+            question: question.into(),
+            resolution_source: "test".into(),
+            expiration: chrono::Utc::now() + chrono::Duration::hours(2),
+            platforms,
+            category: MarketCategory::Other,
+            confidence: 0.99,
+            status: MarketStatus::Active,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+    }
+
+    /// Helper: create a normalized tick with specified BBO and depth.
+    fn make_tick(
+        platform: Platform,
+        market_id: Uuid,
+        bid: Decimal,
+        bid_size: Decimal,
+        ask: Decimal,
+        ask_size: Decimal,
+        fee_bps: u16,
+        seq: u64,
+    ) -> NormalizedTick {
+        let mid = (bid + ask) / Decimal::from(2);
+        NormalizedTick {
+            platform,
+            market_id,
+            timestamp_ns: now_ns(),
+            bid_price: bid,
+            bid_size,
+            ask_price: ask,
+            ask_size,
+            mid_price: mid,
+            last_trade_price: mid,
+            last_trade_size: dec!(10),
+            book_depth: Arc::new(vec![
+                PriceLevel { price: ask, size: ask_size },
+                PriceLevel { price: bid, size: bid_size },
+            ]),
+            fee_rate_bps: fee_bps,
+            sequence: seq,
+        }
+    }
+
+    // ─── Test 1: Full pipeline detects arb opportunity ───
+
+    #[tokio::test]
+    async fn test_pipeline_detects_arb_opportunity() {
+        let mut registry = MarketRegistry::new();
+        let market_id = Uuid::new_v4();
+        register_test_market(&mut registry, market_id, "Will BTC exceed $100k?", "poly_btc", "KBTC100K");
+
+        let mut uob = UnifiedOrderBook::new();
+        let spread_engine = NetSpreadEngine::new(dec!(0.01));
+        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
+
+        // Polymarket: Ask YES at 0.40 (cheap YES)
+        uob.update(&make_tick(Platform::Polymarket, market_id, dec!(0.38), dec!(100), dec!(0.40), dec!(100), 200, 1));
+        // Kalshi: Bid YES at 0.50 → implies NO can be bought at 0.50
+        uob.update(&make_tick(Platform::Kalshi, market_id, dec!(0.50), dec!(100), dec!(0.52), dec!(100), 175, 1));
+
+        let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(10.0));
+
+        assert!(!opps.is_empty(), "Should detect at least 1 arb opportunity");
+        let opp = &opps[0];
+        assert!(opp.net_spread > Decimal::ZERO, "Net spread should be positive");
+        assert!(opp.raw_spread > opp.net_spread, "Raw spread should exceed net spread (fees reduce it)");
+    }
+
+    // ─── Test 2: No arb when spread is too tight ───
+
+    #[tokio::test]
+    async fn test_pipeline_no_arb_tight_spread() {
+        let mut registry = MarketRegistry::new();
+        let market_id = Uuid::new_v4();
+        register_test_market(&mut registry, market_id, "Test tight spread", "poly_t", "KT");
+
+        let mut uob = UnifiedOrderBook::new();
+        let spread_engine = NetSpreadEngine::new(dec!(0.02));
+        let mut detector = ArbitrageDetector::new(dec!(0.02), dec!(1.0), 5000, 3);
+
+        // Both platforms at essentially the same price — no arb
+        uob.update(&make_tick(Platform::Polymarket, market_id, dec!(0.49), dec!(100), dec!(0.51), dec!(100), 200, 1));
+        uob.update(&make_tick(Platform::Kalshi, market_id, dec!(0.49), dec!(100), dec!(0.51), dec!(100), 175, 1));
+
+        let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(10.0));
+        assert!(opps.is_empty(), "No arb should be detected with identical prices");
+    }
+
+    // ─── Test 3: Stale data rejects opportunity ───
+
+    #[tokio::test]
+    async fn test_pipeline_stale_data_rejection() {
+        let mut registry = MarketRegistry::new();
+        let market_id = Uuid::new_v4();
+        register_test_market(&mut registry, market_id, "Test stale", "poly_s", "KS");
+
+        let mut uob = UnifiedOrderBook::new();
+        let spread_engine = NetSpreadEngine::new(dec!(0.01));
+        // 100ms stale timeout — ticks will be stale by the time we detect
+        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 100, 3);
+
+        // Insert ticks with old timestamps
+        let mut tick_a = make_tick(Platform::Polymarket, market_id, dec!(0.30), dec!(100), dec!(0.32), dec!(100), 200, 1);
+        tick_a.timestamp_ns = now_ns() - 200_000_000; // 200ms ago
+        uob.update(&tick_a);
+
+        let mut tick_b = make_tick(Platform::Kalshi, market_id, dec!(0.60), dec!(100), dec!(0.62), dec!(100), 175, 1);
+        tick_b.timestamp_ns = now_ns() - 200_000_000;
+        uob.update(&tick_b);
+
+        let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(10.0));
+        assert!(opps.is_empty(), "Stale ticks should be rejected by gate 3");
+        assert!(detector.stats.gate3_rejected > 0, "Gate 3 should have rejected");
+    }
+
+    // ─── Test 4: Circuit breaker halts trading ───
+
+    #[tokio::test]
+    async fn test_circuit_breaker_daily_loss_halt() {
+        let mut cb = CircuitBreakers::new(
+            dec!(0.05), dec!(0.03), dec!(0.10), dec!(0.40), 100, 5, 20,
+        );
+
+        // daily_loss_pct is 4% (percent-scale), max is 3% (fraction-scale → 3% percent-scale)
+        let trips = cb.check_all(
+            dec!(100), dec!(10000), dec!(4.0), dec!(0), dec!(0), 0, false, 100, dec!(0),
+        );
+
+        assert!(!trips.is_empty(), "CB2 should trip on daily loss exceeding limit");
+        assert!(cb.is_trading_halted(), "Trading should be halted after CB2 trip");
+    }
+
+    // ─── Test 5: Kelly sizing respects limits ───
+
+    #[tokio::test]
+    async fn test_kelly_sizing_respects_caps() {
+        let kelly = KellyCalculator::new(dec!(0.25), dec!(0.02));
+
+        let size = kelly.position_size(dec!(10000), dec!(0.90), dec!(0.05), dec!(0.02));
+        let max_allowed = dec!(10000) * dec!(0.02); // $200
+        assert!(size <= max_allowed, "Kelly size {} should not exceed max_single_trade_pct cap {}", size, max_allowed);
+        assert!(size > Decimal::ZERO, "Kelly size should be positive for profitable opportunity");
+    }
+
+    // ─── Test 6: Order book crossed-book prevention ───
+
+    #[tokio::test]
+    async fn test_order_book_uncrossing() {
+        let mut book = crate::engine::order_book::PlatformBook::new(Platform::Polymarket, Uuid::new_v4());
+
+        // Insert normal book state
+        book.bids.insert(dec!(0.45), dec!(50));
+        book.bids.insert(dec!(0.44), dec!(30));
+        book.asks.insert(dec!(0.55), dec!(50));
+        book.asks.insert(dec!(0.56), dec!(30));
+
+        // Apply a tick that would cross the book (bid at 0.57, above existing asks)
+        let tick = NormalizedTick {
+            platform: Platform::Polymarket,
+            market_id: book.market_id,
+            timestamp_ns: now_ns(),
+            bid_price: dec!(0.57),
+            bid_size: dec!(100),
+            ask_price: dec!(0.58),
+            ask_size: dec!(100),
+            mid_price: dec!(0.575),
+            last_trade_price: dec!(0.57),
+            last_trade_size: dec!(10),
+            book_depth: Arc::new(vec![]),
+            fee_rate_bps: 200,
+            sequence: 1,
+        };
+        book.update_from_tick(&tick);
+
+        // Verify asks below bid are removed
+        assert!(book.asks.get(&dec!(0.55)).is_none(), "Ask at 0.55 should be removed (below new bid 0.57)");
+        assert!(book.asks.get(&dec!(0.56)).is_none(), "Ask at 0.56 should be removed (below new bid 0.57)");
+        assert!(book.asks.get(&dec!(0.58)).is_some(), "Ask at 0.58 should remain");
+
+        // Verify no crossed state: best_bid < best_ask
+        if let (Some((bb, _)), Some((ba, _))) = (book.best_bid(), book.best_ask()) {
+            assert!(bb < ba, "Book must not be crossed: bid {} should be < ask {}", bb, ba);
+        }
+    }
+
+    // ─── Test 7: Sequence-based tick dedup ───
+
+    #[tokio::test]
+    async fn test_sequence_dedup_rejects_old_ticks() {
+        let mut book = crate::engine::order_book::PlatformBook::new(Platform::Kalshi, Uuid::new_v4());
+
+        let tick1 = make_tick(Platform::Kalshi, book.market_id, dec!(0.40), dec!(50), dec!(0.42), dec!(50), 175, 5);
+        book.update_from_tick(&tick1);
+        assert_eq!(book.sequence, 5);
+
+        // Replay an older sequence — should be ignored
+        let tick_old = make_tick(Platform::Kalshi, book.market_id, dec!(0.30), dec!(100), dec!(0.32), dec!(100), 175, 3);
+        book.update_from_tick(&tick_old);
+        assert_eq!(book.sequence, 5, "Sequence should not regress");
+        // Bid should still be from tick1, not tick_old
+        assert_eq!(book.best_bid().unwrap().0, dec!(0.40));
+    }
+
+    // ─── Test 8: Bankroll settlement and exposure tracking ───
+
+    #[tokio::test]
+    async fn test_bankroll_exposure_lifecycle() {
+        let mut bm = BankrollManager::new(dec!(10000));
+
+        let market_id = Uuid::new_v4();
+        bm.add_exposure(Platform::Polymarket, dec!(500));
+        bm.add_exposure(Platform::Kalshi, dec!(500));
+        bm.add_market_exposure(market_id, dec!(100));
+
+        assert_eq!(bm.total_exposure(), dec!(1000));
+        assert_eq!(bm.market_exposure(&market_id), dec!(100));
+
+        bm.remove_exposure(Platform::Polymarket, dec!(500));
+        bm.remove_market_exposure(market_id, dec!(100));
+
+        assert_eq!(bm.total_exposure(), dec!(500));
+        assert_eq!(bm.market_exposure(&market_id), Decimal::ZERO);
+    }
+
+    // ─── Test 9: Database round-trip for trades ───
+
+    #[tokio::test]
+    async fn test_db_trade_roundtrip() {
+        let db = test_db().await;
+
+        let trade = TradeResult {
+            trade_id: 1,
+            opp_id: Uuid::new_v4(),
+            market_id: Uuid::new_v4(),
+            market_question: "Test market".into(),
+            leg_a_platform: Platform::Polymarket,
+            leg_a_side: Side::Yes,
+            leg_a_price: dec!(0.40),
+            leg_a_size: dec!(10),
+            leg_a_fill_price: dec!(0.40),
+            leg_a_fee: dec!(0.08),
+            leg_b_platform: Platform::Kalshi,
+            leg_b_side: Side::No,
+            leg_b_price: dec!(0.50),
+            leg_b_size: dec!(10),
+            leg_b_fill_price: dec!(0.50),
+            leg_b_fee: dec!(0.07),
+            raw_spread: dec!(0.10),
+            net_spread: dec!(0.08),
+            profit: dec!(0.85),
+            status: TradeStatus::Success,
+            failure_reason: None,
+            execution_ms: 42,
+            executed_at: chrono::Utc::now(),
+            bankroll_after: dec!(10000.85),
+            bankroll_change_pct: dec!(0.0085),
+            approved_size: dec!(10),
+        };
+
+        let row_id = db.insert_trade(&trade).await.expect("insert_trade failed");
+        assert!(row_id > 0);
+
+        let trades = db.get_trades_since(chrono::Utc::now() - chrono::Duration::hours(1)).await.expect("get_trades_since failed");
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].profit, dec!(0.85));
+        assert_eq!(trades[0].status, TradeStatus::Success);
+    }
+
+    // ─── Test 10: Database position pair atomicity ───
+
+    #[tokio::test]
+    async fn test_db_position_pair_atomic() {
+        let db = test_db().await;
+        let market_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let pos_a = Position {
+            id: 0, market_id, platform: Platform::Polymarket, side: Side::Yes,
+            quantity: dec!(10), avg_entry_price: dec!(0.40), unrealized_pnl: Decimal::ZERO,
+            opened_at: now, updated_at: now,
+        };
+        let pos_b = Position {
+            id: 0, market_id, platform: Platform::Kalshi, side: Side::No,
+            quantity: dec!(10), avg_entry_price: dec!(0.50), unrealized_pnl: Decimal::ZERO,
+            opened_at: now, updated_at: now,
+        };
+
+        db.upsert_position_pair(&pos_a, &pos_b).await.expect("upsert_position_pair failed");
+
+        let open = db.get_open_positions().await.expect("get_open_positions failed");
+        assert_eq!(open.len(), 2, "Both legs should be persisted atomically");
+
+        let arb_count = db.get_open_arb_count().await.expect("get_open_arb_count failed");
+        assert_eq!(arb_count, 1, "Two legs on same market = 1 arb pair");
+    }
+
+    // ─── Test 11: Slippage estimation edge cases ───
+
+    #[tokio::test]
+    async fn test_slippage_zero_target() {
+        use crate::feeds::normalizer::estimate_slippage;
+
+        let depth = vec![PriceLevel { price: dec!(0.50), size: dec!(10) }];
+
+        // Zero target should return None (prevents divide-by-zero)
+        assert_eq!(estimate_slippage(Decimal::ZERO, &depth), None);
+        assert_eq!(estimate_slippage(dec!(-1), &depth), None);
+
+        // Empty depth should return None
+        assert_eq!(estimate_slippage(dec!(5), &[]), None);
+    }
+
+    // ─── Test 12: Market expiry < 60s blocks detection ───
+
+    #[tokio::test]
+    async fn test_near_expiry_market_blocked() {
+        let mut registry = MarketRegistry::new();
+        let market_id = Uuid::new_v4();
+
+        let mut platforms = HashMap::new();
+        platforms.insert(Platform::Polymarket, PlatformMarketInfo {
+            platform: Platform::Polymarket, platform_market_id: "p".into(),
+            fee_rate_bps: 200, min_order_size: dec!(1), tick_size: dec!(0.01),
+        });
+        platforms.insert(Platform::Kalshi, PlatformMarketInfo {
+            platform: Platform::Kalshi, platform_market_id: "k".into(),
+            fee_rate_bps: 175, min_order_size: dec!(1), tick_size: dec!(0.01),
+        });
+
+        // Market expires in 30 seconds — should be blocked
+        registry.register_market(Market {
+            unified_id: market_id, question: "Expiring".into(), resolution_source: "t".into(),
+            expiration: chrono::Utc::now() + chrono::Duration::seconds(30),
+            platforms, category: MarketCategory::Other, confidence: 0.99,
+            status: MarketStatus::Active, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+        });
+
+        let mut uob = UnifiedOrderBook::new();
+        let spread_engine = NetSpreadEngine::new(dec!(0.01));
+        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
+
+        uob.update(&make_tick(Platform::Polymarket, market_id, dec!(0.30), dec!(100), dec!(0.32), dec!(100), 200, 1));
+        uob.update(&make_tick(Platform::Kalshi, market_id, dec!(0.60), dec!(100), dec!(0.62), dec!(100), 175, 1));
+
+        let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(10));
+        assert!(opps.is_empty(), "Markets expiring in <60s should be blocked");
+    }
+
+    // ─── Test 13: Backup path validation ───
+
+    #[tokio::test]
+    async fn test_backup_path_validation() {
+        let db = test_db().await;
+
+        // These should all be rejected
+        let bad_paths = vec![
+            "../../../etc/passwd",
+            "data/test'.db",
+            "/tmp/evil.db",
+            "data/test;drop table trades.db",
+            "data/test.txt", // wrong extension
+        ];
+
+        for path in bad_paths {
+            let result = db.backup_to_file(path).await;
+            assert!(result.is_err(), "Path '{}' should be rejected", path);
+        }
+    }
+
+    // ─── Test 14: Concurrent CB7 consecutive failure detection ───
+
+    #[tokio::test]
+    async fn test_consecutive_failure_circuit_breaker() {
+        let mut cb = CircuitBreakers::new(
+            dec!(0.05), dec!(0.10), dec!(0.20), dec!(0.40), 100, 5, 20,
+        );
+
+        // Record 5 consecutive failures
+        for _ in 0..5 {
+            cb.record_execution(false);
+        }
+
+        let trips = cb.check_all(
+            dec!(100), dec!(10000), dec!(0), dec!(0), dec!(0), 0, false, 100, dec!(0),
+        );
+
+        let has_cb7 = trips.iter().any(|t| t.breaker_type.contains("CB7"));
+        assert!(has_cb7, "CB7 should trip after 5 consecutive failures");
+        assert!(cb.is_trading_halted(), "Trading should be halted");
+    }
+}
+```
 
 ## File: .gitignore
 ```
@@ -924,176 +1385,6 @@ impl MarketRegistry {
 }
 ```
 
-## File: src/inventory/unwind_watchdog.rs
-```rust
-//! Periodic watchdog that detects orphaned (one-sided) positions and escalates.
-//!
-//! An orphaned position occurs when one leg of an arb fills but the hedge leg
-//! fails and the automatic unwind also fails. These positions bleed money as
-//! the market moves. The watchdog scans every N seconds and alerts.
-
-use anyhow::Result;
-use rust_decimal::Decimal;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{error, info};
-use uuid::Uuid;
-
-use crate::db::Database;
-use crate::types::*;
-use crate::execution::executor::{PlatformOrderClient, OrderAction};
-use crate::execution::polymarket_client::PolymarketClient;
-use crate::execution::kalshi_client::KalshiClient;
-use crate::execution::cdna_client::CdnaClient;
-use crate::execution::forecastex_client::ForecastExClient;
-
-pub struct UnwindWatchdog {
-    db: Arc<dyn Database>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    check_interval: Duration,
-    polymarket: Option<PolymarketClient>,
-    kalshi: Option<KalshiClient>,
-    cdna: Option<CdnaClient>,
-    forecastex: Option<ForecastExClient>,
-}
-
-impl UnwindWatchdog {
-    pub fn new(
-        db: Arc<dyn Database>,
-        alert_tx: mpsc::Sender<AlertMessage>,
-        check_interval_secs: u64,
-        polymarket: Option<PolymarketClient>,
-        kalshi: Option<KalshiClient>,
-        cdna: Option<CdnaClient>,
-        forecastex: Option<ForecastExClient>,
-    ) -> Self {
-        Self {
-            db,
-            alert_tx,
-            check_interval: Duration::from_secs(check_interval_secs),
-            polymarket,
-            kalshi,
-            cdna,
-            forecastex,
-        }
-    }
-
-    pub async fn run(self) {
-        info!("Unwind watchdog started");
-        let mut interval = tokio::time::interval(self.check_interval);
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.check_orphaned_positions().await {
-                error!(error = %e, "Unwind watchdog check failed");
-            }
-        }
-    }
-
-    async fn check_orphaned_positions(&self) -> Result<()> {
-        let positions = self.db.get_open_positions().await?;
-
-        // Group open positions by market_id.
-        let mut by_market: HashMap<Uuid, Vec<Position>> = HashMap::new();
-        for pos in positions {
-            by_market.entry(pos.market_id).or_default().push(pos);
-        }
-
-        for (market_id, legs) in &by_market {
-            // CRITICAL FIX: Accumulate net exposure across ALL positions.
-            // If the bot runs multiple arbs on the same market, legs.len() could be 4, 5, or 6.
-            let mut total_yes = Decimal::ZERO;
-            let mut total_no = Decimal::ZERO;
-
-            for pos in legs {
-                match pos.side {
-                    Side::Yes => total_yes += pos.quantity,
-                    Side::No => total_no += pos.quantity,
-                }
-            }
-
-            let unhedged_diff = (total_yes - total_no).abs();
-
-            if unhedged_diff > Decimal::ZERO {
-                // Find the oldest position to correctly calculate the age of the imbalance
-                let oldest = legs.iter().map(|p| p.opened_at).min().unwrap_or_else(chrono::Utc::now);
-                let age = chrono::Utc::now() - oldest;
-
-                if age.num_minutes() > 5 {
-                    error!(
-                        market_id = %market_id,
-                        unhedged_quantity = %unhedged_diff,
-                        age_minutes = age.num_minutes(),
-                        "ORPHANED POSITION DETECTED — {} contracts unhedged for {} minutes",
-                        unhedged_diff,
-                        age.num_minutes()
-                    );
-
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                        severity: "critical".into(),
-                        message: format!(
-                            "🚨 ORPHANED POSITION IMBALANCE: {} contracts unhedged \
-                             open for {} minutes. Attempting automated liquidation. \
-                             Market ID: {}",
-                            unhedged_diff,
-                            age.num_minutes(),
-                            market_id,
-                        ),
-                    });
-
-                    // L-3 FIX: Automated liquidation attempt
-                    if let Ok(Some(market)) = self.db.get_market(market_id).await {
-                        let (target_platform, target_side) = if total_yes > total_no {
-                            (legs.iter().find(|p| p.side == Side::Yes).map(|p| p.platform), Side::Yes)
-                        } else {
-                            (legs.iter().find(|p| p.side == Side::No).map(|p| p.platform), Side::No)
-                        };
-
-                        if let Some(plat) = target_platform {
-                            if let Some(info) = market.platforms.get(&plat) {
-                                let result = match plat {
-                                    Platform::Polymarket | Platform::PolymarketUs => {
-                                        if let Some(c) = &self.polymarket {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
-                                        } else { None }
-                                    },
-                                    Platform::Kalshi => {
-                                        if let Some(c) = &self.kalshi {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
-                                        } else { None }
-                                    },
-                                    Platform::Cdna => {
-                                        if let Some(c) = &self.cdna {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
-                                        } else { None }
-                                    },
-                                    Platform::ForecastEx => None,
-                                };
-
-                                if let Some(Ok(res)) = result {
-                                    if res.filled {
-                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                            severity: "warning".into(),
-                                            message: format!("✅ Automated liquidation successful. Filled {} contracts on {}.", res.fill_size, plat),
-                                        });
-                                        for pos in legs {
-                                            let _ = self.db.close_position(pos.id).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-```
-
 ## File: src/monitoring/backup.rs
 ```rust
 use anyhow::Result;
@@ -1172,81 +1463,6 @@ impl BackupTask {
             }
         }
         Ok(())
-    }
-}
-```
-
-## File: src/monitoring/health.rs
-```rust
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
-use tokio::net::TcpListener;
-use tracing::{error, info};
-
-use super::metrics::Metrics;
-
-/// Simple HTTP health check endpoint.
-/// Returns 200 when feeds are live, 503 when data is stale.
-pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_ms: u64) {
-    let addr = format!("127.0.0.1:{}", port); // CRIT-2: Bind to localhost to prevent external info leaks
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, addr, "Failed to bind health server");
-            return;
-        }
-    };
-    info!(addr, "Health server listening");
-
-    loop {
-        match listener.accept().await {
-            Ok((mut stream, _)) => {
-                // L-1 FIX: Robust HTTP header parsing using BufReader instead of fixed buffer
-                let mut req_line = String::new();
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    let mut reader = tokio::io::BufReader::new(&mut stream);
-                    let _ = reader.read_line(&mut req_line).await;
-                    let mut header_line = String::new();
-                    while let Ok(n) = reader.read_line(&mut header_line).await {
-                        if n <= 2 { break; } // \r\n or \n
-                        header_line.clear();
-                    }
-                }).await;
-
-                if !req_line.starts_with("GET ") {
-                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
-                    continue;
-                }
-
-                let ms_since_tick = metrics.ms_since_last_tick();
-                let is_healthy = ms_since_tick < stale_timeout_ms || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
-
-                let status_text = if is_healthy { "ok" } else { "degraded" };
-                let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
-
-                let body = format!(
-                    r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{},"ticks":{},"spreads_evaluated":{},"opportunities_detected":{},"executed":{},"success":{},"failed":{},"ws_reconnects":{},"api_errors":{}}}"#,
-                    status_text,
-                    metrics.uptime_secs(),
-                    ms_since_tick,
-                    metrics.ticks_received.load(Ordering::Relaxed),
-                    metrics.spreads_evaluated.load(Ordering::Relaxed),
-                    metrics.opportunities_detected.load(Ordering::Relaxed),
-                    metrics.opportunities_executed.load(Ordering::Relaxed),
-                    metrics.trades_success.load(Ordering::Relaxed),
-                    metrics.trades_failed.load(Ordering::Relaxed),
-                    metrics.ws_reconnects.load(Ordering::Relaxed),
-                    metrics.api_errors.load(Ordering::Relaxed),
-                );
-                let response = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                    http_status, body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-            Err(e) => error!(error = %e, "Health server accept error"),
-        }
     }
 }
 ```
@@ -1911,6 +2127,176 @@ pub async fn run_with_reconnect(
 }
 ```
 
+## File: src/inventory/unwind_watchdog.rs
+```rust
+//! Periodic watchdog that detects orphaned (one-sided) positions and escalates.
+//!
+//! An orphaned position occurs when one leg of an arb fills but the hedge leg
+//! fails and the automatic unwind also fails. These positions bleed money as
+//! the market moves. The watchdog scans every N seconds and alerts.
+
+use anyhow::Result;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+use uuid::Uuid;
+
+use crate::db::Database;
+use crate::types::*;
+use crate::execution::executor::{PlatformOrderClient, OrderAction};
+use crate::execution::polymarket_client::PolymarketClient;
+use crate::execution::kalshi_client::KalshiClient;
+use crate::execution::cdna_client::CdnaClient;
+use crate::execution::forecastex_client::ForecastExClient;
+
+pub struct UnwindWatchdog {
+    db: Arc<dyn Database>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    check_interval: Duration,
+    polymarket: Option<PolymarketClient>,
+    kalshi: Option<KalshiClient>,
+    cdna: Option<CdnaClient>,
+    forecastex: Option<ForecastExClient>,
+}
+
+impl UnwindWatchdog {
+    pub fn new(
+        db: Arc<dyn Database>,
+        alert_tx: mpsc::Sender<AlertMessage>,
+        check_interval_secs: u64,
+        polymarket: Option<PolymarketClient>,
+        kalshi: Option<KalshiClient>,
+        cdna: Option<CdnaClient>,
+        forecastex: Option<ForecastExClient>,
+    ) -> Self {
+        Self {
+            db,
+            alert_tx,
+            check_interval: Duration::from_secs(check_interval_secs),
+            polymarket,
+            kalshi,
+            cdna,
+            forecastex,
+        }
+    }
+
+    pub async fn run(self) {
+        info!("Unwind watchdog started");
+        let mut interval = tokio::time::interval(self.check_interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.check_orphaned_positions().await {
+                error!(error = %e, "Unwind watchdog check failed");
+            }
+        }
+    }
+
+    async fn check_orphaned_positions(&self) -> Result<()> {
+        let positions = self.db.get_open_positions().await?;
+
+        // Group open positions by market_id.
+        let mut by_market: HashMap<Uuid, Vec<Position>> = HashMap::new();
+        for pos in positions {
+            by_market.entry(pos.market_id).or_default().push(pos);
+        }
+
+        for (market_id, legs) in &by_market {
+            // CRITICAL FIX: Accumulate net exposure across ALL positions.
+            // If the bot runs multiple arbs on the same market, legs.len() could be 4, 5, or 6.
+            let mut total_yes = Decimal::ZERO;
+            let mut total_no = Decimal::ZERO;
+
+            for pos in legs {
+                match pos.side {
+                    Side::Yes => total_yes += pos.quantity,
+                    Side::No => total_no += pos.quantity,
+                }
+            }
+
+            let unhedged_diff = (total_yes - total_no).abs();
+
+            if unhedged_diff > Decimal::ZERO {
+                // Find the oldest position to correctly calculate the age of the imbalance
+                let oldest = legs.iter().map(|p| p.opened_at).min().unwrap_or_else(chrono::Utc::now);
+                let age = chrono::Utc::now() - oldest;
+
+                if age.num_minutes() > 5 {
+                    error!(
+                        market_id = %market_id,
+                        unhedged_quantity = %unhedged_diff,
+                        age_minutes = age.num_minutes(),
+                        "ORPHANED POSITION DETECTED — {} contracts unhedged for {} minutes",
+                        unhedged_diff,
+                        age.num_minutes()
+                    );
+
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                        severity: "critical".into(),
+                        message: format!(
+                            "🚨 ORPHANED POSITION IMBALANCE: {} contracts unhedged \
+                             open for {} minutes. Attempting automated liquidation. \
+                             Market ID: {}",
+                            unhedged_diff,
+                            age.num_minutes(),
+                            market_id,
+                        ),
+                    });
+
+                    // L-3 FIX: Automated liquidation attempt
+                    if let Ok(Some(market)) = self.db.get_market(market_id).await {
+                        let (target_platform, target_side) = if total_yes > total_no {
+                            (legs.iter().find(|p| p.side == Side::Yes).map(|p| p.platform), Side::Yes)
+                        } else {
+                            (legs.iter().find(|p| p.side == Side::No).map(|p| p.platform), Side::No)
+                        };
+
+                        if let Some(plat) = target_platform {
+                            if let Some(info) = market.platforms.get(&plat) {
+                                let result = match plat {
+                                    Platform::Polymarket | Platform::PolymarketUs => {
+                                        if let Some(c) = &self.polymarket {
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                        } else { None }
+                                    },
+                                    Platform::Kalshi => {
+                                        if let Some(c) = &self.kalshi {
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                        } else { None }
+                                    },
+                                    Platform::Cdna => {
+                                        if let Some(c) = &self.cdna {
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                        } else { None }
+                                    },
+                                    Platform::ForecastEx => None,
+                                };
+
+                                if let Some(Ok(res)) = result {
+                                    if res.filled {
+                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                            severity: "warning".into(),
+                                            message: format!("✅ Automated liquidation successful. Filled {} contracts on {}.", res.fill_size, plat),
+                                        });
+                                        for pos in legs {
+                                            let _ = self.db.close_position(pos.id).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+```
+
 ## File: src/monitoring/gas_oracle.rs
 ```rust
 use anyhow::Result;
@@ -2162,6 +2548,146 @@ impl GasOracle {
         Decimal::from_f64(usd)
             .ok_or_else(|| anyhow::anyhow!("Failed to convert f64 to Decimal: {}", usd))
     }
+}
+```
+
+## File: src/monitoring/health.rs
+```rust
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
+use tokio::net::TcpListener;
+use tracing::{error, info};
+
+use super::metrics::Metrics;
+
+/// HTTP server exposing both /health (JSON) and /metrics (Prometheus text format).
+/// Binds to localhost only (CRIT-2 security).
+pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_ms: u64) {
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, addr, "Failed to bind health server");
+            return;
+        }
+    };
+    info!(addr, "Health + Prometheus metrics server listening");
+
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                let mut req_line = String::new();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    let mut reader = tokio::io::BufReader::new(&mut stream);
+                    let _ = reader.read_line(&mut req_line).await;
+                    // Drain remaining headers
+                    let mut header_line = String::new();
+                    while let Ok(n) = reader.read_line(&mut header_line).await {
+                        if n <= 2 { break; }
+                        header_line.clear();
+                    }
+                }).await;
+
+                if !req_line.starts_with("GET ") {
+                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+                    continue;
+                }
+
+                // Extract path from "GET /path HTTP/1.1"
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+
+                match path {
+                    "/metrics" => {
+                        let body = render_prometheus(&metrics, stale_timeout_ms);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    "/health" | "/" => {
+                        let ms_since_tick = metrics.ms_since_last_tick();
+                        let is_healthy = ms_since_tick < stale_timeout_ms
+                            || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
+
+                        let status_text = if is_healthy { "ok" } else { "degraded" };
+                        let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
+
+                        let body = format!(
+                            r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
+                            status_text,
+                            metrics.uptime_secs(),
+                            ms_since_tick,
+                        );
+                        let response = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            http_status, body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    _ => {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+                    }
+                }
+            }
+            Err(e) => error!(error = %e, "Health server accept error"),
+        }
+    }
+}
+
+/// Render all metrics in Prometheus text exposition format.
+fn render_prometheus(m: &Metrics, stale_timeout_ms: u64) -> String {
+    let ms_since_tick = m.ms_since_last_tick();
+    let is_healthy: u8 = if ms_since_tick < stale_timeout_ms
+        || (ms_since_tick == u64::MAX && m.uptime_secs() < 60)
+    { 1 } else { 0 };
+
+    let ticks = m.ticks_received.load(Ordering::Relaxed);
+    let spreads = m.spreads_evaluated.load(Ordering::Relaxed);
+    let detected = m.opportunities_detected.load(Ordering::Relaxed);
+    let executed = m.opportunities_executed.load(Ordering::Relaxed);
+    let success = m.trades_success.load(Ordering::Relaxed);
+    let failed = m.trades_failed.load(Ordering::Relaxed);
+    let reconnects = m.ws_reconnects.load(Ordering::Relaxed);
+    let api_errors = m.api_errors.load(Ordering::Relaxed);
+    let uptime = m.uptime_secs();
+
+    format!(
+        "# HELP mercury_up Whether the engine is healthy (1=up, 0=degraded).\n\
+         # TYPE mercury_up gauge\n\
+         mercury_up {is_healthy}\n\
+         # HELP mercury_uptime_seconds Engine uptime in seconds.\n\
+         # TYPE mercury_uptime_seconds gauge\n\
+         mercury_uptime_seconds {uptime}\n\
+         # HELP mercury_ms_since_last_tick Milliseconds since last feed tick.\n\
+         # TYPE mercury_ms_since_last_tick gauge\n\
+         mercury_ms_since_last_tick {ms_since_tick}\n\
+         # HELP mercury_ticks_received_total Total feed ticks received.\n\
+         # TYPE mercury_ticks_received_total counter\n\
+         mercury_ticks_received_total {ticks}\n\
+         # HELP mercury_spreads_evaluated_total Total spread evaluations.\n\
+         # TYPE mercury_spreads_evaluated_total counter\n\
+         mercury_spreads_evaluated_total {spreads}\n\
+         # HELP mercury_opportunities_detected_total Arb opportunities detected.\n\
+         # TYPE mercury_opportunities_detected_total counter\n\
+         mercury_opportunities_detected_total {detected}\n\
+         # HELP mercury_opportunities_executed_total Arb opportunities sent to executor.\n\
+         # TYPE mercury_opportunities_executed_total counter\n\
+         mercury_opportunities_executed_total {executed}\n\
+         # HELP mercury_trades_success_total Successful trades.\n\
+         # TYPE mercury_trades_success_total counter\n\
+         mercury_trades_success_total {success}\n\
+         # HELP mercury_trades_failed_total Failed trades.\n\
+         # TYPE mercury_trades_failed_total counter\n\
+         mercury_trades_failed_total {failed}\n\
+         # HELP mercury_ws_reconnects_total WebSocket reconnection count.\n\
+         # TYPE mercury_ws_reconnects_total counter\n\
+         mercury_ws_reconnects_total {reconnects}\n\
+         # HELP mercury_api_errors_total API error count.\n\
+         # TYPE mercury_api_errors_total counter\n\
+         mercury_api_errors_total {api_errors}\n"
+    )
 }
 ```
 
@@ -3111,7 +3637,6 @@ impl SettlementMonitor {
                                     severity: "critical".into(),
                                     message: format!("Position #{} on {} resolved. Position closed in DB, but MANUAL PnL CREDIT REQUIRED to bankroll.", position.id, position.platform),
                                 });
-                                // Fix: Close position in DB to prevent infinite settlement loops, but skip automated realization.
                                 if let Err(e) = self.db.close_position(position.id).await {
                                     tracing::error!(error = %e, "Failed to close position in DB");
                                 }
@@ -3136,13 +3661,51 @@ impl SettlementMonitor {
                             warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
                         }
                         
-                        let _ = self.settlement_tx.try_send(SettlementResult {
+                        // CRIT-2 FIX: Use blocking send with timeout instead of try_send.
+                        // If the channel is full, we MUST NOT silently drop settlement PnL — 
+                        // that permanently corrupts the bankroll. Retry with backoff.
+                        let settlement_result = SettlementResult {
                             realized_pnl,
                             platform: position.platform,
                             market_id: position.market_id,
                             quantity: position.quantity,
                             avg_entry_price: position.avg_entry_price,
-                        });
+                        };
+                        
+                        let mut send_attempts = 0;
+                        loop {
+                            match self.settlement_tx.try_send(settlement_result.clone()) {
+                                Ok(()) => break,
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    send_attempts += 1;
+                                    if send_attempts >= 10 {
+                                        tracing::error!(
+                                            position_id = position.id,
+                                            realized_pnl = %realized_pnl,
+                                            "CRITICAL: Settlement channel full after 10 retries. \
+                                             PnL ${} NOT credited to bankroll. MANUAL INTERVENTION REQUIRED.",
+                                            realized_pnl
+                                        );
+                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                            severity: "critical".into(),
+                                            message: format!(
+                                                "🚨 SETTLEMENT PnL LOST: Position #{} PnL ${} could not be \
+                                                 delivered to bankroll manager. Channel saturated. \
+                                                 MANUAL BANKROLL ADJUSTMENT REQUIRED.",
+                                                position.id, realized_pnl
+                                            ),
+                                        });
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100 * send_attempts)).await;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::error!("Settlement channel closed — engine shutting down");
+                                    break;
+                                }
+                            }
+                        }
+                        
                         self.db.close_position(position.id).await?;
                         
                         let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
@@ -5174,8 +5737,7 @@ impl PlatformBook {
     /// Update from a NormalizedTick
     ///
     /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
-    /// to prevent out-of-order or replayed updates (e.g. after a reconnect)
-    /// from overwriting a newer book with stale data.
+    /// to prevent out-of-order or replayed updates from overwriting newer data.
     /// Sequence-0 ticks are treated as full snapshots and always applied.
     pub fn update_from_tick(&mut self, tick: &NormalizedTick) {
         if tick.sequence > 0 && tick.sequence <= self.sequence {
@@ -5203,18 +5765,29 @@ impl PlatformBook {
             }
         }
 
-        // Apply BBO and enforce uncrossed book invariant
+        // Apply BBO and enforce uncrossed book invariant using O(log N) split_off
+        // HIGH-4 FIX: BTreeMap::split_off is O(log N) vs the previous O(N) collect+remove.
         if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
             self.bids.insert(tick.bid_price, tick.bid_size);
-            // Split off asks <= bid_price to prevent crossed book
-            let invalid_asks: Vec<Decimal> = self.asks.range(..=tick.bid_price).map(|(&p, _)| p).collect();
-            for p in invalid_asks { self.asks.remove(&p); }
+            // Remove all asks at or below bid_price.
+            // split_off(key) returns everything >= key, leaving everything < key in self.
+            // We need to remove asks where price <= bid_price.
+            // Increment by smallest possible to get "strictly greater than bid_price".
+            // BTreeMap split trick: split at bid_price + epsilon isn't clean with Decimal.
+            // Instead, we split at bid_price and check if bid_price itself is in asks.
+            let kept = self.asks.split_off(&tick.bid_price);
+            // `self.asks` now contains asks < bid_price (invalid). `kept` has asks >= bid_price.
+            self.asks = kept;
+            // Also remove the ask AT bid_price if it exists (asks must be strictly > bid)
+            self.asks.remove(&tick.bid_price);
         }
         if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
             self.asks.insert(tick.ask_price, tick.ask_size);
-            // Split off bids >= ask_price to prevent crossed book
-            let invalid_bids: Vec<Decimal> = self.bids.range(tick.ask_price..).map(|(&p, _)| p).collect();
-            for p in invalid_bids { self.bids.remove(&p); }
+            // Remove all bids at or above ask_price.
+            // split_off(ask_price) gives us everything >= ask_price (invalid bids).
+            let invalid_bids = self.bids.split_off(&tick.ask_price);
+            // `invalid_bids` is dropped, `self.bids` retains only bids < ask_price.
+            drop(invalid_bids);
         }
 
         self.last_update_ns = tick.timestamp_ns;
@@ -5896,436 +6469,6 @@ impl ArbitrageDetector {
             });
         }
 
-        Ok(())
-    }
-}
-```
-
-## File: src/feeds/polymarket.rs
-```rust
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::str::FromStr;
-use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
-use tokio_tungstenite::Connector;
-use tracing::{debug, info};
-use uuid::Uuid;
-
-use super::base::FeedHandler;
-use crate::config::PolymarketConfig;
-use crate::types::*;
-
-pub struct PolymarketFeed {
-    config: PolymarketConfig,
-    db: std::sync::Arc<dyn crate::db::Database>,
-    subscriptions: std::collections::HashMap<String, Uuid>,
-    books: std::collections::HashMap<String, LocalOrderBook>,
-    fee_rates: std::collections::HashMap<String, u16>,
-    sequence: u64,
-}
-
-struct LocalOrderBook {
-    bids: std::collections::BTreeMap<Decimal, Decimal>,
-    asks: std::collections::BTreeMap<Decimal, Decimal>,
-    last_trade_price: Decimal,
-    sequence: u64,
-}
-
-impl LocalOrderBook {
-    fn new() -> Self {
-        Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new(), last_trade_price: Decimal::ZERO, sequence: 0 }
-    }
-
-    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
-    }
-
-    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(&p, &s)| (p, s))
-    }
-
-    fn mid_price(&self) -> Option<Decimal> {
-        let (bid, _) = self.best_bid()?;
-        let (ask, _) = self.best_ask()?;
-        Some((bid + ask) / rust_decimal::Decimal::from(2))
-    }
-
-    fn depth(&self) -> Vec<PriceLevel> {
-        let mut levels = Vec::with_capacity(20);
-        levels.extend(self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
-        levels.extend(self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
-        levels
-    }
-
-    fn apply_update(&mut self, side: &str, price: Decimal, size: Decimal) {
-        let book = if side == "BUY" || side == "bid" { &mut self.bids } else { &mut self.asks };
-        if size == Decimal::ZERO {
-            book.remove(&price);
-        } else {
-            book.insert(price, size);
-        }
-    }
-
-    fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
-        self.bids.clear();
-        self.asks.clear();
-        for (p, s) in bids { self.bids.insert(*p, *s); }
-        for (p, s) in asks { self.asks.insert(*p, *s); }
-    }
-}
-
-#[derive(Deserialize)]
-struct WsMessage {
-    #[serde(default)]
-    event_type: String,
-    #[serde(default)]
-    asset_id: String,
-    #[serde(default)]
-    market: String,
-    #[serde(default)]
-    price: Option<String>,
-    #[serde(default)]
-    bids: Option<Vec<PriceSizeEntry>>,
-    #[serde(default)]
-    asks: Option<Vec<PriceSizeEntry>>,
-    #[serde(default)]
-    changes: Option<Vec<BookChange>>,
-    #[serde(default)]
-    sequence: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct PriceSizeEntry {
-    price: String,
-    size: String,
-}
-
-#[derive(Deserialize)]
-struct BookChange {
-    side: String,
-    price: String,
-    size: String,
-}
-
-#[derive(Serialize)]
-struct SubscribeMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    assets_ids: Vec<String>,
-}
-
-impl PolymarketFeed {
-    // CRITICAL FIX: Added `db` parameter and converted Vec to HashMap to match struct definition
-    pub fn new(
-        config: PolymarketConfig,
-        db: std::sync::Arc<dyn crate::db::Database>,
-        subscriptions: Vec<(String, Uuid, u16)>,
-    ) -> Self {
-        let mut subs_map = std::collections::HashMap::new();
-        let mut fee_rates = std::collections::HashMap::new();
-        for (asset_id, market_id, fee_bps) in subscriptions {
-            subs_map.insert(asset_id.clone(), market_id);
-            // Also key fee_rates by YES token so emit_tick can find them
-            let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
-            fee_rates.insert(ws_key, fee_bps);
-        }
-        Self {
-            config,
-            db,
-            subscriptions: subs_map,
-            books: std::collections::HashMap::new(),
-            fee_rates,
-            sequence: 0,
-        }
-    }
-
-    fn asset_to_market_id(&self, asset_id: &str) -> Option<Uuid> {
-        self.subscriptions.iter()
-            .find(|(a, _)| {
-                // CRITICAL FIX: Prevent prefix-matching bugs. 
-                // If asset_id is "123", a.starts_with("123") would erroneously match "12345,678".
-                // We strictly extract the YES token (first element) and do an exact match.
-                let first_token = a.split(',').next().unwrap_or(a.as_str());
-                first_token == asset_id
-            })
-            .map(|(_, id)| *id)
-    }
-
-    fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
-        let market_id = self.asset_to_market_id(asset_id)?;
-        let book = self.books.get(asset_id)?;
-        // Both sides must be present — phantom fallbacks (bid=0, ask=1) would
-        // make the spread engine see a fake ~100% arb and fire real orders.
-        let bid = book.best_bid()?;
-        let ask = book.best_ask()?;
-        let mid = book.mid_price()?;
-        let fee_bps = self.fee_rates.get(asset_id).copied().unwrap_or(200);
-
-        Some(NormalizedTick {
-            platform: Platform::Polymarket,
-            market_id,
-            timestamp_ns: now_ns(),
-            bid_price: bid.0,
-            bid_size: bid.1,
-            ask_price: ask.0,
-            ask_size: ask.1,
-            mid_price: mid,
-            last_trade_price: book.last_trade_price,
-            last_trade_size: Decimal::ZERO,
-            book_depth: std::sync::Arc::new(book.depth()),
-            fee_rate_bps: fee_bps,
-            sequence: book.sequence, // CRITICAL FIX: Pass the actual sequence counter
-        })
-    }
-}
-
-#[async_trait]
-impl FeedHandler for PolymarketFeed {
-    fn platform(&self) -> Platform {
-        Platform::Polymarket
-    }
-
-    fn clear_books(&mut self) {
-        for book in self.books.values_mut() {
-            book.bids.clear();
-            book.asks.clear();
-        }
-    }
-
-async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
-        let url = &self.config.ws_url;
-        info!(url, "Connecting to Polymarket WebSocket");
-
-        let mut tls_builder = native_tls::TlsConnector::builder();
-        tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
-                tls_builder.add_root_certificate(cert);
-            }
-        }
-        let tls_connector = tls_builder.build().context("Failed to build TLS connector")?;
-        let connector = Connector::NativeTls(tls_connector);
-        let (ws_stream, _) = connect_async_tls_with_config(
-            url,
-            None, // WebSocket config
-            false, // disable_nagle
-            Some(connector),
-        )
-            .await
-            .context("Failed to connect to Polymarket WebSocket")?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // We only subscribe to the YES token (the first token in the comma-separated pair) 
-        // because the spread engine automatically derives the NO price from the YES orderbook.
-        let asset_ids: Vec<String> = self.subscriptions.iter()
-            .map(|(a, _)| a.split(',').next().unwrap_or(a).to_string())
-            .collect();
-            
-        if !asset_ids.is_empty() {
-            let sub_msg = SubscribeMessage {
-                msg_type: "subscribe".into(),
-                assets_ids: asset_ids.clone(),
-            };
-            let msg_text = serde_json::to_string(&sub_msg)?;
-            write.send(Message::Text(msg_text.into())).await?;
-            info!(count = asset_ids.len(), "Subscribed to Polymarket markets");
-        }
-
-        for (asset_id, _) in &self.subscriptions {
-            // WS events arrive keyed by the YES token (first element of comma pair).
-            // Books must be keyed the same way or lookups will always miss.
-            let ws_key = asset_id.split(',').next().unwrap_or(asset_id).to_string();
-            self.books.entry(ws_key).or_insert_with(LocalOrderBook::new);
-        }
-
-        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-
-        loop {
-            tokio::select! {
-                msg_opt = read.next() => {
-                    let msg = match msg_opt {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    match msg {
-                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                            if let Err(e) = self.handle_message(&text, &tick_tx) {
-                                tracing::warn!(error = %e, "Failed to process Polymarket message");
-                            }
-                        }
-                        Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
-                            let _ = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await;
-                        }
-                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                            info!("Polymarket WebSocket closed by server");
-                            return Ok(());
-                        }
-                        Err(e) => return Err(e.into()),
-                        _ => {}
-                    }
-                }
-                _ = sync_interval.tick() => {
-                    // CRITICAL FIX: Dynamically ingest newly discovered 15-min candles without rebooting
-                    if let Ok(markets) = self.db.get_active_markets().await {
-                        let mut new_subs = Vec::new();
-                        for m in markets {
-                            if let Some(info) = m.platforms.get(&crate::types::Platform::Polymarket) {
-                                let asset_id = info.platform_market_id.clone();
-                                if !self.subscriptions.contains_key(&asset_id) {
-                                    self.subscriptions.insert(asset_id.clone(), m.unified_id);
-                                    self.fee_rates.insert(asset_id.clone(), info.fee_rate_bps);
-                                    new_subs.push(asset_id.split(',').next().unwrap_or(&asset_id).to_string());
-                                }
-                            }
-                        }
-                        if !new_subs.is_empty() {
-                            // Initialize local order books for new assets before subscribing
-                            for asset_id in &new_subs {
-                                self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
-                            }
-                            let sub_msg = SubscribeMessage { msg_type: "subscribe".into(), assets_ids: new_subs.clone() };
-                            if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
-                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text.into())).await;
-                                tracing::info!(count = new_subs.len(), "Dynamically subscribed to new Polymarket markets");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum PolymarketPayload {
-    Array(Vec<WsMessage>),
-    Single(WsMessage),
-}
-
-impl PolymarketFeed {
-    fn handle_message(
-        &mut self,
-        text: &str,
-        tick_tx: &broadcast::Sender<NormalizedTick>,
-    ) -> Result<()> {
-        match serde_json::from_str::<PolymarketPayload>(text) {
-            Ok(PolymarketPayload::Array(messages)) => {
-                for msg in messages {
-                    self.process_event(&msg, tick_tx)?;
-                }
-            }
-            Ok(PolymarketPayload::Single(msg)) => {
-                self.process_event(&msg, tick_tx)?;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to parse Polymarket WS message");
-            }
-        }
-        Ok(())
-    }
-
-    fn process_event(&mut self, msg: &WsMessage, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
-        let asset_id = if !msg.asset_id.is_empty() {
-            &msg.asset_id
-        } else if !msg.market.is_empty() {
-            &msg.market
-        } else {
-            return Ok(());
-        };
-
-        match msg.event_type.as_str() {
-            "book" => {
-                if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
-                    let mut seq_to_emit = None;
-                    
-                    if let Some(book) = self.books.get_mut(asset_id) {
-                        book.bids.clear();
-                        book.asks.clear();
-                        
-                        for e in bids {
-                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
-                                book.bids.insert(p, s);
-                            }
-                        }
-                        for e in asks {
-                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
-                                book.asks.insert(p, s);
-                            }
-                        }
-                        
-                        // LOW-7 FIX: Properly handle book_snapshot sequence tracking
-                        // Snapshots from Polymarket establish the base sequence. We accept it unconditionally 
-                        // because a snapshot means we reconnected and need to hard-reset our local tracker.
-                        if let Some(msg_seq) = msg.sequence {
-                            book.sequence = msg_seq;
-                        } else {
-                            book.sequence += 1;
-                        }
-                        seq_to_emit = Some(book.sequence);
-                    }
-                    
-                    if let Some(seq) = seq_to_emit {
-                        if let Some(mut tick) = self.emit_tick(asset_id) {
-                            tick.sequence = seq;
-                            let _ = tick_tx.send(tick);
-                        }
-                    }
-                }
-            }
-            "price_change" | "book_update" => {
-                if let Some(changes) = &msg.changes {
-                    let mut seq_to_emit = None;
-                    
-                    if let Some(book) = self.books.get_mut(asset_id) {
-                        if let Some(msg_seq) = msg.sequence {
-                            if msg_seq <= book.sequence && book.sequence > 0 { return Ok(()); }
-                            if book.sequence > 0 && msg_seq > book.sequence + 1 {
-                                return Err(anyhow::anyhow!("Polymarket sequence gap detected: expected {}, got {}", book.sequence + 1, msg_seq));
-                            }
-                            book.sequence = msg_seq;
-                        } else {
-                            book.sequence += 1;
-                        }
-                        
-                        for change in changes {
-                            if let (Ok(p), Ok(s)) = (
-                                Decimal::from_str(&change.price),
-                                Decimal::from_str(&change.size),
-                            ) {
-                                book.apply_update(&change.side, p, s);
-                            }
-                        }
-                        seq_to_emit = Some(book.sequence);
-                    }
-                    
-                    if let Some(seq) = seq_to_emit {
-                        if let Some(mut tick) = self.emit_tick(asset_id) {
-                            tick.sequence = seq;
-                            let _ = tick_tx.send(tick);
-                        }
-                    }
-                }
-            }
-            "last_trade_price" => {
-                if let Some(price_str) = &msg.price {
-                    if let Ok(price) = Decimal::from_str(price_str) {
-                        if let Some(book) = self.books.get_mut(asset_id) {
-                            book.last_trade_price = price;
-                        }
-                    }
-                }
-            }
-            _ => {
-                debug!(event_type = %msg.event_type, "Unknown Polymarket event type");
-            }
-        }
         Ok(())
     }
 }
@@ -7361,724 +7504,436 @@ impl KalshiFeed {
 }
 ```
 
-## File: src/db/sqlite.rs
+## File: src/feeds/polymarket.rs
 ```rust
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::Row;
-use std::collections::HashMap;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use tokio::sync::broadcast;
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::Connector;
+use tracing::{debug, info};
 use uuid::Uuid;
 
-use super::migrations;
-use super::traits::Database;
+use super::base::FeedHandler;
+use crate::config::PolymarketConfig;
 use crate::types::*;
 
-/// SQLite-backed async implementation of [`Database`].
-#[derive(Clone)]
-pub struct SqliteDb {
-    pool: SqlitePool,
+pub struct PolymarketFeed {
+    config: PolymarketConfig,
+    db: std::sync::Arc<dyn crate::db::Database>,
+    subscriptions: std::collections::HashMap<String, Uuid>,
+    books: std::collections::HashMap<String, LocalOrderBook>,
+    fee_rates: std::collections::HashMap<String, u16>,
+    sequence: u64,
 }
 
-impl SqliteDb {
-    /// Open (or create) a SQLite database at `path` using async SQLx.
-    pub async fn new(path: &str, pool_size: u32, busy_timeout_ms: u64) -> Result<Self> {
-        // Ensure parent directory exists
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+struct LocalOrderBook {
+    bids: std::collections::BTreeMap<Decimal, Decimal>,
+    asks: std::collections::BTreeMap<Decimal, Decimal>,
+    last_trade_price: Decimal,
+    sequence: u64,
+}
+
+impl LocalOrderBook {
+    fn new() -> Self {
+        Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new(), last_trade_price: Decimal::ZERO, sequence: 0 }
+    }
+
+    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
+    }
+
+    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(&p, &s)| (p, s))
+    }
+
+    fn mid_price(&self) -> Option<Decimal> {
+        let (bid, _) = self.best_bid()?;
+        let (ask, _) = self.best_ask()?;
+        Some((bid + ask) / rust_decimal::Decimal::from(2))
+    }
+
+    fn depth(&self) -> Vec<PriceLevel> {
+        let mut levels = Vec::with_capacity(20);
+        levels.extend(self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
+        levels.extend(self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
+        levels
+    }
+
+    fn apply_update(&mut self, side: &str, price: Decimal, size: Decimal) {
+        let book = if side == "BUY" || side == "bid" { &mut self.bids } else { &mut self.asks };
+        if size == Decimal::ZERO {
+            book.remove(&price);
+        } else {
+            book.insert(price, size);
         }
+    }
 
-        let mut conn_opts = SqliteConnectOptions::from_str(&format!("sqlite:{}", path))?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))
-            .foreign_keys(true);
+    fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
+        self.bids.clear();
+        self.asks.clear();
+        for (p, s) in bids { self.bids.insert(*p, *s); }
+        for (p, s) in asks { self.asks.insert(*p, *s); }
+    }
+}
 
-        // C-3 FIX: Support encryption-at-rest via PRAGMA key if DB_ENCRYPTION_KEY is provided
-        if let Ok(key) = std::env::var("DB_ENCRYPTION_KEY") {
-            conn_opts = conn_opts.pragma("key", key);
+#[derive(Deserialize)]
+struct WsMessage {
+    #[serde(default)]
+    event_type: String,
+    #[serde(default)]
+    asset_id: String,
+    #[serde(default)]
+    market: String,
+    #[serde(default)]
+    price: Option<String>,
+    #[serde(default)]
+    bids: Option<Vec<PriceSizeEntry>>,
+    #[serde(default)]
+    asks: Option<Vec<PriceSizeEntry>>,
+    #[serde(default)]
+    changes: Option<Vec<BookChange>>,
+    #[serde(default)]
+    sequence: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PriceSizeEntry {
+    price: String,
+    size: String,
+}
+
+#[derive(Deserialize)]
+struct BookChange {
+    side: String,
+    price: String,
+    size: String,
+}
+
+#[derive(Serialize)]
+struct SubscribeMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    assets_ids: Vec<String>,
+}
+
+impl PolymarketFeed {
+    // CRITICAL FIX: Added `db` parameter and converted Vec to HashMap to match struct definition
+    pub fn new(
+        config: PolymarketConfig,
+        db: std::sync::Arc<dyn crate::db::Database>,
+        subscriptions: Vec<(String, Uuid, u16)>,
+    ) -> Self {
+        let mut subs_map = std::collections::HashMap::new();
+        let mut fee_rates = std::collections::HashMap::new();
+        for (asset_id, market_id, fee_bps) in subscriptions {
+            subs_map.insert(asset_id.clone(), market_id);
+            // Also key fee_rates by YES token so emit_tick can find them
+            let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
+            fee_rates.insert(ws_key, fee_bps);
         }
+        Self {
+            config,
+            db,
+            subscriptions: subs_map,
+            books: std::collections::HashMap::new(),
+            fee_rates,
+            sequence: 0,
+        }
+    }
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(pool_size)
-            .connect_with(conn_opts)
-            .await
-            .context("failed to build SQLite connection pool")?;
+    fn asset_to_market_id(&self, asset_id: &str) -> Option<Uuid> {
+        self.subscriptions.iter()
+            .find(|(a, _)| {
+                // CRITICAL FIX: Prevent prefix-matching bugs. 
+                // If asset_id is "123", a.starts_with("123") would erroneously match "12345,678".
+                // We strictly extract the YES token (first element) and do an exact match.
+                let first_token = a.split(',').next().unwrap_or(a.as_str());
+                first_token == asset_id
+            })
+            .map(|(_, id)| *id)
+    }
 
-        // Run migrations
-        migrations::run_migrations(&pool).await?;
+    fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
+        let market_id = self.asset_to_market_id(asset_id)?;
+        let book = self.books.get(asset_id)?;
+        // Both sides must be present — phantom fallbacks (bid=0, ask=1) would
+        // make the spread engine see a fake ~100% arb and fire real orders.
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        let mid = book.mid_price()?;
+        let fee_bps = self.fee_rates.get(asset_id).copied().unwrap_or(200);
 
-        // MED-8 FIX: Ensure partial index exists for the get_open_arb_count query
-        // This guarantees O(1) lookup times for the 60-second synchronization loop
-        // regardless of how large the historical positions table grows.
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(market_id, opened_at) WHERE closed = 0")
-            .execute(&pool)
-            .await?;
-
-        Ok(Self { pool })
+        Some(NormalizedTick {
+            platform: Platform::Polymarket,
+            market_id,
+            timestamp_ns: now_ns(),
+            bid_price: bid.0,
+            bid_size: bid.1,
+            ask_price: ask.0,
+            ask_size: ask.1,
+            mid_price: mid,
+            last_trade_price: book.last_trade_price,
+            last_trade_size: Decimal::ZERO,
+            book_depth: std::sync::Arc::new(book.depth()),
+            fee_rate_bps: fee_bps,
+            sequence: book.sequence, // CRITICAL FIX: Pass the actual sequence counter
+        })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn dec(s: &str) -> Result<Decimal> {
-    Decimal::from_str(s).map_err(|e| anyhow::anyhow!("Failed to parse Decimal from DB: {}", e))
-}
-
-fn dec_to_string(d: &Decimal) -> String {
-    d.to_string()
-}
-
-fn platform_from_db(s: &str) -> Result<Platform> {
-    match s {
-        "Polymarket" => Ok(Platform::Polymarket),
-        "Polymarket US" => Ok(Platform::PolymarketUs),
-        "Kalshi" => Ok(Platform::Kalshi),
-        "CDNA" => Ok(Platform::Cdna),
-        "ForecastEx" => Ok(Platform::ForecastEx),
-        _ => Err(anyhow::anyhow!("Unknown platform string in DB: {}", s)),
-    }
-}
-
-fn side_from_db(s: &str) -> Result<Side> {
-    match s {
-        "YES" => Ok(Side::Yes),
-        "NO" => Ok(Side::No),
-        _ => Err(anyhow::anyhow!("Unknown side string in DB: {}", s)),
-    }
-}
-
-async fn upsert_position_on<'e, E>(executor: E, pos: &Position) -> Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    if pos.id == 0 {
-        sqlx::query(
-            "INSERT INTO positions (market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
-        )
-        .bind(pos.market_id.to_string())
-        .bind(pos.platform.to_string())
-        .bind(pos.side.to_string())
-        .bind(dec_to_string(&pos.quantity))
-        .bind(dec_to_string(&pos.avg_entry_price))
-        .bind(dec_to_string(&pos.unrealized_pnl))
-        .bind(dt_to_str(&pos.opened_at))
-        .bind(dt_to_str(&pos.updated_at))
-        .execute(executor).await?;
-    } else {
-        sqlx::query(
-            "INSERT INTO positions (id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-             ON CONFLICT(id) DO UPDATE SET
-               quantity = excluded.quantity,
-               avg_entry_price = excluded.avg_entry_price,
-               unrealized_pnl = excluded.unrealized_pnl,
-               updated_at = excluded.updated_at"
-        )
-        .bind(pos.id)
-        .bind(pos.market_id.to_string())
-        .bind(pos.platform.to_string())
-        .bind(pos.side.to_string())
-        .bind(dec_to_string(&pos.quantity))
-        .bind(dec_to_string(&pos.avg_entry_price))
-        .bind(dec_to_string(&pos.unrealized_pnl))
-        .bind(dt_to_str(&pos.opened_at))
-        .bind(dt_to_str(&pos.updated_at))
-        .execute(executor).await?;
-    }
-    Ok(())
-}
-
-fn trade_status_from_db(s: &str) -> TradeStatus {
-    match s {
-        "success" => TradeStatus::Success,
-        "fail" => TradeStatus::Fail,
-        "partial" => TradeStatus::Partial,
-        _ => TradeStatus::Fail,
-    }
-}
-
-fn market_status_from_db(s: &str) -> MarketStatus {
-    match s {
-        "active" => MarketStatus::Active,
-        "suspended" => MarketStatus::Suspended,
-        "resolved" => MarketStatus::Resolved,
-        "expired" => MarketStatus::Expired,
-        _ => MarketStatus::Active,
-    }
-}
-
-fn category_from_db(s: &str) -> MarketCategory {
-    match s {
-        "sports" => MarketCategory::Sports,
-        "politics" => MarketCategory::Politics,
-        "finance" => MarketCategory::Finance,
-        "crypto" => MarketCategory::Crypto,
-        "weather" => MarketCategory::Weather,
-        "culture" => MarketCategory::Culture,
-        _ => MarketCategory::Other,
-    }
-}
-
-fn category_to_str(c: &MarketCategory) -> &'static str {
-    match c {
-        MarketCategory::Sports => "sports",
-        MarketCategory::Politics => "politics",
-        MarketCategory::Finance => "finance",
-        MarketCategory::Crypto => "crypto",
-        MarketCategory::Weather => "weather",
-        MarketCategory::Culture => "culture",
-        MarketCategory::Other => "other",
-    }
-}
-
-fn parse_dt(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
-}
-
-fn dt_to_str(dt: &DateTime<Utc>) -> String {
-    dt.to_rfc3339()
-}
-
-fn parse_naive_date(s: &str) -> NaiveDate {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive())
-}
-
-// ---------------------------------------------------------------------------
-// Database trait impl
-// ---------------------------------------------------------------------------
 
 #[async_trait]
-impl Database for SqliteDb {
-    // -- Markets --------------------------------------------------------
+impl FeedHandler for PolymarketFeed {
+    fn platform(&self) -> Platform {
+        Platform::Polymarket
+    }
 
-    async fn upsert_market(&self, market: &Market) -> Result<()> {
-        let platforms_json = serde_json::to_string(&market.platforms)?;
-        sqlx::query(
-            "INSERT INTO markets (unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             ON CONFLICT(unified_id) DO UPDATE SET
-               question = excluded.question,
-               resolution_source = excluded.resolution_source,
-               expiration = excluded.expiration,
-               platforms = excluded.platforms,
-               category = excluded.category,
-               confidence = excluded.confidence,
-               status = excluded.status,
-               updated_at = excluded.updated_at"
+    fn clear_books(&mut self) {
+        for book in self.books.values_mut() {
+            book.bids.clear();
+            book.asks.clear();
+        }
+    }
+
+async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
+        let url = &self.config.ws_url;
+        info!(url, "Connecting to Polymarket WebSocket");
+
+        let mut tls_builder = native_tls::TlsConnector::builder();
+        tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+        // M-8 FIX: Explicit TLS Cert Pinning
+        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+            if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
+                tls_builder.add_root_certificate(cert);
+            }
+        }
+        let tls_connector = tls_builder.build().context("Failed to build TLS connector")?;
+        let connector = Connector::NativeTls(tls_connector);
+        let (ws_stream, _) = connect_async_tls_with_config(
+            url,
+            None, // WebSocket config
+            false, // disable_nagle
+            Some(connector),
         )
-        .bind(market.unified_id.to_string())
-        .bind(&market.question)
-        .bind(&market.resolution_source)
-        .bind(dt_to_str(&market.expiration))
-        .bind(platforms_json)
-        .bind(category_to_str(&market.category))
-        .bind(market.confidence)
-        .bind(market.status.to_string())
-        .bind(dt_to_str(&market.created_at))
-        .bind(dt_to_str(&market.updated_at))
-        .execute(&self.pool).await?;
-        Ok(())
-    }
+            .await
+            .context("Failed to connect to Polymarket WebSocket")?;
 
-    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>> {
-        let row = sqlx::query(
-            "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
-             FROM markets WHERE unified_id = $1"
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool).await?;
+        let (mut write, mut read) = ws_stream.split();
 
-        if let Some(row) = row {
-            let platforms_str: String = row.try_get(4)?;
-            let platforms: HashMap<Platform, PlatformMarketInfo> = serde_json::from_str(&platforms_str).unwrap_or_default();
-            Ok(Some(Market {
-                unified_id: Uuid::parse_str(&row.try_get::<String, _>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
-                question: row.try_get(1)?,
-                resolution_source: row.try_get(2)?,
-                expiration: parse_dt(&row.try_get::<String, _>(3)?),
-                platforms,
-                category: category_from_db(&row.try_get::<String, _>(5)?),
-                confidence: row.try_get(6)?,
-                status: market_status_from_db(&row.try_get::<String, _>(7)?),
-                created_at: parse_dt(&row.try_get::<String, _>(8)?),
-                updated_at: parse_dt(&row.try_get::<String, _>(9)?),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn get_active_markets(&self) -> Result<Vec<Market>> {
-        let rows = sqlx::query(
-            "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
-             FROM markets WHERE status = 'active'"
-        ).fetch_all(&self.pool).await?;
-        
-        let mut markets = Vec::new();
-        for row in rows {
-            let platforms_str: String = row.try_get(4)?;
-            let platforms: HashMap<Platform, PlatformMarketInfo> = serde_json::from_str(&platforms_str).unwrap_or_default();
-            markets.push(Market {
-                unified_id: Uuid::parse_str(&row.try_get::<String, _>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
-                question: row.try_get(1)?,
-                resolution_source: row.try_get(2)?,
-                expiration: parse_dt(&row.try_get::<String, _>(3)?),
-                platforms,
-                category: category_from_db(&row.try_get::<String, _>(5)?),
-                confidence: row.try_get(6)?,
-                status: market_status_from_db(&row.try_get::<String, _>(7)?),
-                created_at: parse_dt(&row.try_get::<String, _>(8)?),
-                updated_at: parse_dt(&row.try_get::<String, _>(9)?),
-            });
-        }
-        Ok(markets)
-    }
-
-    async fn get_suspended_markets(&self) -> Result<Vec<Market>> {
-        let rows = sqlx::query(
-            "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
-             FROM markets WHERE status = 'suspended'"
-        ).fetch_all(&self.pool).await?;
-        
-        let mut markets = Vec::new();
-        for row in rows {
-            let platforms_str: String = row.try_get(4)?;
-            let platforms: HashMap<Platform, PlatformMarketInfo> = serde_json::from_str(&platforms_str).unwrap_or_default();
-            markets.push(Market {
-                unified_id: Uuid::parse_str(&row.try_get::<String, _>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
-                question: row.try_get(1)?,
-                resolution_source: row.try_get(2)?,
-                expiration: parse_dt(&row.try_get::<String, _>(3)?),
-                platforms,
-                category: category_from_db(&row.try_get::<String, _>(5)?),
-                confidence: row.try_get(6)?,
-                status: market_status_from_db(&row.try_get::<String, _>(7)?),
-                created_at: parse_dt(&row.try_get::<String, _>(8)?),
-                updated_at: parse_dt(&row.try_get::<String, _>(9)?),
-            });
-        }
-        Ok(markets)
-    }
-
-    async fn update_market_status(&self, id: &Uuid, status: MarketStatus) -> Result<()> {
-        sqlx::query("UPDATE markets SET status = $1 WHERE unified_id = $2")
-            .bind(status.to_string())
-            .bind(id.to_string())
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    // -- Trades ---------------------------------------------------------
-
-    async fn insert_trade(&self, trade: &TradeResult) -> Result<i64> {
-        let result = sqlx::query(
-            "INSERT INTO trades (opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)"
-        )
-        .bind(trade.opp_id.to_string())
-        .bind(trade.market_id.to_string())
-        .bind(&trade.market_question)
-        .bind(trade.leg_a_platform.to_string())
-        .bind(trade.leg_a_side.to_string())
-        .bind(dec_to_string(&trade.leg_a_price))
-        .bind(dec_to_string(&trade.leg_a_size))
-        .bind(dec_to_string(&trade.leg_a_fill_price))
-        .bind(dec_to_string(&trade.leg_a_fee))
-        .bind(trade.leg_b_platform.to_string())
-        .bind(trade.leg_b_side.to_string())
-        .bind(dec_to_string(&trade.leg_b_price))
-        .bind(dec_to_string(&trade.leg_b_size))
-        .bind(dec_to_string(&trade.leg_b_fill_price))
-        .bind(dec_to_string(&trade.leg_b_fee))
-        .bind(dec_to_string(&trade.raw_spread))
-        .bind(dec_to_string(&trade.net_spread))
-        .bind(dec_to_string(&trade.profit))
-        .bind(trade.status.to_string())
-        .bind(trade.failure_reason.clone())
-        .bind(trade.execution_ms as i64)
-        .bind(dt_to_str(&trade.executed_at))
-        .bind(dec_to_string(&trade.bankroll_after))
-        .bind(dec_to_string(&trade.bankroll_change_pct))
-        .execute(&self.pool).await?;
-
-        Ok(result.last_insert_rowid())
-    }
-
-    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>> {
-        let rows = sqlx::query(
-            "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
-             FROM trades WHERE executed_at >= $1 ORDER BY executed_at ASC"
-        )
-        .bind(dt_to_str(&since))
-        .fetch_all(&self.pool).await?;
-
-        let mut trades = Vec::new();
-        for row in rows {
-            trades.push(row_to_trade(&row)?);
-        }
-        Ok(trades)
-    }
-
-    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>> {
-        let start = format!("{}T00:00:00+00:00", date);
-        let end = format!("{}T00:00:00+00:00", date + Days::new(1));
-        
-        let rows = sqlx::query(
-            "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
-             FROM trades WHERE executed_at >= $1 AND executed_at < $2 ORDER BY executed_at ASC"
-        )
-        .bind(start)
-        .bind(end)
-        .fetch_all(&self.pool).await?;
-
-        let mut trades = Vec::new();
-        for row in rows {
-            trades.push(row_to_trade(&row)?);
-        }
-        Ok(trades)
-    }
-
-    async fn get_trade_count(&self) -> Result<i64> {
-        // LOW-6: Use MAX(id) to prevent duplicate IDs if trades are pruned
-        let count: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM trades")
-            .fetch_one(&self.pool).await?;
-        Ok(count)
-    }
-
-    // -- Positions ------------------------------------------------------
-
-    async fn upsert_position(&self, pos: &Position) -> Result<()> {
-        upsert_position_on(&self.pool, pos).await
-    }
-
-    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        // The sqlx Transaction inherently wraps both inserts in a single atomic transaction.
-        // Removed nested BEGIN IMMEDIATE which causes undefined behavior in SQLite.
-        upsert_position_on(&mut *tx, pos_a).await?;
-        upsert_position_on(&mut *tx, pos_b).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn get_open_positions(&self) -> Result<Vec<Position>> {
-        let rows = sqlx::query(
-            "SELECT id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at
-             FROM positions WHERE closed = 0"
-        ).fetch_all(&self.pool).await?;
-        
-        let mut positions = Vec::new();
-        for row in rows {
-            positions.push(row_to_position(&row)?);
-        }
-        Ok(positions)
-    }
-
-    async fn get_open_arb_count(&self) -> Result<usize> {
-        // HIGH-6 FIX: Use DISTINCT market_id to accurately count open arbitrage positions
-        // regardless of minor timestamp variations across multiple legs.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT market_id) FROM positions WHERE closed = 0"
-        ).fetch_one(&self.pool).await?;
-        Ok(count as usize)
-    }
-
-    async fn get_cumulative_profit(&self) -> Result<Decimal> {
-        let profit_str: String = sqlx::query_scalar("SELECT COALESCE(SUM(profit), '0') FROM trades WHERE status = 'success'")
-            .fetch_one(&self.pool).await?;
-        dec(&profit_str)
-    }
-
-    async fn close_position(&self, id: i64) -> Result<()> {
-        sqlx::query("UPDATE positions SET closed = 1 WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    // -- Balances -------------------------------------------------------
-
-    async fn update_balance(&self, bal: &PlatformBalance) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO platform_balances (platform, available, reserved, pending_settlement, total, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6)
-             ON CONFLICT(platform) DO UPDATE SET
-               available = excluded.available,
-               reserved = excluded.reserved,
-               pending_settlement = excluded.pending_settlement,
-               total = excluded.total,
-               updated_at = excluded.updated_at"
-        )
-        .bind(bal.platform.to_string())
-        .bind(dec_to_string(&bal.available))
-        .bind(dec_to_string(&bal.reserved))
-        .bind(dec_to_string(&bal.pending_settlement))
-        .bind(dec_to_string(&bal.total))
-        .bind(dt_to_str(&bal.updated_at))
-        .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>> {
-        let row = sqlx::query(
-            "SELECT platform, available, reserved, pending_settlement, total, updated_at
-             FROM platform_balances WHERE platform = $1"
-        )
-        .bind(platform.to_string())
-        .fetch_optional(&self.pool).await?;
-
-        if let Some(row) = row {
-            Ok(Some(PlatformBalance {
-                platform: platform_from_db(&row.try_get::<String, _>(0)?)?,
-                available: dec(&row.try_get::<String, _>(1)?)?,
-                reserved: dec(&row.try_get::<String, _>(2)?)?,
-                pending_settlement: dec(&row.try_get::<String, _>(3)?)?,
-                total: dec(&row.try_get::<String, _>(4)?)?,
-                updated_at: parse_dt(&row.try_get::<String, _>(5)?),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>> {
-        let rows = sqlx::query(
-            "SELECT platform, available, reserved, pending_settlement, total, updated_at
-             FROM platform_balances"
-        ).fetch_all(&self.pool).await?;
-
-        let mut balances = Vec::new();
-        for row in rows {
-            balances.push(PlatformBalance {
-                platform: platform_from_db(&row.try_get::<String, _>(0)?)?,
-                available: dec(&row.try_get::<String, _>(1)?)?,
-                reserved: dec(&row.try_get::<String, _>(2)?)?,
-                pending_settlement: dec(&row.try_get::<String, _>(3)?)?,
-                total: dec(&row.try_get::<String, _>(4)?)?,
-                updated_at: parse_dt(&row.try_get::<String, _>(5)?),
-            });
-        }
-        Ok(balances)
-    }
-
-    // -- Daily snapshots ------------------------------------------------
-
-    async fn insert_daily_snapshot(&self, snap: &DailySnapshot) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO daily_snapshots (date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-             ON CONFLICT(date) DO UPDATE SET
-               bankroll = excluded.bankroll,
-               gross_pnl = excluded.gross_pnl,
-               fees_paid = excluded.fees_paid,
-               net_pnl = excluded.net_pnl,
-               trades_count = excluded.trades_count,
-               success_count = excluded.success_count,
-               fail_count = excluded.fail_count,
-               success_rate = excluded.success_rate,
-               peak_bankroll = excluded.peak_bankroll,
-               drawdown_pct = excluded.drawdown_pct,
-               kelly_utilization = excluded.kelly_utilization"
-        )
-        .bind(snap.date.to_string())
-        .bind(dec_to_string(&snap.bankroll))
-        .bind(dec_to_string(&snap.gross_pnl))
-        .bind(dec_to_string(&snap.fees_paid))
-        .bind(dec_to_string(&snap.net_pnl))
-        .bind(snap.trades_count)
-        .bind(snap.success_count)
-        .bind(snap.fail_count)
-        .bind(dec_to_string(&snap.success_rate))
-        .bind(dec_to_string(&snap.peak_bankroll))
-        .bind(dec_to_string(&snap.drawdown_pct))
-        .bind(dec_to_string(&snap.kelly_utilization))
-        .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>> {
-        let row = sqlx::query(
-            "SELECT date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization, report_sent
-             FROM daily_snapshots WHERE date = $1"
-        )
-        .bind(date.to_string())
-        .fetch_optional(&self.pool).await?;
-
-        if let Some(row) = row {
-            Ok(Some(DailySnapshot {
-                date: parse_naive_date(&row.try_get::<String, _>(0)?),
-                bankroll: dec(&row.try_get::<String, _>(1)?)?,
-                gross_pnl: dec(&row.try_get::<String, _>(2)?)?,
-                fees_paid: dec(&row.try_get::<String, _>(3)?)?,
-                net_pnl: dec(&row.try_get::<String, _>(4)?)?,
-                trades_count: row.try_get(5)?,
-                success_count: row.try_get(6)?,
-                fail_count: row.try_get(7)?,
-                success_rate: dec(&row.try_get::<String, _>(8)?)?,
-                peak_bankroll: dec(&row.try_get::<String, _>(9)?)?,
-                drawdown_pct: dec(&row.try_get::<String, _>(10)?)?,
-                kelly_utilization: dec(&row.try_get::<String, _>(11)?)?,
-                report_sent: row.try_get::<i32, _>(12)? != 0,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()> {
-        sqlx::query("UPDATE daily_snapshots SET report_sent = 1 WHERE date = $1")
-            .bind(date.to_string())
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    // -- Audit ----------------------------------------------------------
-
-    async fn append_audit(&self, entry: &AuditEntry) -> Result<()> {
-        let data_str = serde_json::to_string(&entry.data)?;
-        sqlx::query("INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES ($1,$2,$3,$4)")
-            .bind(entry.timestamp_ns as i64)
-            .bind(&entry.module)
-            .bind(&entry.event_type)
-            .bind(data_str)
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()> {
-        if entries.is_empty() { return Ok(()); }
-        let mut tx = self.pool.begin().await?;
-        for entry in entries {
-            let data_str = serde_json::to_string(&entry.data)?;
-            sqlx::query("INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES ($1,$2,$3,$4)")
-                .bind(entry.timestamp_ns as i64)
-                .bind(&entry.module)
-                .bind(&entry.event_type)
-                .bind(data_str)
-                .execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()> {
-        sqlx::query("INSERT INTO config_history (changed_at, key, old_value, new_value) VALUES ($1,$2,$3,$4)")
-            .bind(dt_to_str(&Utc::now()))
-            .bind(key)
-            .bind(old_val)
-            .bind(new_val)
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    // -- Meta -----------------------------------------------------------
-
-    async fn checkpoint_wal(&self) -> Result<()> {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
-        Ok(())
-    }
-
-    async fn prune_audit_log(&self, keep_days: u32) -> Result<()> {
-        let cutoff_ns = crate::types::now_ns() - (keep_days as u64 * 24 * 3600 * 1_000_000_000);
-        sqlx::query("DELETE FROM audit_log WHERE timestamp_ns < $1")
-            .bind(cutoff_ns as i64)
-            .execute(&self.pool).await?;
-        
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+        // We only subscribe to the YES token (the first token in the comma-separated pair) 
+        // because the spread engine automatically derives the NO price from the YES orderbook.
+        let asset_ids: Vec<String> = self.subscriptions.iter()
+            .map(|(a, _)| a.split(',').next().unwrap_or(a).to_string())
+            .collect();
             
-        let cutoff_dt = Utc::now() - chrono::Duration::days(keep_days as i64);
-        sqlx::query("DELETE FROM config_history WHERE changed_at < $1")
-            .bind(dt_to_str(&cutoff_dt))
-            .execute(&self.pool).await?;
-        Ok(())
-    }
+        if !asset_ids.is_empty() {
+            let sub_msg = SubscribeMessage {
+                msg_type: "subscribe".into(),
+                assets_ids: asset_ids.clone(),
+            };
+            let msg_text = serde_json::to_string(&sub_msg)?;
+            write.send(Message::Text(msg_text.into())).await?;
+            info!(count = asset_ids.len(), "Subscribed to Polymarket markets");
+        }
 
-    async fn db_size_bytes(&self) -> Result<u64> {
-        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(&self.pool).await?;
-        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size").fetch_one(&self.pool).await?;
-        Ok((page_count * page_size) as u64)
-    }
+        for (asset_id, _) in &self.subscriptions {
+            // WS events arrive keyed by the YES token (first element of comma pair).
+            // Books must be keyed the same way or lookups will always miss.
+            let ws_key = asset_id.split(',').next().unwrap_or(asset_id).to_string();
+            self.books.entry(ws_key).or_insert_with(LocalOrderBook::new);
+        }
 
-    async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
-        anyhow::ensure!(!dest_path.contains(".."), "Backup path contains directory traversal");
-        anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote — potential SQL injection");
-        anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
-        anyhow::ensure!(dest_path.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.'), "Backup path contains invalid characters");
-        
-        // Restrict backups to known safe prefixes. Accept both production and local dev paths.
-        anyhow::ensure!(
-            dest_path.starts_with("/opt/mercury/data/") 
-            || dest_path.starts_with("data/") 
-            || dest_path.starts_with("./"),
-            "Backup path must be under /opt/mercury/data/, data/, or ./, got: {}", dest_path
-        );
-        
-        let query = format!("VACUUM INTO '{}'", dest_path);
-        sqlx::query(&query).execute(&self.pool).await?;
-        Ok(())
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+
+        loop {
+            tokio::select! {
+                msg_opt = read.next() => {
+                    let msg = match msg_opt {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    match msg {
+                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                            if let Err(e) = self.handle_message(&text, &tick_tx) {
+                                tracing::warn!(error = %e, "Failed to process Polymarket message");
+                            }
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
+                            let _ = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await;
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                            info!("Polymarket WebSocket closed by server");
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                        _ => {}
+                    }
+                }
+                _ = sync_interval.tick() => {
+                    // CRITICAL FIX: Dynamically ingest newly discovered 15-min candles without rebooting
+                    if let Ok(markets) = self.db.get_active_markets().await {
+                        let mut new_subs = Vec::new();
+                        for m in markets {
+                            if let Some(info) = m.platforms.get(&crate::types::Platform::Polymarket) {
+                                let asset_id = info.platform_market_id.clone();
+                                if !self.subscriptions.contains_key(&asset_id) {
+                                    self.subscriptions.insert(asset_id.clone(), m.unified_id);
+                                    
+                                    // Extract the YES token so emit_tick can correctly look up the fee rate
+                                    let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
+                                    self.fee_rates.insert(ws_key.clone(), info.fee_rate_bps);
+                                    new_subs.push(ws_key);
+                                }
+                            }
+                        }
+                        if !new_subs.is_empty() {
+                            // Initialize local order books for new assets before subscribing
+                            for asset_id in &new_subs {
+                                self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
+                            }
+                            let sub_msg = SubscribeMessage { msg_type: "subscribe".into(), assets_ids: new_subs.clone() };
+                            if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
+                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text.into())).await;
+                                tracing::info!(count = new_subs.len(), "Dynamically subscribed to new Polymarket markets");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Row-to-struct helpers
-// ---------------------------------------------------------------------------
-
-fn row_to_trade(row: &sqlx::sqlite::SqliteRow) -> Result<TradeResult> {
-    Ok(TradeResult {
-        trade_id: row.try_get("id")?,
-        opp_id: Uuid::parse_str(&row.try_get::<String, _>("opp_id")?).map_err(|e| anyhow::anyhow!("Invalid opp_id UUID in DB: {}", e))?,
-        market_id: Uuid::parse_str(&row.try_get::<String, _>("market_id")?).map_err(|e| anyhow::anyhow!("Invalid market_id UUID in DB: {}", e))?,
-        market_question: row.try_get("market_question")?,
-        leg_a_platform: platform_from_db(&row.try_get::<String, _>("leg_a_platform")?)?,
-        leg_a_side: side_from_db(&row.try_get::<String, _>("leg_a_side")?)?,
-        leg_a_price: dec(&row.try_get::<String, _>("leg_a_price")?)?,
-        leg_a_size: dec(&row.try_get::<String, _>("leg_a_size")?)?,
-        leg_a_fill_price: dec(&row.try_get::<String, _>("leg_a_fill_price")?)?,
-        leg_a_fee: dec(&row.try_get::<String, _>("leg_a_fee")?)?,
-        leg_b_platform: platform_from_db(&row.try_get::<String, _>("leg_b_platform")?)?,
-        leg_b_side: side_from_db(&row.try_get::<String, _>("leg_b_side")?)?,
-        leg_b_price: dec(&row.try_get::<String, _>("leg_b_price")?)?,
-        leg_b_size: dec(&row.try_get::<String, _>("leg_b_size")?)?,
-        leg_b_fill_price: dec(&row.try_get::<String, _>("leg_b_fill_price")?)?,
-        leg_b_fee: dec(&row.try_get::<String, _>("leg_b_fee")?)?,
-        raw_spread: dec(&row.try_get::<String, _>("raw_spread")?)?,
-        net_spread: dec(&row.try_get::<String, _>("net_spread")?)?,
-        profit: dec(&row.try_get::<String, _>("profit")?)?,
-        status: trade_status_from_db(&row.try_get::<String, _>("status")?),
-        failure_reason: row.try_get("failure_reason")?,
-        execution_ms: row.try_get::<i64, _>("execution_ms")? as u64,
-        executed_at: parse_dt(&row.try_get::<String, _>("executed_at")?),
-        bankroll_after: dec(&row.try_get::<String, _>("bankroll_after")?)?,
-        bankroll_change_pct: dec(&row.try_get::<String, _>("bankroll_change_pct")?)?,
-        approved_size: Decimal::ZERO,
-    })
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PolymarketPayload {
+    Array(Vec<WsMessage>),
+    Single(WsMessage),
 }
 
-fn row_to_position(row: &sqlx::sqlite::SqliteRow) -> Result<Position> {
-    Ok(Position {
-        id: row.try_get("id")?,
-        market_id: Uuid::parse_str(&row.try_get::<String, _>("market_id")?).map_err(|e| anyhow::anyhow!("Invalid market_id UUID in DB: {}", e))?,
-        platform: platform_from_db(&row.try_get::<String, _>("platform")?)?,
-        side: side_from_db(&row.try_get::<String, _>("side")?)?,
-        quantity: dec(&row.try_get::<String, _>("quantity")?)?,
-        avg_entry_price: dec(&row.try_get::<String, _>("avg_entry_price")?)?,
-        unrealized_pnl: dec(&row.try_get::<String, _>("unrealized_pnl")?)?,
-        opened_at: parse_dt(&row.try_get::<String, _>("opened_at")?),
-        updated_at: parse_dt(&row.try_get::<String, _>("updated_at")?),
-    })
+impl PolymarketFeed {
+    fn handle_message(
+        &mut self,
+        text: &str,
+        tick_tx: &broadcast::Sender<NormalizedTick>,
+    ) -> Result<()> {
+        match serde_json::from_str::<PolymarketPayload>(text) {
+            Ok(PolymarketPayload::Array(messages)) => {
+                for msg in messages {
+                    self.process_event(&msg, tick_tx)?;
+                }
+            }
+            Ok(PolymarketPayload::Single(msg)) => {
+                self.process_event(&msg, tick_tx)?;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to parse Polymarket WS message");
+            }
+        }
+        Ok(())
+    }
+
+    fn process_event(&mut self, msg: &WsMessage, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
+        let asset_id = if !msg.asset_id.is_empty() {
+            &msg.asset_id
+        } else if !msg.market.is_empty() {
+            &msg.market
+        } else {
+            return Ok(());
+        };
+
+        match msg.event_type.as_str() {
+            "book" => {
+                if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
+                    let mut seq_to_emit = None;
+                    
+                    if let Some(book) = self.books.get_mut(asset_id) {
+                        book.bids.clear();
+                        book.asks.clear();
+                        
+                        for e in bids {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                book.bids.insert(p, s);
+                            }
+                        }
+                        for e in asks {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                book.asks.insert(p, s);
+                            }
+                        }
+                        
+                        // LOW-7 FIX: Properly handle book_snapshot sequence tracking
+                        // Snapshots from Polymarket establish the base sequence. We accept it unconditionally 
+                        // because a snapshot means we reconnected and need to hard-reset our local tracker.
+                        if let Some(msg_seq) = msg.sequence {
+                            book.sequence = msg_seq;
+                        } else {
+                            book.sequence += 1;
+                        }
+                        seq_to_emit = Some(book.sequence);
+                    }
+                    
+                    if let Some(seq) = seq_to_emit {
+                        if let Some(mut tick) = self.emit_tick(asset_id) {
+                            tick.sequence = seq;
+                            let _ = tick_tx.send(tick);
+                        }
+                    }
+                }
+            }
+            "price_change" | "book_update" => {
+                if let Some(changes) = &msg.changes {
+                    let mut seq_to_emit = None;
+                    
+                    if let Some(book) = self.books.get_mut(asset_id) {
+                        if let Some(msg_seq) = msg.sequence {
+                            if msg_seq <= book.sequence && book.sequence > 0 { return Ok(()); }
+                            if book.sequence > 0 && msg_seq > book.sequence + 1 {
+                                return Err(anyhow::anyhow!("Polymarket sequence gap detected: expected {}, got {}", book.sequence + 1, msg_seq));
+                            }
+                            book.sequence = msg_seq;
+                        } else {
+                            book.sequence += 1;
+                        }
+                        
+                        for change in changes {
+                            if let (Ok(p), Ok(s)) = (
+                                Decimal::from_str(&change.price),
+                                Decimal::from_str(&change.size),
+                            ) {
+                                book.apply_update(&change.side, p, s);
+                            }
+                        }
+                        seq_to_emit = Some(book.sequence);
+                    }
+                    
+                    if let Some(seq) = seq_to_emit {
+                        if let Some(mut tick) = self.emit_tick(asset_id) {
+                            tick.sequence = seq;
+                            let _ = tick_tx.send(tick);
+                        }
+                    }
+                }
+            }
+            "last_trade_price" => {
+                if let Some(price_str) = &msg.price {
+                    if let Ok(price) = Decimal::from_str(price_str) {
+                        if let Some(book) = self.books.get_mut(asset_id) {
+                            book.last_trade_price = price;
+                        }
+                    }
+                }
+            }
+            _ => {
+                debug!(event_type = %msg.event_type, "Unknown Polymarket event type");
+            }
+        }
+        Ok(())
+    }
 }
 ```
 
@@ -8862,6 +8717,741 @@ impl KalshiClient {
         let balance_cents = body.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
         Ok(Decimal::from(balance_cents) / Decimal::from(100))
     }
+}
+```
+
+## File: src/db/sqlite.rs
+```rust
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Days, NaiveDate, Utc};
+use rust_decimal::Decimal;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::Row;
+use std::collections::HashMap;
+use std::path::Path;
+use std::str::FromStr;
+use uuid::Uuid;
+
+use super::migrations;
+use super::traits::Database;
+use crate::types::*;
+
+/// SQLite-backed async implementation of [`Database`].
+#[derive(Clone)]
+pub struct SqliteDb {
+    pool: SqlitePool,
+}
+
+impl SqliteDb {
+    /// Open (or create) a SQLite database at `path` using async SQLx.
+    pub async fn new(path: &str, pool_size: u32, busy_timeout_ms: u64) -> Result<Self> {
+        // Ensure parent directory exists
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let mut conn_opts = SqliteConnectOptions::from_str(&format!("sqlite:{}", path))?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))
+            .foreign_keys(true);
+
+        // C-3 FIX: Support encryption-at-rest via PRAGMA key if DB_ENCRYPTION_KEY is provided
+        if let Ok(key) = std::env::var("DB_ENCRYPTION_KEY") {
+            conn_opts = conn_opts.pragma("key", key);
+        }
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(pool_size)
+            .connect_with(conn_opts)
+            .await
+            .context("failed to build SQLite connection pool")?;
+
+        // Run migrations
+        migrations::run_migrations(&pool).await?;
+
+        // FIX (LOW-7): Use a DIFFERENT index name than the migration's idx_positions_open
+        // so this composite index coexists with the migration's single-column index.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_positions_open_market ON positions(market_id, opened_at) WHERE closed = 0")
+            .execute(&pool)
+            .await?;
+
+        Ok(Self { pool })
+    }
+
+    /// Perform a final WAL checkpoint. Call during graceful shutdown.
+    pub async fn final_checkpoint(&self) -> Result<()> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn dec(s: &str) -> Result<Decimal> {
+    Decimal::from_str(s).map_err(|e| anyhow::anyhow!("Failed to parse Decimal from DB: {}", e))
+}
+
+fn dec_to_string(d: &Decimal) -> String {
+    d.to_string()
+}
+
+fn platform_from_db(s: &str) -> Result<Platform> {
+    match s {
+        "Polymarket" => Ok(Platform::Polymarket),
+        "Polymarket US" => Ok(Platform::PolymarketUs),
+        "Kalshi" => Ok(Platform::Kalshi),
+        "CDNA" => Ok(Platform::Cdna),
+        "ForecastEx" => Ok(Platform::ForecastEx),
+        _ => Err(anyhow::anyhow!("Unknown platform string in DB: {}", s)),
+    }
+}
+
+fn side_from_db(s: &str) -> Result<Side> {
+    match s {
+        "YES" => Ok(Side::Yes),
+        "NO" => Ok(Side::No),
+        _ => Err(anyhow::anyhow!("Unknown side string in DB: {}", s)),
+    }
+}
+
+async fn upsert_position_on<'e, E>(executor: E, pos: &Position) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    if pos.id == 0 {
+        sqlx::query(
+            "INSERT INTO positions (market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+        )
+        .bind(pos.market_id.to_string())
+        .bind(pos.platform.to_string())
+        .bind(pos.side.to_string())
+        .bind(dec_to_string(&pos.quantity))
+        .bind(dec_to_string(&pos.avg_entry_price))
+        .bind(dec_to_string(&pos.unrealized_pnl))
+        .bind(dt_to_str(&pos.opened_at))
+        .bind(dt_to_str(&pos.updated_at))
+        .execute(executor).await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO positions (id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             ON CONFLICT(id) DO UPDATE SET
+               quantity = excluded.quantity,
+               avg_entry_price = excluded.avg_entry_price,
+               unrealized_pnl = excluded.unrealized_pnl,
+               updated_at = excluded.updated_at"
+        )
+        .bind(pos.id)
+        .bind(pos.market_id.to_string())
+        .bind(pos.platform.to_string())
+        .bind(pos.side.to_string())
+        .bind(dec_to_string(&pos.quantity))
+        .bind(dec_to_string(&pos.avg_entry_price))
+        .bind(dec_to_string(&pos.unrealized_pnl))
+        .bind(dt_to_str(&pos.opened_at))
+        .bind(dt_to_str(&pos.updated_at))
+        .execute(executor).await?;
+    }
+    Ok(())
+}
+
+fn trade_status_from_db(s: &str) -> TradeStatus {
+    match s {
+        "success" => TradeStatus::Success,
+        "fail" => TradeStatus::Fail,
+        "partial" => TradeStatus::Partial,
+        _ => TradeStatus::Fail,
+    }
+}
+
+fn market_status_from_db(s: &str) -> MarketStatus {
+    match s {
+        "active" => MarketStatus::Active,
+        "suspended" => MarketStatus::Suspended,
+        "resolved" => MarketStatus::Resolved,
+        "expired" => MarketStatus::Expired,
+        _ => MarketStatus::Active,
+    }
+}
+
+fn category_from_db(s: &str) -> MarketCategory {
+    match s {
+        "sports" => MarketCategory::Sports,
+        "politics" => MarketCategory::Politics,
+        "finance" => MarketCategory::Finance,
+        "crypto" => MarketCategory::Crypto,
+        "weather" => MarketCategory::Weather,
+        "culture" => MarketCategory::Culture,
+        _ => MarketCategory::Other,
+    }
+}
+
+fn category_to_str(c: &MarketCategory) -> &'static str {
+    match c {
+        MarketCategory::Sports => "sports",
+        MarketCategory::Politics => "politics",
+        MarketCategory::Finance => "finance",
+        MarketCategory::Crypto => "crypto",
+        MarketCategory::Weather => "weather",
+        MarketCategory::Culture => "culture",
+        MarketCategory::Other => "other",
+    }
+}
+
+fn parse_dt(s: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn dt_to_str(dt: &DateTime<Utc>) -> String {
+    dt.to_rfc3339()
+}
+
+fn parse_naive_date(s: &str) -> NaiveDate {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive())
+}
+
+// ---------------------------------------------------------------------------
+// Database trait impl
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl Database for SqliteDb {
+    // -- Markets --------------------------------------------------------
+
+    async fn upsert_market(&self, market: &Market) -> Result<()> {
+        let platforms_json = serde_json::to_string(&market.platforms)?;
+        sqlx::query(
+            "INSERT INTO markets (unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT(unified_id) DO UPDATE SET
+               question = excluded.question,
+               resolution_source = excluded.resolution_source,
+               expiration = excluded.expiration,
+               platforms = excluded.platforms,
+               category = excluded.category,
+               confidence = excluded.confidence,
+               status = excluded.status,
+               updated_at = excluded.updated_at"
+        )
+        .bind(market.unified_id.to_string())
+        .bind(&market.question)
+        .bind(&market.resolution_source)
+        .bind(dt_to_str(&market.expiration))
+        .bind(platforms_json)
+        .bind(category_to_str(&market.category))
+        .bind(market.confidence)
+        .bind(market.status.to_string())
+        .bind(dt_to_str(&market.created_at))
+        .bind(dt_to_str(&market.updated_at))
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>> {
+        let row = sqlx::query(
+            "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
+             FROM markets WHERE unified_id = $1"
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool).await?;
+
+        if let Some(row) = row {
+            let platforms_str: String = row.try_get(4)?;
+            let platforms: HashMap<Platform, PlatformMarketInfo> = serde_json::from_str(&platforms_str).unwrap_or_default();
+            Ok(Some(Market {
+                unified_id: Uuid::parse_str(&row.try_get::<String, _>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
+                question: row.try_get(1)?,
+                resolution_source: row.try_get(2)?,
+                expiration: parse_dt(&row.try_get::<String, _>(3)?),
+                platforms,
+                category: category_from_db(&row.try_get::<String, _>(5)?),
+                confidence: row.try_get(6)?,
+                status: market_status_from_db(&row.try_get::<String, _>(7)?),
+                created_at: parse_dt(&row.try_get::<String, _>(8)?),
+                updated_at: parse_dt(&row.try_get::<String, _>(9)?),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_active_markets(&self) -> Result<Vec<Market>> {
+        let rows = sqlx::query(
+            "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
+             FROM markets WHERE status = 'active'"
+        ).fetch_all(&self.pool).await?;
+        
+        let mut markets = Vec::new();
+        for row in rows {
+            let platforms_str: String = row.try_get(4)?;
+            let platforms: HashMap<Platform, PlatformMarketInfo> = serde_json::from_str(&platforms_str).unwrap_or_default();
+            markets.push(Market {
+                unified_id: Uuid::parse_str(&row.try_get::<String, _>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
+                question: row.try_get(1)?,
+                resolution_source: row.try_get(2)?,
+                expiration: parse_dt(&row.try_get::<String, _>(3)?),
+                platforms,
+                category: category_from_db(&row.try_get::<String, _>(5)?),
+                confidence: row.try_get(6)?,
+                status: market_status_from_db(&row.try_get::<String, _>(7)?),
+                created_at: parse_dt(&row.try_get::<String, _>(8)?),
+                updated_at: parse_dt(&row.try_get::<String, _>(9)?),
+            });
+        }
+        Ok(markets)
+    }
+
+    async fn get_suspended_markets(&self) -> Result<Vec<Market>> {
+        let rows = sqlx::query(
+            "SELECT unified_id, question, resolution_source, expiration, platforms, category, confidence, status, created_at, updated_at
+             FROM markets WHERE status = 'suspended'"
+        ).fetch_all(&self.pool).await?;
+        
+        let mut markets = Vec::new();
+        for row in rows {
+            let platforms_str: String = row.try_get(4)?;
+            let platforms: HashMap<Platform, PlatformMarketInfo> = serde_json::from_str(&platforms_str).unwrap_or_default();
+            markets.push(Market {
+                unified_id: Uuid::parse_str(&row.try_get::<String, _>(0)?).unwrap_or_else(|_| Uuid::new_v4()),
+                question: row.try_get(1)?,
+                resolution_source: row.try_get(2)?,
+                expiration: parse_dt(&row.try_get::<String, _>(3)?),
+                platforms,
+                category: category_from_db(&row.try_get::<String, _>(5)?),
+                confidence: row.try_get(6)?,
+                status: market_status_from_db(&row.try_get::<String, _>(7)?),
+                created_at: parse_dt(&row.try_get::<String, _>(8)?),
+                updated_at: parse_dt(&row.try_get::<String, _>(9)?),
+            });
+        }
+        Ok(markets)
+    }
+
+    async fn update_market_status(&self, id: &Uuid, status: MarketStatus) -> Result<()> {
+        sqlx::query("UPDATE markets SET status = $1 WHERE unified_id = $2")
+            .bind(status.to_string())
+            .bind(id.to_string())
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // -- Trades ---------------------------------------------------------
+
+    async fn insert_trade(&self, trade: &TradeResult) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO trades (opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)"
+        )
+        .bind(trade.opp_id.to_string())
+        .bind(trade.market_id.to_string())
+        .bind(&trade.market_question)
+        .bind(trade.leg_a_platform.to_string())
+        .bind(trade.leg_a_side.to_string())
+        .bind(dec_to_string(&trade.leg_a_price))
+        .bind(dec_to_string(&trade.leg_a_size))
+        .bind(dec_to_string(&trade.leg_a_fill_price))
+        .bind(dec_to_string(&trade.leg_a_fee))
+        .bind(trade.leg_b_platform.to_string())
+        .bind(trade.leg_b_side.to_string())
+        .bind(dec_to_string(&trade.leg_b_price))
+        .bind(dec_to_string(&trade.leg_b_size))
+        .bind(dec_to_string(&trade.leg_b_fill_price))
+        .bind(dec_to_string(&trade.leg_b_fee))
+        .bind(dec_to_string(&trade.raw_spread))
+        .bind(dec_to_string(&trade.net_spread))
+        .bind(dec_to_string(&trade.profit))
+        .bind(trade.status.to_string())
+        .bind(trade.failure_reason.clone())
+        .bind(trade.execution_ms as i64)
+        .bind(dt_to_str(&trade.executed_at))
+        .bind(dec_to_string(&trade.bankroll_after))
+        .bind(dec_to_string(&trade.bankroll_change_pct))
+        .execute(&self.pool).await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>> {
+        let rows = sqlx::query(
+            "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
+             FROM trades WHERE executed_at >= $1 ORDER BY executed_at ASC"
+        )
+        .bind(dt_to_str(&since))
+        .fetch_all(&self.pool).await?;
+
+        let mut trades = Vec::new();
+        for row in rows {
+            trades.push(row_to_trade(&row)?);
+        }
+        Ok(trades)
+    }
+
+    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>> {
+        let start = format!("{}T00:00:00+00:00", date);
+        let end = format!("{}T00:00:00+00:00", date + Days::new(1));
+        
+        let rows = sqlx::query(
+            "SELECT id, opp_id, market_id, market_question, leg_a_platform, leg_a_side, leg_a_price, leg_a_size, leg_a_fill_price, leg_a_fee, leg_b_platform, leg_b_side, leg_b_price, leg_b_size, leg_b_fill_price, leg_b_fee, raw_spread, net_spread, profit, status, failure_reason, execution_ms, executed_at, bankroll_after, bankroll_change_pct
+             FROM trades WHERE executed_at >= $1 AND executed_at < $2 ORDER BY executed_at ASC"
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool).await?;
+
+        let mut trades = Vec::new();
+        for row in rows {
+            trades.push(row_to_trade(&row)?);
+        }
+        Ok(trades)
+    }
+
+    async fn get_trade_count(&self) -> Result<i64> {
+        // FIX (HIGH-1): Use COUNT(*) for accurate row count, and a separate MAX(id) for
+        // the trade counter seed. The caller (main.rs) needs the highest ID to avoid
+        // collisions, not the count of rows.
+        let max_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM trades")
+            .fetch_one(&self.pool).await?;
+        Ok(max_id)
+    }
+
+    // -- Positions ------------------------------------------------------
+
+    async fn upsert_position(&self, pos: &Position) -> Result<()> {
+        upsert_position_on(&self.pool, pos).await
+    }
+
+    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        upsert_position_on(&mut *tx, pos_a).await?;
+        upsert_position_on(&mut *tx, pos_b).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn get_open_positions(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            "SELECT id, market_id, platform, side, quantity, avg_entry_price, unrealized_pnl, opened_at, updated_at
+             FROM positions WHERE closed = 0"
+        ).fetch_all(&self.pool).await?;
+        
+        let mut positions = Vec::new();
+        for row in rows {
+            positions.push(row_to_position(&row)?);
+        }
+        Ok(positions)
+    }
+
+    async fn get_open_arb_count(&self) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT market_id) FROM positions WHERE closed = 0"
+        ).fetch_one(&self.pool).await?;
+        Ok(count as usize)
+    }
+
+    async fn get_cumulative_profit(&self) -> Result<Decimal> {
+        let profit_str: String = sqlx::query_scalar("SELECT COALESCE(SUM(profit), '0') FROM trades WHERE status = 'success'")
+            .fetch_one(&self.pool).await?;
+        dec(&profit_str)
+    }
+
+    async fn close_position(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE positions SET closed = 1 WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // -- Balances -------------------------------------------------------
+
+    async fn update_balance(&self, bal: &PlatformBalance) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO platform_balances (platform, available, reserved, pending_settlement, total, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT(platform) DO UPDATE SET
+               available = excluded.available,
+               reserved = excluded.reserved,
+               pending_settlement = excluded.pending_settlement,
+               total = excluded.total,
+               updated_at = excluded.updated_at"
+        )
+        .bind(bal.platform.to_string())
+        .bind(dec_to_string(&bal.available))
+        .bind(dec_to_string(&bal.reserved))
+        .bind(dec_to_string(&bal.pending_settlement))
+        .bind(dec_to_string(&bal.total))
+        .bind(dt_to_str(&bal.updated_at))
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>> {
+        let row = sqlx::query(
+            "SELECT platform, available, reserved, pending_settlement, total, updated_at
+             FROM platform_balances WHERE platform = $1"
+        )
+        .bind(platform.to_string())
+        .fetch_optional(&self.pool).await?;
+
+        if let Some(row) = row {
+            Ok(Some(PlatformBalance {
+                platform: platform_from_db(&row.try_get::<String, _>(0)?)?,
+                available: dec(&row.try_get::<String, _>(1)?)?,
+                reserved: dec(&row.try_get::<String, _>(2)?)?,
+                pending_settlement: dec(&row.try_get::<String, _>(3)?)?,
+                total: dec(&row.try_get::<String, _>(4)?)?,
+                updated_at: parse_dt(&row.try_get::<String, _>(5)?),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>> {
+        let rows = sqlx::query(
+            "SELECT platform, available, reserved, pending_settlement, total, updated_at
+             FROM platform_balances"
+        ).fetch_all(&self.pool).await?;
+
+        let mut balances = Vec::new();
+        for row in rows {
+            balances.push(PlatformBalance {
+                platform: platform_from_db(&row.try_get::<String, _>(0)?)?,
+                available: dec(&row.try_get::<String, _>(1)?)?,
+                reserved: dec(&row.try_get::<String, _>(2)?)?,
+                pending_settlement: dec(&row.try_get::<String, _>(3)?)?,
+                total: dec(&row.try_get::<String, _>(4)?)?,
+                updated_at: parse_dt(&row.try_get::<String, _>(5)?),
+            });
+        }
+        Ok(balances)
+    }
+
+    // -- Daily snapshots ------------------------------------------------
+
+    async fn insert_daily_snapshot(&self, snap: &DailySnapshot) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO daily_snapshots (date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             ON CONFLICT(date) DO UPDATE SET
+               bankroll = excluded.bankroll,
+               gross_pnl = excluded.gross_pnl,
+               fees_paid = excluded.fees_paid,
+               net_pnl = excluded.net_pnl,
+               trades_count = excluded.trades_count,
+               success_count = excluded.success_count,
+               fail_count = excluded.fail_count,
+               success_rate = excluded.success_rate,
+               peak_bankroll = excluded.peak_bankroll,
+               drawdown_pct = excluded.drawdown_pct,
+               kelly_utilization = excluded.kelly_utilization"
+        )
+        .bind(snap.date.to_string())
+        .bind(dec_to_string(&snap.bankroll))
+        .bind(dec_to_string(&snap.gross_pnl))
+        .bind(dec_to_string(&snap.fees_paid))
+        .bind(dec_to_string(&snap.net_pnl))
+        .bind(snap.trades_count)
+        .bind(snap.success_count)
+        .bind(snap.fail_count)
+        .bind(dec_to_string(&snap.success_rate))
+        .bind(dec_to_string(&snap.peak_bankroll))
+        .bind(dec_to_string(&snap.drawdown_pct))
+        .bind(dec_to_string(&snap.kelly_utilization))
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>> {
+        let row = sqlx::query(
+            "SELECT date, bankroll, gross_pnl, fees_paid, net_pnl, trades_count, success_count, fail_count, success_rate, peak_bankroll, drawdown_pct, kelly_utilization, report_sent
+             FROM daily_snapshots WHERE date = $1"
+        )
+        .bind(date.to_string())
+        .fetch_optional(&self.pool).await?;
+
+        if let Some(row) = row {
+            Ok(Some(DailySnapshot {
+                date: parse_naive_date(&row.try_get::<String, _>(0)?),
+                bankroll: dec(&row.try_get::<String, _>(1)?)?,
+                gross_pnl: dec(&row.try_get::<String, _>(2)?)?,
+                fees_paid: dec(&row.try_get::<String, _>(3)?)?,
+                net_pnl: dec(&row.try_get::<String, _>(4)?)?,
+                trades_count: row.try_get(5)?,
+                success_count: row.try_get(6)?,
+                fail_count: row.try_get(7)?,
+                success_rate: dec(&row.try_get::<String, _>(8)?)?,
+                peak_bankroll: dec(&row.try_get::<String, _>(9)?)?,
+                drawdown_pct: dec(&row.try_get::<String, _>(10)?)?,
+                kelly_utilization: dec(&row.try_get::<String, _>(11)?)?,
+                report_sent: row.try_get::<i32, _>(12)? != 0,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()> {
+        sqlx::query("UPDATE daily_snapshots SET report_sent = 1 WHERE date = $1")
+            .bind(date.to_string())
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // -- Audit ----------------------------------------------------------
+
+    async fn append_audit(&self, entry: &AuditEntry) -> Result<()> {
+        let data_str = serde_json::to_string(&entry.data)?;
+        sqlx::query("INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES ($1,$2,$3,$4)")
+            .bind(entry.timestamp_ns as i64)
+            .bind(&entry.module)
+            .bind(&entry.event_type)
+            .bind(data_str)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()> {
+        if entries.is_empty() { return Ok(()); }
+        let mut tx = self.pool.begin().await?;
+        for entry in entries {
+            let data_str = serde_json::to_string(&entry.data)?;
+            sqlx::query("INSERT INTO audit_log (timestamp_ns, module, event_type, data) VALUES ($1,$2,$3,$4)")
+                .bind(entry.timestamp_ns as i64)
+                .bind(&entry.module)
+                .bind(&entry.event_type)
+                .bind(data_str)
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()> {
+        sqlx::query("INSERT INTO config_history (changed_at, key, old_value, new_value) VALUES ($1,$2,$3,$4)")
+            .bind(dt_to_str(&Utc::now()))
+            .bind(key)
+            .bind(old_val)
+            .bind(new_val)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // -- Meta -----------------------------------------------------------
+
+    async fn checkpoint_wal(&self) -> Result<()> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()> {
+        let cutoff_ns = crate::types::now_ns() - (keep_days as u64 * 24 * 3600 * 1_000_000_000);
+        sqlx::query("DELETE FROM audit_log WHERE timestamp_ns < $1")
+            .bind(cutoff_ns as i64)
+            .execute(&self.pool).await?;
+        
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+            
+        let cutoff_dt = Utc::now() - chrono::Duration::days(keep_days as i64);
+        sqlx::query("DELETE FROM config_history WHERE changed_at < $1")
+            .bind(dt_to_str(&cutoff_dt))
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn db_size_bytes(&self) -> Result<u64> {
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(&self.pool).await?;
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size").fetch_one(&self.pool).await?;
+        Ok((page_count * page_size) as u64)
+    }
+
+    async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
+        // CRIT-1 FIX: Comprehensive path validation to prevent SQL injection via VACUUM INTO.
+        // SQLite's VACUUM INTO does not support parameterized paths, so we must validate rigorously.
+        anyhow::ensure!(!dest_path.contains(".."), "Backup path contains directory traversal");
+        anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
+        anyhow::ensure!(
+            dest_path.chars().all(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.')),
+            "Backup path contains invalid characters: only alphanumeric, /, _, -, . allowed"
+        );
+        // Block single quotes explicitly — this is the SQL injection vector for VACUUM INTO
+        anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote");
+        // Block semicolons to prevent statement chaining
+        anyhow::ensure!(!dest_path.contains(';'), "Backup path contains semicolon");
+        
+        // Restrict backups to known safe prefixes
+        anyhow::ensure!(
+            dest_path.starts_with("/opt/mercury/data/") 
+            || dest_path.starts_with("data/") 
+            || dest_path.starts_with("./"),
+            "Backup path must be under /opt/mercury/data/, data/, or ./, got: {}", dest_path
+        );
+        
+        // Ensure the path ends with .db to prevent writing arbitrary file extensions
+        anyhow::ensure!(dest_path.ends_with(".db"), "Backup path must end with .db");
+        
+        let query = format!("VACUUM INTO '{}'", dest_path);
+        sqlx::query(&query).execute(&self.pool).await?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row-to-struct helpers
+// ---------------------------------------------------------------------------
+
+fn row_to_trade(row: &sqlx::sqlite::SqliteRow) -> Result<TradeResult> {
+    Ok(TradeResult {
+        trade_id: row.try_get("id")?,
+        opp_id: Uuid::parse_str(&row.try_get::<String, _>("opp_id")?).map_err(|e| anyhow::anyhow!("Invalid opp_id UUID in DB: {}", e))?,
+        market_id: Uuid::parse_str(&row.try_get::<String, _>("market_id")?).map_err(|e| anyhow::anyhow!("Invalid market_id UUID in DB: {}", e))?,
+        market_question: row.try_get("market_question")?,
+        leg_a_platform: platform_from_db(&row.try_get::<String, _>("leg_a_platform")?)?,
+        leg_a_side: side_from_db(&row.try_get::<String, _>("leg_a_side")?)?,
+        leg_a_price: dec(&row.try_get::<String, _>("leg_a_price")?)?,
+        leg_a_size: dec(&row.try_get::<String, _>("leg_a_size")?)?,
+        leg_a_fill_price: dec(&row.try_get::<String, _>("leg_a_fill_price")?)?,
+        leg_a_fee: dec(&row.try_get::<String, _>("leg_a_fee")?)?,
+        leg_b_platform: platform_from_db(&row.try_get::<String, _>("leg_b_platform")?)?,
+        leg_b_side: side_from_db(&row.try_get::<String, _>("leg_b_side")?)?,
+        leg_b_price: dec(&row.try_get::<String, _>("leg_b_price")?)?,
+        leg_b_size: dec(&row.try_get::<String, _>("leg_b_size")?)?,
+        leg_b_fill_price: dec(&row.try_get::<String, _>("leg_b_fill_price")?)?,
+        leg_b_fee: dec(&row.try_get::<String, _>("leg_b_fee")?)?,
+        raw_spread: dec(&row.try_get::<String, _>("raw_spread")?)?,
+        net_spread: dec(&row.try_get::<String, _>("net_spread")?)?,
+        profit: dec(&row.try_get::<String, _>("profit")?)?,
+        status: trade_status_from_db(&row.try_get::<String, _>("status")?),
+        failure_reason: row.try_get("failure_reason")?,
+        execution_ms: row.try_get::<i64, _>("execution_ms")? as u64,
+        executed_at: parse_dt(&row.try_get::<String, _>("executed_at")?),
+        bankroll_after: dec(&row.try_get::<String, _>("bankroll_after")?)?,
+        bankroll_change_pct: dec(&row.try_get::<String, _>("bankroll_change_pct")?)?,
+        approved_size: Decimal::ZERO,
+    })
+}
+
+fn row_to_position(row: &sqlx::sqlite::SqliteRow) -> Result<Position> {
+    Ok(Position {
+        id: row.try_get("id")?,
+        market_id: Uuid::parse_str(&row.try_get::<String, _>("market_id")?).map_err(|e| anyhow::anyhow!("Invalid market_id UUID in DB: {}", e))?,
+        platform: platform_from_db(&row.try_get::<String, _>("platform")?)?,
+        side: side_from_db(&row.try_get::<String, _>("side")?)?,
+        quantity: dec(&row.try_get::<String, _>("quantity")?)?,
+        avg_entry_price: dec(&row.try_get::<String, _>("avg_entry_price")?)?,
+        unrealized_pnl: dec(&row.try_get::<String, _>("unrealized_pnl")?)?,
+        opened_at: parse_dt(&row.try_get::<String, _>("opened_at")?),
+        updated_at: parse_dt(&row.try_get::<String, _>("updated_at")?),
+    })
 }
 ```
 

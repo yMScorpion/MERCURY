@@ -62,8 +62,7 @@ impl PlatformBook {
     /// Update from a NormalizedTick
     ///
     /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
-    /// to prevent out-of-order or replayed updates (e.g. after a reconnect)
-    /// from overwriting a newer book with stale data.
+    /// to prevent out-of-order or replayed updates from overwriting newer data.
     /// Sequence-0 ticks are treated as full snapshots and always applied.
     pub fn update_from_tick(&mut self, tick: &NormalizedTick) {
         if tick.sequence > 0 && tick.sequence <= self.sequence {
@@ -91,18 +90,29 @@ impl PlatformBook {
             }
         }
 
-        // Apply BBO and enforce uncrossed book invariant
+        // Apply BBO and enforce uncrossed book invariant using O(log N) split_off
+        // HIGH-4 FIX: BTreeMap::split_off is O(log N) vs the previous O(N) collect+remove.
         if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
             self.bids.insert(tick.bid_price, tick.bid_size);
-            // Split off asks <= bid_price to prevent crossed book
-            let invalid_asks: Vec<Decimal> = self.asks.range(..=tick.bid_price).map(|(&p, _)| p).collect();
-            for p in invalid_asks { self.asks.remove(&p); }
+            // Remove all asks at or below bid_price.
+            // split_off(key) returns everything >= key, leaving everything < key in self.
+            // We need to remove asks where price <= bid_price.
+            // Increment by smallest possible to get "strictly greater than bid_price".
+            // BTreeMap split trick: split at bid_price + epsilon isn't clean with Decimal.
+            // Instead, we split at bid_price and check if bid_price itself is in asks.
+            let kept = self.asks.split_off(&tick.bid_price);
+            // `self.asks` now contains asks < bid_price (invalid). `kept` has asks >= bid_price.
+            self.asks = kept;
+            // Also remove the ask AT bid_price if it exists (asks must be strictly > bid)
+            self.asks.remove(&tick.bid_price);
         }
         if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
             self.asks.insert(tick.ask_price, tick.ask_size);
-            // Split off bids >= ask_price to prevent crossed book
-            let invalid_bids: Vec<Decimal> = self.bids.range(tick.ask_price..).map(|(&p, _)| p).collect();
-            for p in invalid_bids { self.bids.remove(&p); }
+            // Remove all bids at or above ask_price.
+            // split_off(ask_price) gives us everything >= ask_price (invalid bids).
+            let invalid_bids = self.bids.split_off(&tick.ask_price);
+            // `invalid_bids` is dropped, `self.bids` retains only bids < ask_price.
+            drop(invalid_bids);
         }
 
         self.last_update_ns = tick.timestamp_ns;

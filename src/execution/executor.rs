@@ -88,9 +88,30 @@ impl ExecutionEngine {
 
     pub async fn run(mut self) {
         info!("Execution engine started");
-        while let Some(opp) = self.rx.recv().await {
-            if let Err(e) = self.execute_arbitrage(opp).await {
-                error!(error = %e, "Arbitrage execution error");
+        loop {
+            // HIGH-3 FIX: Use recv() with a periodic timeout so the task
+            // doesn't block forever if the sender is dropped or the system
+            // is shutting down. This allows the JoinSet monitor to detect
+            // executor health issues within 5 seconds.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.rx.recv(),
+            ).await {
+                Ok(Some(opp)) => {
+                    if let Err(e) = self.execute_arbitrage(opp).await {
+                        error!(error = %e, "Arbitrage execution error");
+                    }
+                }
+                Ok(None) => {
+                    // Channel closed — sender dropped, begin graceful shutdown
+                    info!("Execution engine: opportunity channel closed, draining");
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — no opportunities in 5s, just loop and check again.
+                    // This prevents the task from appearing "stuck" to the JoinSet monitor.
+                    continue;
+                }
             }
         }
         info!("Execution engine stopped");

@@ -1,15 +1,15 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use super::metrics::Metrics;
 
-/// Simple HTTP health check endpoint.
-/// Returns 200 when feeds are live, 503 when data is stale.
+/// HTTP server exposing both /health (JSON) and /metrics (Prometheus text format).
+/// Binds to localhost only (CRIT-2 security).
 pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_ms: u64) {
-    let addr = format!("127.0.0.1:{}", port); // CRIT-2: Bind to localhost to prevent external info leaks
+    let addr = format!("127.0.0.1:{}", port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -17,19 +17,19 @@ pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_m
             return;
         }
     };
-    info!(addr, "Health server listening");
+    info!(addr, "Health + Prometheus metrics server listening");
 
     loop {
         match listener.accept().await {
             Ok((mut stream, _)) => {
-                // L-1 FIX: Robust HTTP header parsing using BufReader instead of fixed buffer
                 let mut req_line = String::new();
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                     let mut reader = tokio::io::BufReader::new(&mut stream);
                     let _ = reader.read_line(&mut req_line).await;
+                    // Drain remaining headers
                     let mut header_line = String::new();
                     while let Ok(n) = reader.read_line(&mut header_line).await {
-                        if n <= 2 { break; } // \r\n or \n
+                        if n <= 2 { break; }
                         header_line.clear();
                     }
                 }).await;
@@ -39,33 +39,98 @@ pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_m
                     continue;
                 }
 
-                let ms_since_tick = metrics.ms_since_last_tick();
-                let is_healthy = ms_since_tick < stale_timeout_ms || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
+                // Extract path from "GET /path HTTP/1.1"
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
 
-                let status_text = if is_healthy { "ok" } else { "degraded" };
-                let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
+                match path {
+                    "/metrics" => {
+                        let body = render_prometheus(&metrics, stale_timeout_ms);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    "/health" | "/" => {
+                        let ms_since_tick = metrics.ms_since_last_tick();
+                        let is_healthy = ms_since_tick < stale_timeout_ms
+                            || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
 
-                let body = format!(
-                    r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{},"ticks":{},"spreads_evaluated":{},"opportunities_detected":{},"executed":{},"success":{},"failed":{},"ws_reconnects":{},"api_errors":{}}}"#,
-                    status_text,
-                    metrics.uptime_secs(),
-                    ms_since_tick,
-                    metrics.ticks_received.load(Ordering::Relaxed),
-                    metrics.spreads_evaluated.load(Ordering::Relaxed),
-                    metrics.opportunities_detected.load(Ordering::Relaxed),
-                    metrics.opportunities_executed.load(Ordering::Relaxed),
-                    metrics.trades_success.load(Ordering::Relaxed),
-                    metrics.trades_failed.load(Ordering::Relaxed),
-                    metrics.ws_reconnects.load(Ordering::Relaxed),
-                    metrics.api_errors.load(Ordering::Relaxed),
-                );
-                let response = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                    http_status, body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
+                        let status_text = if is_healthy { "ok" } else { "degraded" };
+                        let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
+
+                        let body = format!(
+                            r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
+                            status_text,
+                            metrics.uptime_secs(),
+                            ms_since_tick,
+                        );
+                        let response = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            http_status, body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    _ => {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+                    }
+                }
             }
             Err(e) => error!(error = %e, "Health server accept error"),
         }
     }
+}
+
+/// Render all metrics in Prometheus text exposition format.
+fn render_prometheus(m: &Metrics, stale_timeout_ms: u64) -> String {
+    let ms_since_tick = m.ms_since_last_tick();
+    let is_healthy: u8 = if ms_since_tick < stale_timeout_ms
+        || (ms_since_tick == u64::MAX && m.uptime_secs() < 60)
+    { 1 } else { 0 };
+
+    let ticks = m.ticks_received.load(Ordering::Relaxed);
+    let spreads = m.spreads_evaluated.load(Ordering::Relaxed);
+    let detected = m.opportunities_detected.load(Ordering::Relaxed);
+    let executed = m.opportunities_executed.load(Ordering::Relaxed);
+    let success = m.trades_success.load(Ordering::Relaxed);
+    let failed = m.trades_failed.load(Ordering::Relaxed);
+    let reconnects = m.ws_reconnects.load(Ordering::Relaxed);
+    let api_errors = m.api_errors.load(Ordering::Relaxed);
+    let uptime = m.uptime_secs();
+
+    format!(
+        "# HELP mercury_up Whether the engine is healthy (1=up, 0=degraded).\n\
+         # TYPE mercury_up gauge\n\
+         mercury_up {is_healthy}\n\
+         # HELP mercury_uptime_seconds Engine uptime in seconds.\n\
+         # TYPE mercury_uptime_seconds gauge\n\
+         mercury_uptime_seconds {uptime}\n\
+         # HELP mercury_ms_since_last_tick Milliseconds since last feed tick.\n\
+         # TYPE mercury_ms_since_last_tick gauge\n\
+         mercury_ms_since_last_tick {ms_since_tick}\n\
+         # HELP mercury_ticks_received_total Total feed ticks received.\n\
+         # TYPE mercury_ticks_received_total counter\n\
+         mercury_ticks_received_total {ticks}\n\
+         # HELP mercury_spreads_evaluated_total Total spread evaluations.\n\
+         # TYPE mercury_spreads_evaluated_total counter\n\
+         mercury_spreads_evaluated_total {spreads}\n\
+         # HELP mercury_opportunities_detected_total Arb opportunities detected.\n\
+         # TYPE mercury_opportunities_detected_total counter\n\
+         mercury_opportunities_detected_total {detected}\n\
+         # HELP mercury_opportunities_executed_total Arb opportunities sent to executor.\n\
+         # TYPE mercury_opportunities_executed_total counter\n\
+         mercury_opportunities_executed_total {executed}\n\
+         # HELP mercury_trades_success_total Successful trades.\n\
+         # TYPE mercury_trades_success_total counter\n\
+         mercury_trades_success_total {success}\n\
+         # HELP mercury_trades_failed_total Failed trades.\n\
+         # TYPE mercury_trades_failed_total counter\n\
+         mercury_trades_failed_total {failed}\n\
+         # HELP mercury_ws_reconnects_total WebSocket reconnection count.\n\
+         # TYPE mercury_ws_reconnects_total counter\n\
+         mercury_ws_reconnects_total {reconnects}\n\
+         # HELP mercury_api_errors_total API error count.\n\
+         # TYPE mercury_api_errors_total counter\n\
+         mercury_api_errors_total {api_errors}\n"
+    )
 }

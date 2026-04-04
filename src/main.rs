@@ -20,10 +20,15 @@ mod monitoring;
 mod risk;
 mod telegram;
 mod types;
+#[cfg(test)]
+#[path = "tests/integration.rs"] 
+mod integration_tests;
 
 use config::MercuryConfig;
 use db::SqliteDb;
 use types::*;
+
+
 
 #[derive(Parser)]
 #[command(name = "mercury", about = "MERCURY - Cross-Market Prediction Arbitrage Engine")]
@@ -1216,6 +1221,17 @@ loop {
     // Abort all remaining tasks and wait for them to finish.
     join_set.abort_all();
     while join_set.join_next().await.is_some() {}
+
+    // HIGH-5 FIX: Final WAL checkpoint to ensure all recent writes are durable.
+    // Without this, the last few minutes of trades/audit entries could be lost
+    // if the WAL file is corrupted or truncated on unclean shutdown.
+    if let Some(sqlite_db) = (db.as_ref() as &dyn std::any::Any).downcast_ref::<SqliteDb>() {
+        if let Err(e) = sqlite_db.final_checkpoint().await {
+            error!(error = %e, "Failed to perform final WAL checkpoint on shutdown");
+        } else {
+            info!("Final WAL checkpoint complete");
+        }
+    }
 
     Ok(())
 }

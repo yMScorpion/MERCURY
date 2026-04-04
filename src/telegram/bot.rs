@@ -162,6 +162,7 @@ impl TelegramBot {
         text.replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;")
+            .replace('"', "&quot;")
     }
     
 /// Acknowledge a callback query to remove the loading state from Telegram buttons

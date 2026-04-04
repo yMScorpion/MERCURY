@@ -118,7 +118,7 @@ impl NetSpreadEngine {
                         }
                     }
                     _ => {
-                        tracing::warn!(
+                        tracing::debug!(
                             market_id = %book_a.market_id,
                             direction = "YES-A/NO-B",
                             "Insufficient liquidity to size opportunity — skipping"

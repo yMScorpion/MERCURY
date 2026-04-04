@@ -50,14 +50,19 @@ impl SqliteDb {
         // Run migrations
         migrations::run_migrations(&pool).await?;
 
-        // MED-8 FIX: Ensure partial index exists for the get_open_arb_count query
-        // This guarantees O(1) lookup times for the 60-second synchronization loop
-        // regardless of how large the historical positions table grows.
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(market_id, opened_at) WHERE closed = 0")
+        // FIX (LOW-7): Use a DIFFERENT index name than the migration's idx_positions_open
+        // so this composite index coexists with the migration's single-column index.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_positions_open_market ON positions(market_id, opened_at) WHERE closed = 0")
             .execute(&pool)
             .await?;
 
         Ok(Self { pool })
+    }
+
+    /// Perform a final WAL checkpoint. Call during graceful shutdown.
+    pub async fn final_checkpoint(&self) -> Result<()> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+        Ok(())
     }
 }
 
@@ -387,10 +392,12 @@ impl Database for SqliteDb {
     }
 
     async fn get_trade_count(&self) -> Result<i64> {
-        // LOW-6: Use MAX(id) to prevent duplicate IDs if trades are pruned
-        let count: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM trades")
+        // FIX (HIGH-1): Use COUNT(*) for accurate row count, and a separate MAX(id) for
+        // the trade counter seed. The caller (main.rs) needs the highest ID to avoid
+        // collisions, not the count of rows.
+        let max_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM trades")
             .fetch_one(&self.pool).await?;
-        Ok(count)
+        Ok(max_id)
     }
 
     // -- Positions ------------------------------------------------------
@@ -401,8 +408,6 @@ impl Database for SqliteDb {
 
     async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        // The sqlx Transaction inherently wraps both inserts in a single atomic transaction.
-        // Removed nested BEGIN IMMEDIATE which causes undefined behavior in SQLite.
         upsert_position_on(&mut *tx, pos_a).await?;
         upsert_position_on(&mut *tx, pos_b).await?;
         tx.commit().await?;
@@ -423,8 +428,6 @@ impl Database for SqliteDb {
     }
 
     async fn get_open_arb_count(&self) -> Result<usize> {
-        // HIGH-6 FIX: Use DISTINCT market_id to accurately count open arbitrage positions
-        // regardless of minor timestamp variations across multiple legs.
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT market_id) FROM positions WHERE closed = 0"
         ).fetch_one(&self.pool).await?;
@@ -648,18 +651,29 @@ impl Database for SqliteDb {
     }
 
     async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
+        // CRIT-1 FIX: Comprehensive path validation to prevent SQL injection via VACUUM INTO.
+        // SQLite's VACUUM INTO does not support parameterized paths, so we must validate rigorously.
         anyhow::ensure!(!dest_path.contains(".."), "Backup path contains directory traversal");
-        anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote — potential SQL injection");
         anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
-        anyhow::ensure!(dest_path.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.'), "Backup path contains invalid characters");
+        anyhow::ensure!(
+            dest_path.chars().all(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.')),
+            "Backup path contains invalid characters: only alphanumeric, /, _, -, . allowed"
+        );
+        // Block single quotes explicitly — this is the SQL injection vector for VACUUM INTO
+        anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote");
+        // Block semicolons to prevent statement chaining
+        anyhow::ensure!(!dest_path.contains(';'), "Backup path contains semicolon");
         
-        // Restrict backups to known safe prefixes. Accept both production and local dev paths.
+        // Restrict backups to known safe prefixes
         anyhow::ensure!(
             dest_path.starts_with("/opt/mercury/data/") 
             || dest_path.starts_with("data/") 
             || dest_path.starts_with("./"),
             "Backup path must be under /opt/mercury/data/, data/, or ./, got: {}", dest_path
         );
+        
+        // Ensure the path ends with .db to prevent writing arbitrary file extensions
+        anyhow::ensure!(dest_path.ends_with(".db"), "Backup path must end with .db");
         
         let query = format!("VACUUM INTO '{}'", dest_path);
         sqlx::query(&query).execute(&self.pool).await?;
