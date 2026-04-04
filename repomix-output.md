@@ -94,6 +94,137 @@ src/types.rs
 
 # Files
 
+## File: .gitignore
+```
+/target
+*.db
+*.db-wal
+*.db-shm
+*.enc
+.env
+data/
+logs/
+keys/
+```
+
+## File: .mcp.json
+```json
+{
+  "mcpServers": {
+    "claude-flow": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@claude-flow/cli@latest",
+        "mcp",
+        "start"
+      ],
+      "env": {
+        "npm_config_update_notifier": "false",
+        "CLAUDE_FLOW_MODE": "v3",
+        "CLAUDE_FLOW_HOOKS_ENABLED": "true",
+        "CLAUDE_FLOW_TOPOLOGY": "hierarchical-mesh",
+        "CLAUDE_FLOW_MAX_AGENTS": "15",
+        "CLAUDE_FLOW_MEMORY_BACKEND": "hybrid"
+      },
+      "autoStart": false
+    },
+    "serena": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/oraios/serena",
+        "serena",
+        "start-mcp-server",
+        "--project-from-cwd",
+        "--context",
+        "claude-code",
+        "--mode",
+        "interactive",
+        "--mode",
+        "editing",
+        "--enable-web-dashboard",
+        "false",
+        "--open-web-dashboard",
+        "false",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}
+```
+
+## File: deploy/setup.sh
+```bash
+#!/bin/bash
+set -euo pipefail
+
+echo "=== MERCURY Instance Setup ==="
+
+sudo useradd -r -s /bin/false mercury 2>/dev/null || true
+sudo mkdir -p /opt/mercury/{config,data,logs,keys}
+sudo chown -R mercury:mercury /opt/mercury
+sudo cp target/release/mercury /opt/mercury/mercury
+sudo chmod +x /opt/mercury/mercury
+sudo cp config/default.yaml /opt/mercury/config/
+
+if [ ! -f /opt/mercury/.env ]; then
+    cat <<'ENVEOF' | sudo tee /opt/mercury/.env
+RUST_LOG=mercury=info
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_ALERTS_CHAT_ID=
+TELEGRAM_REPORT_CHAT_ID=
+POLYMARKET_API_KEY=
+POLYMARKET_API_SECRET=
+POLYMARKET_API_PASSPHRASE=
+KALSHI_API_KEY_ID=
+WALLET_PASSPHRASE=
+ENVEOF
+    sudo chmod 600 /opt/mercury/.env
+    sudo chown mercury:mercury /opt/mercury/.env
+    echo ">>> Edit /opt/mercury/.env with your credentials"
+fi
+
+sudo cp deploy/mercury.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable mercury
+
+echo "=== Setup complete ==="
+echo "1. Edit /opt/mercury/.env with your credentials"
+echo "2. Start with: sudo systemctl start mercury"
+echo "3. View logs: journalctl -u mercury -f"
+```
+
+## File: src/db/mod.rs
+```rust
+pub mod migrations;
+pub mod sqlite;
+pub mod traits;
+
+pub use sqlite::SqliteDb;
+pub use traits::Database;
+```
+
+## File: src/engine/mod.rs
+```rust
+pub mod order_book;
+pub mod spread;
+pub mod detector;
+pub mod market_registry;
+```
+
+## File: src/execution/mod.rs
+```rust
+pub mod executor;
+pub mod polymarket_client;
+pub mod kalshi_client;
+pub mod cdna_client;
+pub mod forecastex_client;
+```
+
 ## File: src/integration.rs
 ```rust
 //! Integration tests for the full MERCURY pipeline:
@@ -552,137 +683,6 @@ mod pipeline_tests {
         assert!(cb.is_trading_halted(), "Trading should be halted");
     }
 }
-```
-
-## File: .gitignore
-```
-/target
-*.db
-*.db-wal
-*.db-shm
-*.enc
-.env
-data/
-logs/
-keys/
-```
-
-## File: .mcp.json
-```json
-{
-  "mcpServers": {
-    "claude-flow": {
-      "command": "cmd",
-      "args": [
-        "/c",
-        "npx",
-        "-y",
-        "@claude-flow/cli@latest",
-        "mcp",
-        "start"
-      ],
-      "env": {
-        "npm_config_update_notifier": "false",
-        "CLAUDE_FLOW_MODE": "v3",
-        "CLAUDE_FLOW_HOOKS_ENABLED": "true",
-        "CLAUDE_FLOW_TOPOLOGY": "hierarchical-mesh",
-        "CLAUDE_FLOW_MAX_AGENTS": "15",
-        "CLAUDE_FLOW_MEMORY_BACKEND": "hybrid"
-      },
-      "autoStart": false
-    },
-    "serena": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/oraios/serena",
-        "serena",
-        "start-mcp-server",
-        "--project-from-cwd",
-        "--context",
-        "claude-code",
-        "--mode",
-        "interactive",
-        "--mode",
-        "editing",
-        "--enable-web-dashboard",
-        "false",
-        "--open-web-dashboard",
-        "false",
-        "--transport",
-        "stdio"
-      ]
-    }
-  }
-}
-```
-
-## File: deploy/setup.sh
-```bash
-#!/bin/bash
-set -euo pipefail
-
-echo "=== MERCURY Instance Setup ==="
-
-sudo useradd -r -s /bin/false mercury 2>/dev/null || true
-sudo mkdir -p /opt/mercury/{config,data,logs,keys}
-sudo chown -R mercury:mercury /opt/mercury
-sudo cp target/release/mercury /opt/mercury/mercury
-sudo chmod +x /opt/mercury/mercury
-sudo cp config/default.yaml /opt/mercury/config/
-
-if [ ! -f /opt/mercury/.env ]; then
-    cat <<'ENVEOF' | sudo tee /opt/mercury/.env
-RUST_LOG=mercury=info
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_ALERTS_CHAT_ID=
-TELEGRAM_REPORT_CHAT_ID=
-POLYMARKET_API_KEY=
-POLYMARKET_API_SECRET=
-POLYMARKET_API_PASSPHRASE=
-KALSHI_API_KEY_ID=
-WALLET_PASSPHRASE=
-ENVEOF
-    sudo chmod 600 /opt/mercury/.env
-    sudo chown mercury:mercury /opt/mercury/.env
-    echo ">>> Edit /opt/mercury/.env with your credentials"
-fi
-
-sudo cp deploy/mercury.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable mercury
-
-echo "=== Setup complete ==="
-echo "1. Edit /opt/mercury/.env with your credentials"
-echo "2. Start with: sudo systemctl start mercury"
-echo "3. View logs: journalctl -u mercury -f"
-```
-
-## File: src/db/mod.rs
-```rust
-pub mod migrations;
-pub mod sqlite;
-pub mod traits;
-
-pub use sqlite::SqliteDb;
-pub use traits::Database;
-```
-
-## File: src/engine/mod.rs
-```rust
-pub mod order_book;
-pub mod spread;
-pub mod detector;
-pub mod market_registry;
-```
-
-## File: src/execution/mod.rs
-```rust
-pub mod executor;
-pub mod polymarket_client;
-pub mod kalshi_client;
-pub mod cdna_client;
-pub mod forecastex_client;
 ```
 
 ## File: src/risk/mod.rs
@@ -1312,79 +1312,6 @@ impl KalshiAuth {
 }
 ```
 
-## File: src/engine/market_registry.rs
-```rust
-use std::collections::HashMap;
-use uuid::Uuid;
-
-use crate::types::*;
-
-/// Cross-platform market matching registry
-pub struct MarketRegistry {
-    markets: HashMap<Uuid, Market>,
-    arb_pairs: HashMap<Uuid, Vec<ArbPair>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ArbPair {
-    pub market_id: Uuid,
-    pub platform_a: Platform,
-    pub platform_b: Platform,
-    pub confidence: f64,
-}
-
-impl MarketRegistry {
-    pub fn new() -> Self {
-        Self {
-            markets: HashMap::new(),
-            arb_pairs: HashMap::new(), // CRITICAL FIX: Match struct definition
-        }
-    }
-
-    /// Register a market. Idempotent: re-registering the same market_id updates
-    /// the market definition but does not create duplicate arb pairs.
-    pub fn register_market(&mut self, market: Market) {
-        let market_id = market.unified_id;
-        let platforms: Vec<Platform> = market.platforms.keys().cloned().collect();
-        let confidence = market.confidence;
-
-        self.markets.insert(market_id, market);
-
-        let mut pairs = Vec::new();
-        if confidence >= 0.95 {
-            for i in 0..platforms.len() {
-                for j in (i + 1)..platforms.len() {
-                    pairs.push(ArbPair {
-                        market_id,
-                        platform_a: platforms[i],
-                        platform_b: platforms[j],
-                        confidence,
-                    });
-                }
-            }
-        }
-        
-        if !pairs.is_empty() {
-            self.arb_pairs.insert(market_id, pairs);
-        } else {
-            self.arb_pairs.remove(&market_id);
-        }
-    }
-
-    pub fn get_arb_pairs_for_market(&self, market_id: &Uuid) -> Option<&Vec<ArbPair>> {
-        self.arb_pairs.get(market_id)
-    }
-
-    pub fn get_market(&self, id: &Uuid) -> Option<&Market> {
-        self.markets.get(id)
-    }
-
-    pub fn get_platform_info(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformMarketInfo> {
-        self.markets.get(market_id)?.platforms.get(platform)
-    }
-}
-```
-
 ## File: src/monitoring/backup.rs
 ```rust
 use anyhow::Result;
@@ -1986,6 +1913,79 @@ CREATE INDEX IF NOT EXISTS idx_config_hist_ts ON config_history(changed_at);
 "#;
 ```
 
+## File: src/engine/market_registry.rs
+```rust
+use std::collections::HashMap;
+use uuid::Uuid;
+
+use crate::types::*;
+
+/// Cross-platform market matching registry
+pub struct MarketRegistry {
+    markets: HashMap<Uuid, Market>,
+    arb_pairs: HashMap<Uuid, Vec<ArbPair>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbPair {
+    pub market_id: Uuid,
+    pub platform_a: Platform,
+    pub platform_b: Platform,
+    pub confidence: f64,
+}
+
+impl MarketRegistry {
+    pub fn new() -> Self {
+        Self {
+            markets: HashMap::new(),
+            arb_pairs: HashMap::new(),
+        }
+    }
+
+    /// Register a market. Idempotent: re-registering the same market_id updates
+    /// the market definition but does not create duplicate arb pairs.
+    pub fn register_market(&mut self, market: Market) {
+        let market_id = market.unified_id;
+        let platforms: Vec<Platform> = market.platforms.keys().cloned().collect();
+        let confidence = market.confidence;
+
+        self.markets.insert(market_id, market);
+
+        let mut pairs = Vec::new();
+        if confidence >= 0.95 {
+            for i in 0..platforms.len() {
+                for j in (i + 1)..platforms.len() {
+                    pairs.push(ArbPair {
+                        market_id,
+                        platform_a: platforms[i],
+                        platform_b: platforms[j],
+                        confidence,
+                    });
+                }
+            }
+        }
+        
+        if !pairs.is_empty() {
+            self.arb_pairs.insert(market_id, pairs);
+        } else {
+            self.arb_pairs.remove(&market_id);
+        }
+    }
+
+    pub fn get_arb_pairs_for_market(&self, market_id: &Uuid) -> Option<&Vec<ArbPair>> {
+        self.arb_pairs.get(market_id)
+    }
+
+    pub fn get_market(&self, id: &Uuid) -> Option<&Market> {
+        self.markets.get(id)
+    }
+
+    pub fn get_platform_info(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformMarketInfo> {
+        self.markets.get(market_id)?.platforms.get(platform)
+    }
+}
+```
+
 ## File: src/execution/forecastex_client.rs
 ```rust
 use anyhow::Result;
@@ -2294,400 +2294,6 @@ impl UnwindWatchdog {
 
         Ok(())
     }
-}
-```
-
-## File: src/monitoring/gas_oracle.rs
-```rust
-use anyhow::Result;
-use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
-use rust_decimal_macros::dec;
-use serde::Deserialize;
-use tokio::sync::mpsc;
-use tokio::time::{interval_at, Duration, Instant};
-use tracing::{debug, error, info, warn};
-
-/// Sent to the main event loop whenever live prices are refreshed.
-#[derive(Debug, Clone)]
-pub struct GasUpdate {
-    /// Polygon network gas price in gwei.
-    pub gas_gwei: u64,
-    /// MATIC/USD spot price.
-    pub matic_usd: Decimal,
-}
-
-pub struct GasOracle {
-    rpc_url: String,
-    poll_interval_secs: u64,
-    update_tx: mpsc::Sender<GasUpdate>,
-    http: reqwest::Client,
-}
-
-// ── JSON shapes for eth_gasPrice RPC ───────────────────────────────────────
-
-#[derive(Deserialize)]
-struct RpcResponse {
-    result: Option<String>,
-    /// JSON-RPC error object returned with HTTP 200 on RPC-level errors.
-    /// Must be captured to produce useful diagnostics instead of "null result".
-    error: Option<RpcError>,
-}
-
-#[derive(Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-
-/// Alert if this many consecutive CoinGecko fetches fail (rate-limited or down).
-const COINGECKO_ALERT_THRESHOLD: u32 = 5;
-
-impl GasOracle {
-    pub fn new(
-        rpc_url: String,
-        poll_interval_secs: u64,
-        update_tx: mpsc::Sender<GasUpdate>,
-    ) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("mercury-gas-oracle/1.0")
-            .build()
-            .expect("failed to build gas oracle HTTP client");
-        Self { rpc_url, poll_interval_secs, update_tx, http }
-    }
-
-    pub async fn run(self) {
-        // Start with sane defaults so the engine is never un-initialised.
-        let mut last_gwei: u64 = 50;
-        let mut last_matic: Decimal = dec!(0.50);
-        let mut coingecko_failures: u32 = 0;
-
-        let poll_secs = self.poll_interval_secs.max(10); // floor at 10s
-
-        // Use interval_at(now) so the FIRST tick fires immediately, pushing live
-        // values to the spread engine before any arb detection begins.
-        let mut ticker = interval_at(Instant::now(), Duration::from_secs(poll_secs));
-
-        info!(
-            interval_secs = poll_secs,
-            rpc_url = %self.rpc_url,
-            "Gas oracle started (first fetch is immediate)"
-        );
-
-        loop {
-            ticker.tick().await;
-
-            match self.fetch_gas_gwei().await {
-                Ok(gwei) => {
-                    if gwei != last_gwei {
-                        info!(gwei, prev_gwei = last_gwei, "Polygon gas price updated");
-                    } else {
-                        debug!(gwei, "Polygon gas price unchanged");
-                    }
-                    last_gwei = gwei;
-                }
-                Err(e) => {
-                    warn!(error = %e, last_gwei, "Failed to fetch Polygon gas price — keeping last value");
-                }
-            }
-
-            match self.fetch_matic_usd().await {
-                Ok(raw_price) => {
-                    // CRITICAL FIX (3-D): Hard floor/ceiling to prevent severe oracle glitches
-                    // from multiplying gas estimates by 1000x and breaking the spread math.
-                    let price = raw_price.clamp(dec!(0.20), dec!(5.00));
-                    
-                    let change_pct = if last_matic > Decimal::ZERO {
-                        ((price - last_matic) / last_matic * Decimal::from(100)).abs()
-                    } else {
-                        Decimal::from(100)
-                    };
-                    if change_pct > dec!(1) {
-                        info!(matic_usd = %price, prev = %last_matic, "MATIC/USD price updated");
-                    } else {
-                        debug!(matic_usd = %price, "MATIC/USD price refreshed");
-                    }
-                    last_matic = price;
-                    coingecko_failures = 0;
-                }
-                Err(e) => {
-                    coingecko_failures += 1;
-                    if coingecko_failures >= COINGECKO_ALERT_THRESHOLD {
-                        error!(
-                            failures = coingecko_failures,
-                            last_matic = %last_matic,
-                            error = %e,
-                            "CoinGecko MATIC/USD fetch has failed {} consecutive times — \
-                             gas costs may be stale, arb profitability estimates unreliable",
-                            coingecko_failures
-                        );
-                    } else {
-                        warn!(
-                            error = %e,
-                            last_matic = %last_matic,
-                            failures = coingecko_failures,
-                            "Failed to fetch MATIC/USD — keeping last value"
-                        );
-                    }
-                }
-            }
-
-            let update = GasUpdate { gas_gwei: last_gwei, matic_usd: last_matic };
-            // Use try_send (non-blocking) so the oracle never blocks the main loop
-            if let Err(e) = self.update_tx.try_send(update) {
-                match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        warn!("Gas oracle channel full — skipping update");
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        debug!("Gas oracle channel closed — exiting cleanly");
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Call `eth_gasPrice` on the configured Polygon RPC endpoint.
-    async fn fetch_gas_gwei(&self) -> Result<u64> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_gasPrice",
-            "params": [],
-            "id": 1
-        });
-
-        let resp: RpcResponse = self.http
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        // Surface JSON-RPC errors (returned with HTTP 200 by most RPC providers).
-        if let Some(rpc_err) = resp.error {
-            return Err(anyhow::anyhow!(
-                "Polygon RPC error {}: {}",
-                rpc_err.code,
-                rpc_err.message
-            ));
-        }
-
-        let hex = resp.result
-            .ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result (no error field)"))?;
-
-        // Result is a hex string like "0x..." representing wei
-        let hex_stripped = hex.trim_start_matches("0x");
-        let wei = u64::from_str_radix(hex_stripped, 16)
-            .map_err(|e| anyhow::anyhow!("failed to parse gas price hex '{}': {}", hex, e))?;
-        let gwei = wei / 1_000_000_000;
-        Ok(gwei.max(1)) // floor at 1 gwei to avoid zero gas cost in spread calc
-    }
-
-    /// Fetch MATIC/USD (or POL/USD) from CoinGecko's free simple/price endpoint.
-    /// Tries both the legacy `matic-network` and new `polygon-ecosystem-token` IDs.
-    async fn fetch_matic_usd(&self) -> Result<Decimal> {
-        // Try the current ID first, fall back to legacy
-        for coin_id in &["polygon-ecosystem-token", "matic-network"] {
-            match self.try_coingecko_price(coin_id).await {
-                Ok(price) => return Ok(price),
-                Err(e) => {
-                    tracing::debug!(coin_id, error = %e, "CoinGecko fetch failed, trying next ID");
-                }
-            }
-        }
-        // MED-6: Binance fallback for stability
-        match self.try_binance_price("MATICUSDT").await {
-            Ok(price) => return Ok(price),
-            Err(e) => tracing::debug!(error = %e, "Binance fallback failed"),
-        }
-        Err(anyhow::anyhow!("All price oracles failed for MATIC/POL price"))
-    }
-
-    async fn try_binance_price(&self, symbol: &str) -> Result<Decimal> {
-        let http_resp = self.http.get("https://api.binance.com/api/v3/ticker/price")
-            .query(&[("symbol", symbol)]).send().await?;
-        if !http_resp.status().is_success() {
-            return Err(anyhow::anyhow!("Binance HTTP {}", http_resp.status()));
-        }
-        let resp: serde_json::Value = http_resp.json().await?;
-        let price_str = resp.get("price").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing price"))?;
-        std::str::FromStr::from_str(price_str).map_err(|e| anyhow::anyhow!("Parse error: {}", e))
-    }
-
-    async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
-        let http_resp = self.http
-            .get("https://api.coingecko.com/api/v3/simple/price")
-            .query(&[("ids", coin_id), ("vs_currencies", "usd")])
-            .send()
-            .await?;
-
-        let status = http_resp.status();
-        if !status.is_success() {
-            let body = http_resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "CoinGecko HTTP {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-
-        let resp: serde_json::Value = http_resp.json().await?;
-        let usd = resp.get(coin_id)
-            .and_then(|v| v.get("usd"))
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
-
-        if !usd.is_finite() {
-            return Err(anyhow::anyhow!("CoinGecko value is not finite: {}", usd));
-        }
-        Decimal::from_f64(usd)
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert f64 to Decimal: {}", usd))
-    }
-}
-```
-
-## File: src/monitoring/health.rs
-```rust
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
-use tokio::net::TcpListener;
-use tracing::{error, info};
-
-use super::metrics::Metrics;
-
-/// HTTP server exposing both /health (JSON) and /metrics (Prometheus text format).
-/// Binds to localhost only (CRIT-2 security).
-pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_ms: u64) {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, addr, "Failed to bind health server");
-            return;
-        }
-    };
-    info!(addr, "Health + Prometheus metrics server listening");
-
-    loop {
-        match listener.accept().await {
-            Ok((mut stream, _)) => {
-                let mut req_line = String::new();
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    let mut reader = tokio::io::BufReader::new(&mut stream);
-                    let _ = reader.read_line(&mut req_line).await;
-                    // Drain remaining headers
-                    let mut header_line = String::new();
-                    while let Ok(n) = reader.read_line(&mut header_line).await {
-                        if n <= 2 { break; }
-                        header_line.clear();
-                    }
-                }).await;
-
-                if !req_line.starts_with("GET ") {
-                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
-                    continue;
-                }
-
-                // Extract path from "GET /path HTTP/1.1"
-                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
-
-                match path {
-                    "/metrics" => {
-                        let body = render_prometheus(&metrics, stale_timeout_ms);
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                            body.len(), body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    }
-                    "/health" | "/" => {
-                        let ms_since_tick = metrics.ms_since_last_tick();
-                        let is_healthy = ms_since_tick < stale_timeout_ms
-                            || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
-
-                        let status_text = if is_healthy { "ok" } else { "degraded" };
-                        let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
-
-                        let body = format!(
-                            r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
-                            status_text,
-                            metrics.uptime_secs(),
-                            ms_since_tick,
-                        );
-                        let response = format!(
-                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                            http_status, body.len(), body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    }
-                    _ => {
-                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
-                    }
-                }
-            }
-            Err(e) => error!(error = %e, "Health server accept error"),
-        }
-    }
-}
-
-/// Render all metrics in Prometheus text exposition format.
-fn render_prometheus(m: &Metrics, stale_timeout_ms: u64) -> String {
-    let ms_since_tick = m.ms_since_last_tick();
-    let is_healthy: u8 = if ms_since_tick < stale_timeout_ms
-        || (ms_since_tick == u64::MAX && m.uptime_secs() < 60)
-    { 1 } else { 0 };
-
-    let ticks = m.ticks_received.load(Ordering::Relaxed);
-    let spreads = m.spreads_evaluated.load(Ordering::Relaxed);
-    let detected = m.opportunities_detected.load(Ordering::Relaxed);
-    let executed = m.opportunities_executed.load(Ordering::Relaxed);
-    let success = m.trades_success.load(Ordering::Relaxed);
-    let failed = m.trades_failed.load(Ordering::Relaxed);
-    let reconnects = m.ws_reconnects.load(Ordering::Relaxed);
-    let api_errors = m.api_errors.load(Ordering::Relaxed);
-    let uptime = m.uptime_secs();
-
-    format!(
-        "# HELP mercury_up Whether the engine is healthy (1=up, 0=degraded).\n\
-         # TYPE mercury_up gauge\n\
-         mercury_up {is_healthy}\n\
-         # HELP mercury_uptime_seconds Engine uptime in seconds.\n\
-         # TYPE mercury_uptime_seconds gauge\n\
-         mercury_uptime_seconds {uptime}\n\
-         # HELP mercury_ms_since_last_tick Milliseconds since last feed tick.\n\
-         # TYPE mercury_ms_since_last_tick gauge\n\
-         mercury_ms_since_last_tick {ms_since_tick}\n\
-         # HELP mercury_ticks_received_total Total feed ticks received.\n\
-         # TYPE mercury_ticks_received_total counter\n\
-         mercury_ticks_received_total {ticks}\n\
-         # HELP mercury_spreads_evaluated_total Total spread evaluations.\n\
-         # TYPE mercury_spreads_evaluated_total counter\n\
-         mercury_spreads_evaluated_total {spreads}\n\
-         # HELP mercury_opportunities_detected_total Arb opportunities detected.\n\
-         # TYPE mercury_opportunities_detected_total counter\n\
-         mercury_opportunities_detected_total {detected}\n\
-         # HELP mercury_opportunities_executed_total Arb opportunities sent to executor.\n\
-         # TYPE mercury_opportunities_executed_total counter\n\
-         mercury_opportunities_executed_total {executed}\n\
-         # HELP mercury_trades_success_total Successful trades.\n\
-         # TYPE mercury_trades_success_total counter\n\
-         mercury_trades_success_total {success}\n\
-         # HELP mercury_trades_failed_total Failed trades.\n\
-         # TYPE mercury_trades_failed_total counter\n\
-         mercury_trades_failed_total {failed}\n\
-         # HELP mercury_ws_reconnects_total WebSocket reconnection count.\n\
-         # TYPE mercury_ws_reconnects_total counter\n\
-         mercury_ws_reconnects_total {reconnects}\n\
-         # HELP mercury_api_errors_total API error count.\n\
-         # TYPE mercury_api_errors_total counter\n\
-         mercury_api_errors_total {api_errors}\n"
-    )
 }
 ```
 
@@ -3569,188 +3175,398 @@ impl Reconciler {
 }
 ```
 
-## File: src/inventory/settlement.rs
+## File: src/monitoring/gas_oracle.rs
 ```rust
 use anyhow::Result;
-use std::sync::Arc;
-use std::time::Duration;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
+use rust_decimal_macros::dec;
+use serde::Deserialize;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tokio::time::{interval_at, Duration, Instant};
+use tracing::{debug, error, info, warn};
 
-use crate::db::Database;
-use crate::types::*;
-use serde_json::json;
-
-pub struct SettlementMonitor {
-    db: Arc<dyn Database>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    settlement_tx: mpsc::Sender<SettlementResult>,
-    check_interval: Duration,
-    kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+/// Sent to the main event loop whenever live prices are refreshed.
+#[derive(Debug, Clone)]
+pub struct GasUpdate {
+    /// Polygon network gas price in gwei.
+    pub gas_gwei: u64,
+    /// MATIC/USD spot price.
+    pub matic_usd: Decimal,
 }
 
-impl SettlementMonitor {
+pub struct GasOracle {
+    rpc_url: String,
+    poll_interval_secs: u64,
+    update_tx: mpsc::Sender<GasUpdate>,
+    http: reqwest::Client,
+}
+
+// ── JSON shapes for eth_gasPrice RPC ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RpcResponse {
+    result: Option<String>,
+    /// JSON-RPC error object returned with HTTP 200 on RPC-level errors.
+    /// Must be captured to produce useful diagnostics instead of "null result".
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+}
+
+
+/// Alert if this many consecutive CoinGecko fetches fail (rate-limited or down).
+const COINGECKO_ALERT_THRESHOLD: u32 = 5;
+
+impl GasOracle {
     pub fn new(
-        db: Arc<dyn Database>, 
-        alert_tx: mpsc::Sender<AlertMessage>, 
-        settlement_tx: mpsc::Sender<SettlementResult>,
-        check_interval_secs: u64,
-        kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+        rpc_url: String,
+        poll_interval_secs: u64,
+        update_tx: mpsc::Sender<GasUpdate>,
     ) -> Self {
-        Self { db, alert_tx, settlement_tx, check_interval: Duration::from_secs(check_interval_secs), kalshi_client }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .user_agent("mercury-gas-oracle/1.0")
+            .build()
+            .expect("failed to build gas oracle HTTP client");
+        Self { rpc_url, poll_interval_secs, update_tx, http }
     }
 
     pub async fn run(self) {
-        info!("Settlement monitor started");
-        let mut interval = tokio::time::interval(self.check_interval);
+        // Start with sane defaults so the engine is never un-initialised.
+        let mut last_gwei: u64 = 50;
+        let mut last_matic: Decimal = dec!(0.50);
+        let mut coingecko_failures: u32 = 0;
+
+        let poll_secs = self.poll_interval_secs.max(10); // floor at 10s
+
+        // Use interval_at(now) so the FIRST tick fires immediately, pushing live
+        // values to the spread engine before any arb detection begins.
+        let mut ticker = interval_at(Instant::now(), Duration::from_secs(poll_secs));
+
+        info!(
+            interval_secs = poll_secs,
+            rpc_url = %self.rpc_url,
+            "Gas oracle started (first fetch is immediate)"
+        );
+
         loop {
-            interval.tick().await;
-            if let Err(e) = self.check_settlements().await {
-                tracing::error!(error = %e, "Settlement check failed");
+            ticker.tick().await;
+
+            match self.fetch_gas_gwei().await {
+                Ok(gwei) => {
+                    if gwei != last_gwei {
+                        info!(gwei, prev_gwei = last_gwei, "Polygon gas price updated");
+                    } else {
+                        debug!(gwei, "Polygon gas price unchanged");
+                    }
+                    last_gwei = gwei;
+                }
+                Err(e) => {
+                    warn!(error = %e, last_gwei, "Failed to fetch Polygon gas price — keeping last value");
+                }
             }
-        }
-    }
 
-    async fn check_settlements(&self) -> Result<()> {
-        let positions = self.db.get_open_positions().await?;
-        let now = chrono::Utc::now();
+            match self.fetch_matic_usd().await {
+                Ok(raw_price) => {
+                    // Hard floor/ceiling to prevent severe oracle glitches.
+                    // MATIC historically traded up to ~$2.92. Ceiling at $10 gives headroom
+                    // for appreciation while still blocking 1000x glitches.
+                    let price = raw_price.clamp(dec!(0.10), dec!(10.00));
+                    
+                    let change_pct = if last_matic > Decimal::ZERO {
+                        ((price - last_matic) / last_matic * Decimal::from(100)).abs()
+                    } else {
+                        Decimal::from(100)
+                    };
+                    if change_pct > dec!(1) {
+                        info!(matic_usd = %price, prev = %last_matic, "MATIC/USD price updated");
+                    } else {
+                        debug!(matic_usd = %price, "MATIC/USD price refreshed");
+                    }
+                    last_matic = price;
+                    coingecko_failures = 0;
+                }
+                Err(e) => {
+                    coingecko_failures += 1;
+                    if coingecko_failures >= COINGECKO_ALERT_THRESHOLD {
+                        error!(
+                            failures = coingecko_failures,
+                            last_matic = %last_matic,
+                            error = %e,
+                            "CoinGecko MATIC/USD fetch has failed {} consecutive times — \
+                             gas costs may be stale, arb profitability estimates unreliable",
+                            coingecko_failures
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            last_matic = %last_matic,
+                            failures = coingecko_failures,
+                            "Failed to fetch MATIC/USD — keeping last value"
+                        );
+                    }
+                }
+            }
 
-        for position in &positions {
-            if let Some(market) = self.db.get_market(&position.market_id).await? {
-                match market.status {
-                    MarketStatus::Resolved => {
-                        info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
-                        
-                        let mut realized_pnl = -(position.avg_entry_price * position.quantity); // Assume total loss by default
-                        
-                        if let Some(info) = market.platforms.get(&position.platform) {
-                            if position.platform == Platform::Kalshi {
-                                if let Some(client) = &self.kalshi_client {
-                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                                    if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
-                                        realized_pnl = pnl;
-                                    }
-                                }
-                            } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
-                                tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
-                                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                    severity: "critical".into(),
-                                    message: format!("Position #{} on {} resolved. Position closed in DB, but MANUAL PnL CREDIT REQUIRED to bankroll.", position.id, position.platform),
-                                });
-                                if let Err(e) = self.db.close_position(position.id).await {
-                                    tracing::error!(error = %e, "Failed to close position in DB");
-                                }
-                                continue; 
-                            }
-                        }
-                        
-                        let audit = AuditEntry {
-                            timestamp_ns: now_ns(),
-                            module: "settlement".into(),
-                            event_type: "position_settled".into(),
-                            data: json!({
-                                "position_id": position.id,
-                                "market": market.question,
-                                "platform": position.platform.to_string(),
-                                "quantity": position.quantity.to_string(),
-                                "avg_entry_price": position.avg_entry_price.to_string(),
-                                "realized_pnl": realized_pnl.to_string(),
-                            }),
-                        };
-                        if let Err(e) = self.db.append_audit(&audit).await {
-                            warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
-                        }
-                        
-                        // CRIT-2 FIX: Use blocking send with timeout instead of try_send.
-                        // If the channel is full, we MUST NOT silently drop settlement PnL — 
-                        // that permanently corrupts the bankroll. Retry with backoff.
-                        let settlement_result = SettlementResult {
-                            realized_pnl,
-                            platform: position.platform,
-                            market_id: position.market_id,
-                            quantity: position.quantity,
-                            avg_entry_price: position.avg_entry_price,
-                        };
-                        
-                        let mut send_attempts = 0;
-                        loop {
-                            match self.settlement_tx.try_send(settlement_result.clone()) {
-                                Ok(()) => break,
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    send_attempts += 1;
-                                    if send_attempts >= 10 {
-                                        tracing::error!(
-                                            position_id = position.id,
-                                            realized_pnl = %realized_pnl,
-                                            "CRITICAL: Settlement channel full after 10 retries. \
-                                             PnL ${} NOT credited to bankroll. MANUAL INTERVENTION REQUIRED.",
-                                            realized_pnl
-                                        );
-                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                            severity: "critical".into(),
-                                            message: format!(
-                                                "🚨 SETTLEMENT PnL LOST: Position #{} PnL ${} could not be \
-                                                 delivered to bankroll manager. Channel saturated. \
-                                                 MANUAL BANKROLL ADJUSTMENT REQUIRED.",
-                                                position.id, realized_pnl
-                                            ),
-                                        });
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100 * send_attempts)).await;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    tracing::error!("Settlement channel closed — engine shutting down");
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        self.db.close_position(position.id).await?;
-                        
-                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                            severity: "info".into(),
-                            message: format!(
-                                "Position #{} settled: {} {} on {} ({} contracts @ ${})\nRealized PnL: ${}",
-                                position.id, position.side, market.question,
-                                position.platform, position.quantity, position.avg_entry_price, realized_pnl.round_dp(2),
-                            ),
-                        });
+            let update = GasUpdate { gas_gwei: last_gwei, matic_usd: last_matic };
+            // Use try_send (non-blocking) so the oracle never blocks the main loop
+            if let Err(e) = self.update_tx.try_send(update) {
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        warn!("Gas oracle channel full — skipping update");
                     }
-                    MarketStatus::Expired => {
-                        warn!(position_id = position.id, market = %market.question, "Market expired with open position");
-                        let audit = AuditEntry {
-                            timestamp_ns: now_ns(),
-                            module: "settlement".into(),
-                            event_type: "position_expired".into(),
-                            data: json!({
-                                "position_id": position.id,
-                                "market": market.question,
-                                "platform": position.platform.to_string(),
-                            }),
-                        };
-                        if let Err(e) = self.db.append_audit(&audit).await {
-                            warn!(error = %e, position_id = position.id, "Failed to write expiry audit entry");
-                        }
-                        self.db.close_position(position.id).await?;
-                    }
-                    _ => {
-                        let time_to_expiry = market.expiration - now;
-                        if time_to_expiry.num_hours() < 1 && time_to_expiry.num_seconds() > 0 {
-                            let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                severity: "warning".into(),
-                                message: format!(
-                                    "Position #{} expiring in {:.0} minutes: {}",
-                                    position.id, time_to_expiry.num_minutes(), market.question,
-                                ),
-                            });
-                        }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        debug!("Gas oracle channel closed — exiting cleanly");
+                        return;
                     }
                 }
             }
         }
-        Ok(())
     }
+
+    /// Call `eth_gasPrice` on the configured Polygon RPC endpoint.
+    async fn fetch_gas_gwei(&self) -> Result<u64> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_gasPrice",
+            "params": [],
+            "id": 1
+        });
+
+        let resp: RpcResponse = self.http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        // Surface JSON-RPC errors (returned with HTTP 200 by most RPC providers).
+        if let Some(rpc_err) = resp.error {
+            return Err(anyhow::anyhow!(
+                "Polygon RPC error {}: {}",
+                rpc_err.code,
+                rpc_err.message
+            ));
+        }
+
+        let hex = resp.result
+            .ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result (no error field)"))?;
+
+        // Result is a hex string like "0x..." representing wei
+        let hex_stripped = hex.trim_start_matches("0x");
+        let wei = u64::from_str_radix(hex_stripped, 16)
+            .map_err(|e| anyhow::anyhow!("failed to parse gas price hex '{}': {}", hex, e))?;
+        let gwei = wei / 1_000_000_000;
+        Ok(gwei.max(1)) // floor at 1 gwei to avoid zero gas cost in spread calc
+    }
+
+    /// Fetch MATIC/USD (or POL/USD) from CoinGecko's free simple/price endpoint.
+    /// Tries both the legacy `matic-network` and new `polygon-ecosystem-token` IDs.
+    async fn fetch_matic_usd(&self) -> Result<Decimal> {
+        // Try the current ID first, fall back to legacy
+        for coin_id in &["polygon-ecosystem-token", "matic-network"] {
+            match self.try_coingecko_price(coin_id).await {
+                Ok(price) => return Ok(price),
+                Err(e) => {
+                    tracing::debug!(coin_id, error = %e, "CoinGecko fetch failed, trying next ID");
+                }
+            }
+        }
+        // MED-6: Binance fallback for stability
+        match self.try_binance_price("MATICUSDT").await {
+            Ok(price) => return Ok(price),
+            Err(e) => tracing::debug!(error = %e, "Binance fallback failed"),
+        }
+        Err(anyhow::anyhow!("All price oracles failed for MATIC/POL price"))
+    }
+
+    async fn try_binance_price(&self, symbol: &str) -> Result<Decimal> {
+        let http_resp = self.http.get("https://api.binance.com/api/v3/ticker/price")
+            .query(&[("symbol", symbol)]).send().await?;
+        if !http_resp.status().is_success() {
+            return Err(anyhow::anyhow!("Binance HTTP {}", http_resp.status()));
+        }
+        let resp: serde_json::Value = http_resp.json().await?;
+        let price_str = resp.get("price").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing price"))?;
+        std::str::FromStr::from_str(price_str).map_err(|e| anyhow::anyhow!("Parse error: {}", e))
+    }
+
+    async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
+        let http_resp = self.http
+            .get("https://api.coingecko.com/api/v3/simple/price")
+            .query(&[("ids", coin_id), ("vs_currencies", "usd")])
+            .send()
+            .await?;
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let body = http_resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "CoinGecko HTTP {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+
+        let resp: serde_json::Value = http_resp.json().await?;
+        let usd = resp.get(coin_id)
+            .and_then(|v| v.get("usd"))
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
+
+        if !usd.is_finite() {
+            return Err(anyhow::anyhow!("CoinGecko value is not finite: {}", usd));
+        }
+        Decimal::from_f64(usd)
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert f64 to Decimal: {}", usd))
+    }
+}
+```
+
+## File: src/monitoring/health.rs
+```rust
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
+use tokio::net::TcpListener;
+use tracing::{error, info};
+
+use super::metrics::Metrics;
+
+/// HTTP server exposing both /health (JSON) and /metrics (Prometheus text format).
+/// Binds to localhost only (CRIT-2 security).
+pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_ms: u64) {
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, addr, "Failed to bind health server");
+            return;
+        }
+    };
+    info!(addr, "Health + Prometheus metrics server listening");
+
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                let mut req_line = String::new();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    let mut reader = tokio::io::BufReader::new(&mut stream);
+                    let _ = reader.read_line(&mut req_line).await;
+                    // Drain remaining headers
+                    let mut header_line = String::new();
+                    while let Ok(n) = reader.read_line(&mut header_line).await {
+                        if n <= 2 { break; }
+                        header_line.clear();
+                    }
+                }).await;
+
+                if !req_line.starts_with("GET ") {
+                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+                    continue;
+                }
+
+                // Extract path from "GET /path HTTP/1.1"
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+
+                match path {
+                    "/metrics" => {
+                        let body = render_prometheus(&metrics, stale_timeout_ms);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    "/health" | "/" => {
+                        let ms_since_tick = metrics.ms_since_last_tick();
+                        let is_healthy = ms_since_tick < stale_timeout_ms
+                            || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
+
+                        let status_text = if is_healthy { "ok" } else { "degraded" };
+                        let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
+
+                        let body = format!(
+                            r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{}}}"#,
+                            status_text,
+                            metrics.uptime_secs(),
+                            ms_since_tick,
+                        );
+                        let response = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            http_status, body.len(), body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    _ => {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+                    }
+                }
+            }
+            Err(e) => error!(error = %e, "Health server accept error"),
+        }
+    }
+}
+
+/// Render all metrics in Prometheus text exposition format.
+fn render_prometheus(m: &Metrics, stale_timeout_ms: u64) -> String {
+    let ms_since_tick = m.ms_since_last_tick();
+    let is_healthy: u8 = if ms_since_tick < stale_timeout_ms
+        || (ms_since_tick == u64::MAX && m.uptime_secs() < 60)
+    { 1 } else { 0 };
+
+    let ticks = m.ticks_received.load(Ordering::Relaxed);
+    let spreads = m.spreads_evaluated.load(Ordering::Relaxed);
+    let detected = m.opportunities_detected.load(Ordering::Relaxed);
+    let executed = m.opportunities_executed.load(Ordering::Relaxed);
+    let success = m.trades_success.load(Ordering::Relaxed);
+    let failed = m.trades_failed.load(Ordering::Relaxed);
+    let reconnects = m.ws_reconnects.load(Ordering::Relaxed);
+    let api_errors = m.api_errors.load(Ordering::Relaxed);
+    let uptime = m.uptime_secs();
+
+    format!(
+        "# HELP mercury_up Whether the engine is healthy (1=up, 0=degraded).\n\
+         # TYPE mercury_up gauge\n\
+         mercury_up {is_healthy}\n\
+         # HELP mercury_uptime_seconds Engine uptime in seconds.\n\
+         # TYPE mercury_uptime_seconds gauge\n\
+         mercury_uptime_seconds {uptime}\n\
+         # HELP mercury_ms_since_last_tick Milliseconds since last feed tick.\n\
+         # TYPE mercury_ms_since_last_tick gauge\n\
+         mercury_ms_since_last_tick {ms_since_tick}\n\
+         # HELP mercury_ticks_received_total Total feed ticks received.\n\
+         # TYPE mercury_ticks_received_total counter\n\
+         mercury_ticks_received_total {ticks}\n\
+         # HELP mercury_spreads_evaluated_total Total spread evaluations.\n\
+         # TYPE mercury_spreads_evaluated_total counter\n\
+         mercury_spreads_evaluated_total {spreads}\n\
+         # HELP mercury_opportunities_detected_total Arb opportunities detected.\n\
+         # TYPE mercury_opportunities_detected_total counter\n\
+         mercury_opportunities_detected_total {detected}\n\
+         # HELP mercury_opportunities_executed_total Arb opportunities sent to executor.\n\
+         # TYPE mercury_opportunities_executed_total counter\n\
+         mercury_opportunities_executed_total {executed}\n\
+         # HELP mercury_trades_success_total Successful trades.\n\
+         # TYPE mercury_trades_success_total counter\n\
+         mercury_trades_success_total {success}\n\
+         # HELP mercury_trades_failed_total Failed trades.\n\
+         # TYPE mercury_trades_failed_total counter\n\
+         mercury_trades_failed_total {failed}\n\
+         # HELP mercury_ws_reconnects_total WebSocket reconnection count.\n\
+         # TYPE mercury_ws_reconnects_total counter\n\
+         mercury_ws_reconnects_total {reconnects}\n\
+         # HELP mercury_api_errors_total API error count.\n\
+         # TYPE mercury_api_errors_total counter\n\
+         mercury_api_errors_total {api_errors}\n"
+    )
 }
 ```
 
@@ -4132,434 +3948,6 @@ mod tests {
     }
 ```
 
-## File: src/types.rs
-```rust
-use chrono::{DateTime, NaiveDate, Utc};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fmt;
-use uuid::Uuid;
-
-// ─── Platform ───
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Platform {
-    Polymarket,
-    PolymarketUs,
-    Kalshi,
-    Cdna,
-    ForecastEx,
-}
-
-impl fmt::Display for Platform {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Platform::Polymarket => write!(f, "Polymarket"),
-            Platform::PolymarketUs => write!(f, "Polymarket US"),
-            Platform::Kalshi => write!(f, "Kalshi"),
-            Platform::Cdna => write!(f, "CDNA"),
-            Platform::ForecastEx => write!(f, "ForecastEx"),
-        }
-    }
-}
-
-// ─── Side ───
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum Side {
-    Yes,
-    No,
-}
-
-impl fmt::Display for Side {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Side::Yes => write!(f, "YES"),
-            Side::No => write!(f, "NO"),
-        }
-    }
-}
-
-// ─── Market Category ───
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MarketCategory {
-    Sports,
-    Politics,
-    Finance,
-    Crypto,
-    Weather,
-    Culture,
-    Other,
-}
-
-// ─── Market Status ───
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MarketStatus {
-    Active,
-    Suspended,
-    Resolved,
-    Expired,
-}
-
-impl fmt::Display for MarketStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MarketStatus::Active => write!(f, "active"),
-            MarketStatus::Suspended => write!(f, "suspended"),
-            MarketStatus::Resolved => write!(f, "resolved"),
-            MarketStatus::Expired => write!(f, "expired"),
-        }
-    }
-}
-
-// ─── Platform Health ───
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlatformHealth {
-    Healthy,
-    Degraded,
-    Down,
-}
-
-// ─── Price Level ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PriceLevel {
-    pub price: Decimal,
-    pub size: Decimal,
-}
-
-// ─── Normalized Tick ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NormalizedTick {
-    pub platform: Platform,
-    pub market_id: Uuid,
-    pub timestamp_ns: u64,
-    pub bid_price: Decimal,
-    pub bid_size: Decimal,
-    pub ask_price: Decimal,
-    pub ask_size: Decimal,
-    pub mid_price: Decimal,
-    pub last_trade_price: Decimal,
-    pub last_trade_size: Decimal,
-    pub book_depth: std::sync::Arc<Vec<PriceLevel>>,
-    pub fee_rate_bps: u16,
-    pub sequence: u64,
-}
-
-// ─── Platform Market Info ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformMarketInfo {
-    pub platform: Platform,
-    pub platform_market_id: String,
-    pub fee_rate_bps: u16,
-    pub min_order_size: Decimal,
-    pub tick_size: Decimal,
-}
-
-// ─── Market ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Market {
-    pub unified_id: Uuid,
-    pub question: String,
-    pub resolution_source: String,
-    pub expiration: DateTime<Utc>,
-    pub platforms: HashMap<Platform, PlatformMarketInfo>,
-    pub category: MarketCategory,
-    pub confidence: f64,
-    pub status: MarketStatus,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-// ─── Leg Detail ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegDetail {
-    pub platform: Platform,
-    /// Platform-native market/token identifier (e.g. Polymarket token ID, Kalshi ticker).
-    /// Used by execution clients; distinct from the unified UUID `market_id` on the opportunity.
-    pub platform_market_id: String,
-    pub fee_rate_bps: u32,
-    pub side: Side,
-    pub price: Decimal,
-    pub available_size: Decimal,
-    pub fee_estimate: Decimal,
-}
-
-// ─── Arbitrage Opportunity ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArbitrageOpportunity {
-    pub opp_id: Uuid,
-    pub market_id: Uuid,
-    pub market_question: String,
-    pub leg_a: LegDetail,
-    pub leg_b: LegDetail,
-    pub raw_spread: Decimal,
-    pub net_spread: Decimal,
-    pub kelly_fraction: Decimal,
-    pub recommended_size: Decimal,
-    pub score: Decimal,
-    pub detected_at: u64,
-    pub ttl_ms: u32,
-}
-
-// ─── Validated Opportunity ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidatedOpportunity {
-    pub opportunity: ArbitrageOpportunity,
-    pub approved_size: Decimal,
-    pub risk_score: Decimal,
-}
-
-// ─── Trade Status ───
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TradeStatus {
-    Success,
-    Fail,
-    Partial,
-}
-
-impl fmt::Display for TradeStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TradeStatus::Success => write!(f, "success"),
-            TradeStatus::Fail => write!(f, "fail"),
-            TradeStatus::Partial => write!(f, "partial"),
-        }
-    }
-}
-
-// ─── Execution State ───
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionState {
-    Pending,
-    PartialFill,
-    Filled,
-    Failed,
-    Unwinding,
-}
-
-// ─── Trade Result ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TradeResult {
-    pub trade_id: i64,
-    pub opp_id: Uuid,
-    pub market_id: Uuid,
-    pub market_question: String,
-    pub leg_a_platform: Platform,
-    pub leg_a_side: Side,
-    pub leg_a_price: Decimal,
-    pub leg_a_size: Decimal,
-    pub leg_a_fill_price: Decimal,
-    pub leg_a_fee: Decimal,
-    pub leg_b_platform: Platform,
-    pub leg_b_side: Side,
-    pub leg_b_price: Decimal,
-    pub leg_b_size: Decimal,
-    pub leg_b_fill_price: Decimal,
-    pub leg_b_fee: Decimal,
-    pub raw_spread: Decimal,
-    pub net_spread: Decimal,
-    pub profit: Decimal,
-    pub status: TradeStatus,
-    pub failure_reason: Option<String>,
-    pub execution_ms: u64,
-    pub executed_at: DateTime<Utc>,
-    pub bankroll_after: Decimal,
-    pub bankroll_change_pct: Decimal,
-    /// Size that was reserved in in_flight_notional when this trade was dispatched.
-    /// Used by the event loop to release the reservation on settlement.
-    /// Not persisted to the database.
-    #[serde(default)]
-    pub approved_size: Decimal,
-}
-
-// ─── Settlement Result ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettlementResult {
-    pub realized_pnl: Decimal,
-    pub platform: Platform,
-    pub market_id: Uuid,
-    pub quantity: Decimal,
-    pub avg_entry_price: Decimal,
-}
-
-// ─── Position ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Position {
-    pub id: i64,
-    pub market_id: Uuid,
-    pub platform: Platform,
-    pub side: Side,
-    pub quantity: Decimal,
-    pub avg_entry_price: Decimal,
-    pub unrealized_pnl: Decimal,
-    pub opened_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-// ─── Platform Balance ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformBalance {
-    pub platform: Platform,
-    pub available: Decimal,
-    pub reserved: Decimal,
-    pub pending_settlement: Decimal,
-    pub total: Decimal,
-    pub updated_at: DateTime<Utc>,
-}
-
-// ─── Daily Snapshot ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DailySnapshot {
-    pub date: NaiveDate,
-    pub bankroll: Decimal,
-    pub gross_pnl: Decimal,
-    pub fees_paid: Decimal,
-    pub net_pnl: Decimal,
-    pub trades_count: i32,
-    pub success_count: i32,
-    pub fail_count: i32,
-    pub success_rate: Decimal,
-    pub peak_bankroll: Decimal,
-    pub drawdown_pct: Decimal,
-    pub kelly_utilization: Decimal,
-    pub report_sent: bool,
-}
-
-// ─── Audit Entry ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditEntry {
-    pub timestamp_ns: u64,
-    pub module: String,
-    pub event_type: String,
-    pub data: serde_json::Value,
-}
-
-// ─── Alert Message (for Telegram) ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AlertMessage {
-    TradeComplete(TradeResult),
-    CircuitBreaker {
-        breaker_type: String,
-        details: String,
-        action: String,
-        resume_at: Option<DateTime<Utc>>,
-    },
-    SystemAlert {
-        severity: String,
-        message: String,
-    },
-}
-
-// ─── Daily Report ───
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DailyReport {
-    pub snapshot: DailySnapshot,
-    pub platform_breakdown: HashMap<Platform, PlatformDayStats>,
-    pub top_trades: Vec<TradeResult>,
-    pub worst_trades: Vec<TradeResult>,
-    pub uptime_secs: u64,
-    pub ws_reconnects: u32,
-    pub api_errors: u32,
-    pub db_size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformDayStats {
-    pub platform: Platform,
-    pub exposure: Decimal,
-    pub trade_count: i32,
-    pub pnl: Decimal,
-}
-
-// ─── Timestamp helper ───
-
-/// Returns nanoseconds since epoch. Cast to u64 wraps in 2554, which is acceptable.
-pub fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(std::time::Duration::ZERO)
-        .as_nanos() as u64
-}
-
-// ─── System Commands (Telegram Control) ───
-
-#[derive(Debug, Clone)]
-pub enum SystemCommand {
-    StartTrading,
-    StopTrading,
-    EnablePlatform(Platform),
-    DisablePlatform(Platform),
-    RequestDailyReport,
-    ActivateMarket(Uuid),
-}
-
-#[derive(serde::Deserialize)]
-pub struct TelegramUpdate {
-    pub update_id: i64,
-    pub message: Option<TelegramMessage>,
-    pub callback_query: Option<TelegramCallbackQuery>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct TelegramCallbackQuery {
-    pub id: String,
-    pub from: TelegramUser,
-    pub message: Option<TelegramMessage>,
-    pub data: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct TelegramMessage {
-    pub text: Option<String>,
-    pub chat: TelegramChat,
-    pub from: Option<TelegramUser>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct TelegramUser {
-    pub id: i64,
-}
-
-#[derive(serde::Deserialize)]
-pub struct TelegramChat {
-    pub id: i64,
-}
-
-#[derive(serde::Deserialize)]
-pub struct TelegramUpdatesResponse {
-    pub ok: bool,
-    pub result: Vec<TelegramUpdate>,
-}
-```
-
 ## File: src/db/traits.rs
 ```rust
 use anyhow::Result;
@@ -4872,6 +4260,1823 @@ impl CdnaFeed {
         }
 
         Ok(())
+    }
+}
+```
+
+## File: src/inventory/settlement.rs
+```rust
+use anyhow::Result;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::db::Database;
+use crate::types::*;
+use serde_json::json;
+
+pub struct SettlementMonitor {
+    db: Arc<dyn Database>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    settlement_tx: mpsc::Sender<SettlementResult>,
+    check_interval: Duration,
+    kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+}
+
+impl SettlementMonitor {
+    pub fn new(
+        db: Arc<dyn Database>, 
+        alert_tx: mpsc::Sender<AlertMessage>, 
+        settlement_tx: mpsc::Sender<SettlementResult>,
+        check_interval_secs: u64,
+        kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+    ) -> Self {
+        Self { db, alert_tx, settlement_tx, check_interval: Duration::from_secs(check_interval_secs), kalshi_client }
+    }
+
+    pub async fn run(self) {
+        info!("Settlement monitor started");
+        let mut interval = tokio::time::interval(self.check_interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.check_settlements().await {
+                tracing::error!(error = %e, "Settlement check failed");
+            }
+        }
+    }
+
+    async fn check_settlements(&self) -> Result<()> {
+        let positions = self.db.get_open_positions().await?;
+        let now = chrono::Utc::now();
+
+        for position in &positions {
+            if let Some(market) = self.db.get_market(&position.market_id).await? {
+                match market.status {
+                    MarketStatus::Resolved => {
+                        info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
+                        
+                        let mut realized_pnl = -(position.avg_entry_price * position.quantity); // Assume total loss by default
+                        
+                        if let Some(info) = market.platforms.get(&position.platform) {
+                            if position.platform == Platform::Kalshi {
+                                if let Some(client) = &self.kalshi_client {
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                    if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
+                                        realized_pnl = pnl;
+                                    }
+                                }
+                            } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
+                                tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
+                                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                    severity: "critical".into(),
+                                    message: format!("Position #{} on {} resolved. Position closed in DB, but MANUAL PnL CREDIT REQUIRED to bankroll.", position.id, position.platform),
+                                });
+                                if let Err(e) = self.db.close_position(position.id).await {
+                                    tracing::error!(error = %e, "Failed to close position in DB");
+                                }
+                                continue; 
+                            }
+                        }
+                        
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_settled".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                                "quantity": position.quantity.to_string(),
+                                "avg_entry_price": position.avg_entry_price.to_string(),
+                                "realized_pnl": realized_pnl.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
+                        }
+                        
+                        // CRIT-2 FIX: Use blocking send with timeout instead of try_send.
+                        // If the channel is full, we MUST NOT silently drop settlement PnL — 
+                        // that permanently corrupts the bankroll. Retry with backoff.
+                        let settlement_result = SettlementResult {
+                            realized_pnl,
+                            platform: position.platform,
+                            market_id: position.market_id,
+                            quantity: position.quantity,
+                            avg_entry_price: position.avg_entry_price,
+                        };
+                        
+                        let mut send_attempts = 0;
+                        loop {
+                            match self.settlement_tx.try_send(settlement_result.clone()) {
+                                Ok(()) => break,
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    send_attempts += 1;
+                                    if send_attempts >= 10 {
+                                        tracing::error!(
+                                            position_id = position.id,
+                                            realized_pnl = %realized_pnl,
+                                            "CRITICAL: Settlement channel full after 10 retries. \
+                                             PnL ${} NOT credited to bankroll. MANUAL INTERVENTION REQUIRED.",
+                                            realized_pnl
+                                        );
+                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                            severity: "critical".into(),
+                                            message: format!(
+                                                "🚨 SETTLEMENT PnL LOST: Position #{} PnL ${} could not be \
+                                                 delivered to bankroll manager. Channel saturated. \
+                                                 MANUAL BANKROLL ADJUSTMENT REQUIRED.",
+                                                position.id, realized_pnl
+                                            ),
+                                        });
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100 * send_attempts)).await;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::error!("Settlement channel closed — engine shutting down");
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        self.db.close_position(position.id).await?;
+                        
+                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                            severity: "info".into(),
+                            message: format!(
+                                "Position #{} settled: {} {} on {} ({} contracts @ ${})\nRealized PnL: ${}",
+                                position.id, position.side, market.question,
+                                position.platform, position.quantity, position.avg_entry_price, realized_pnl.round_dp(2),
+                            ),
+                        });
+                    }
+                    MarketStatus::Expired => {
+                        warn!(position_id = position.id, market = %market.question, "Market expired with open position");
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_expired".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write expiry audit entry");
+                        }
+                        self.db.close_position(position.id).await?;
+                    }
+                    _ => {
+                        let time_to_expiry = market.expiration - now;
+                        if time_to_expiry.num_hours() < 1 && time_to_expiry.num_seconds() > 0 {
+                            let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                severity: "warning".into(),
+                                message: format!(
+                                    "Position #{} expiring in {:.0} minutes: {}",
+                                    position.id, time_to_expiry.num_minutes(), market.question,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+## File: src/types.rs
+```rust
+use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
+use uuid::Uuid;
+
+// ─── Platform ───
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    Polymarket,
+    PolymarketUs,
+    Kalshi,
+    Cdna,
+    ForecastEx,
+}
+
+impl fmt::Display for Platform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Platform::Polymarket => write!(f, "Polymarket"),
+            Platform::PolymarketUs => write!(f, "Polymarket US"),
+            Platform::Kalshi => write!(f, "Kalshi"),
+            Platform::Cdna => write!(f, "CDNA"),
+            Platform::ForecastEx => write!(f, "ForecastEx"),
+        }
+    }
+}
+
+// ─── Side ───
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Side {
+    Yes,
+    No,
+}
+
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Side::Yes => write!(f, "YES"),
+            Side::No => write!(f, "NO"),
+        }
+    }
+}
+
+// ─── Market Category ───
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketCategory {
+    Sports,
+    Politics,
+    Finance,
+    Crypto,
+    Weather,
+    Culture,
+    Other,
+}
+
+// ─── Market Status ───
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketStatus {
+    Active,
+    Suspended,
+    Resolved,
+    Expired,
+}
+
+impl fmt::Display for MarketStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MarketStatus::Active => write!(f, "active"),
+            MarketStatus::Suspended => write!(f, "suspended"),
+            MarketStatus::Resolved => write!(f, "resolved"),
+            MarketStatus::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+// ─── Platform Health ───
+// Reserved for future per-platform health tracking in the monitoring subsystem.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum PlatformHealth {
+    Healthy,
+    Degraded,
+    Down,
+}
+
+// ─── Price Level ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceLevel {
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+// ─── Normalized Tick ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedTick {
+    pub platform: Platform,
+    pub market_id: Uuid,
+    pub timestamp_ns: u64,
+    pub bid_price: Decimal,
+    pub bid_size: Decimal,
+    pub ask_price: Decimal,
+    pub ask_size: Decimal,
+    pub mid_price: Decimal,
+    pub last_trade_price: Decimal,
+    pub last_trade_size: Decimal,
+    pub book_depth: std::sync::Arc<Vec<PriceLevel>>,
+    pub fee_rate_bps: u16,
+    pub sequence: u64,
+}
+
+// ─── Platform Market Info ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformMarketInfo {
+    pub platform: Platform,
+    pub platform_market_id: String,
+    pub fee_rate_bps: u16,
+    pub min_order_size: Decimal,
+    pub tick_size: Decimal,
+}
+
+// ─── Market ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Market {
+    pub unified_id: Uuid,
+    pub question: String,
+    pub resolution_source: String,
+    pub expiration: DateTime<Utc>,
+    pub platforms: HashMap<Platform, PlatformMarketInfo>,
+    pub category: MarketCategory,
+    pub confidence: f64,
+    pub status: MarketStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ─── Leg Detail ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegDetail {
+    pub platform: Platform,
+    /// Platform-native market/token identifier (e.g. Polymarket token ID, Kalshi ticker).
+    /// Used by execution clients; distinct from the unified UUID `market_id` on the opportunity.
+    pub platform_market_id: String,
+    pub fee_rate_bps: u32,
+    pub side: Side,
+    pub price: Decimal,
+    pub available_size: Decimal,
+    pub fee_estimate: Decimal,
+}
+
+// ─── Arbitrage Opportunity ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArbitrageOpportunity {
+    pub opp_id: Uuid,
+    pub market_id: Uuid,
+    pub market_question: String,
+    pub leg_a: LegDetail,
+    pub leg_b: LegDetail,
+    pub raw_spread: Decimal,
+    pub net_spread: Decimal,
+    pub kelly_fraction: Decimal,
+    pub recommended_size: Decimal,
+    pub score: Decimal,
+    pub detected_at: u64,
+    pub ttl_ms: u32,
+}
+
+// ─── Validated Opportunity ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatedOpportunity {
+    pub opportunity: ArbitrageOpportunity,
+    pub approved_size: Decimal,
+    pub risk_score: Decimal,
+}
+
+// ─── Trade Status ───
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeStatus {
+    Success,
+    Fail,
+    Partial,
+}
+
+impl fmt::Display for TradeStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TradeStatus::Success => write!(f, "success"),
+            TradeStatus::Fail => write!(f, "fail"),
+            TradeStatus::Partial => write!(f, "partial"),
+        }
+    }
+}
+
+// ─── Execution State ───
+// Reserved for future stateful execution tracking in the executor.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum ExecutionState {
+    Pending,
+    PartialFill,
+    Filled,
+    Failed,
+    Unwinding,
+}
+
+// ─── Trade Result ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeResult {
+    pub trade_id: i64,
+    pub opp_id: Uuid,
+    pub market_id: Uuid,
+    pub market_question: String,
+    pub leg_a_platform: Platform,
+    pub leg_a_side: Side,
+    pub leg_a_price: Decimal,
+    pub leg_a_size: Decimal,
+    pub leg_a_fill_price: Decimal,
+    pub leg_a_fee: Decimal,
+    pub leg_b_platform: Platform,
+    pub leg_b_side: Side,
+    pub leg_b_price: Decimal,
+    pub leg_b_size: Decimal,
+    pub leg_b_fill_price: Decimal,
+    pub leg_b_fee: Decimal,
+    pub raw_spread: Decimal,
+    pub net_spread: Decimal,
+    pub profit: Decimal,
+    pub status: TradeStatus,
+    pub failure_reason: Option<String>,
+    pub execution_ms: u64,
+    pub executed_at: DateTime<Utc>,
+    pub bankroll_after: Decimal,
+    pub bankroll_change_pct: Decimal,
+    /// Size that was reserved in in_flight_notional when this trade was dispatched.
+    /// Used by the event loop to release the reservation on settlement.
+    /// Not persisted to the database.
+    #[serde(default)]
+    pub approved_size: Decimal,
+}
+
+// ─── Settlement Result ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementResult {
+    pub realized_pnl: Decimal,
+    pub platform: Platform,
+    pub market_id: Uuid,
+    pub quantity: Decimal,
+    pub avg_entry_price: Decimal,
+}
+
+// ─── Position ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Position {
+    pub id: i64,
+    pub market_id: Uuid,
+    pub platform: Platform,
+    pub side: Side,
+    pub quantity: Decimal,
+    pub avg_entry_price: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub opened_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ─── Platform Balance ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformBalance {
+    pub platform: Platform,
+    pub available: Decimal,
+    pub reserved: Decimal,
+    pub pending_settlement: Decimal,
+    pub total: Decimal,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ─── Daily Snapshot ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailySnapshot {
+    pub date: NaiveDate,
+    pub bankroll: Decimal,
+    pub gross_pnl: Decimal,
+    pub fees_paid: Decimal,
+    pub net_pnl: Decimal,
+    pub trades_count: i32,
+    pub success_count: i32,
+    pub fail_count: i32,
+    pub success_rate: Decimal,
+    pub peak_bankroll: Decimal,
+    pub drawdown_pct: Decimal,
+    pub kelly_utilization: Decimal,
+    pub report_sent: bool,
+}
+
+// ─── Audit Entry ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub timestamp_ns: u64,
+    pub module: String,
+    pub event_type: String,
+    pub data: serde_json::Value,
+}
+
+// ─── Alert Message (for Telegram) ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlertMessage {
+    TradeComplete(TradeResult),
+    CircuitBreaker {
+        breaker_type: String,
+        details: String,
+        action: String,
+        resume_at: Option<DateTime<Utc>>,
+    },
+    SystemAlert {
+        severity: String,
+        message: String,
+    },
+}
+
+// ─── Daily Report ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyReport {
+    pub snapshot: DailySnapshot,
+    pub platform_breakdown: HashMap<Platform, PlatformDayStats>,
+    pub top_trades: Vec<TradeResult>,
+    pub worst_trades: Vec<TradeResult>,
+    pub uptime_secs: u64,
+    pub ws_reconnects: u32,
+    pub api_errors: u32,
+    pub db_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformDayStats {
+    pub platform: Platform,
+    pub exposure: Decimal,
+    pub trade_count: i32,
+    pub pnl: Decimal,
+}
+
+// ─── Timestamp helper ───
+
+/// Returns nanoseconds since epoch. Cast to u64 wraps in 2554, which is acceptable.
+pub fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_nanos() as u64
+}
+
+// ─── System Commands (Telegram Control) ───
+
+#[derive(Debug, Clone)]
+pub enum SystemCommand {
+    StartTrading,
+    StopTrading,
+    EnablePlatform(Platform),
+    DisablePlatform(Platform),
+    RequestDailyReport,
+    ActivateMarket(Uuid),
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramUpdate {
+    pub update_id: i64,
+    pub message: Option<TelegramMessage>,
+    pub callback_query: Option<TelegramCallbackQuery>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramCallbackQuery {
+    pub id: String,
+    pub from: TelegramUser,
+    pub message: Option<TelegramMessage>,
+    pub data: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramMessage {
+    pub text: Option<String>,
+    pub chat: TelegramChat,
+    pub from: Option<TelegramUser>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramUser {
+    pub id: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramChat {
+    pub id: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramUpdatesResponse {
+    pub ok: bool,
+    pub result: Vec<TelegramUpdate>,
+}
+```
+
+## File: src/feeds/normalizer.rs
+```rust
+use rust_decimal::Decimal;
+use uuid::Uuid;
+
+use crate::types::*;
+
+/// Compute a deterministic unified market ID from question + resolution + expiry
+pub fn compute_unified_market_id(question: &str, resolution_source: &str, expiry: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(question.to_lowercase().as_bytes());
+    hasher.update(b"|");
+    hasher.update(resolution_source.to_lowercase().as_bytes());
+    hasher.update(b"|");
+    hasher.update(expiry.as_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// Calculate Polymarket fee for given price and fee_rate_bps
+pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
+    let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
+    let max_side = price.max(Decimal::ONE - price);
+    rate * quantity * max_side
+}
+
+/// Calculate VWAP slippage for a target order size against order book depth.
+///
+/// `depth` **must** be pre-sorted in fill-walk order by the caller:
+///   - For buys against asks: ascending price (`PlatformBook::ask_depth()`)
+///   - For sells into bids: descending price (`PlatformBook::bid_depth()`)
+///
+/// Returns `None` when the available depth is insufficient to fill `target_size`.
+/// Returns `Some(slippage)` — the absolute VWAP deviation from best quoted price.
+pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<Decimal> {
+    // CRITICAL FIX: If target size is zero or less, we must return None.
+    // Returning Some(0) causes a fatal Divide-By-Zero panic in the spread engine 
+    // when it attempts to normalize fees (fee_a / actual_target).
+    if depth.is_empty() || target_size <= Decimal::ZERO {
+        return None; 
+    }
+
+    let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();
+    if levels.is_empty() {
+        // Return None to explicitly signal a complete lack of liquidity
+        return None;
+    }
+
+    let best_price = levels[0].price;
+    let mut remaining = target_size;
+    let mut total_cost = Decimal::ZERO;
+
+    for level in &levels {
+        let fill_qty = remaining.min(level.size);
+        total_cost += fill_qty * level.price;
+        remaining -= fill_qty;
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+    }
+
+    if remaining > Decimal::ZERO {
+        return None;
+    }
+
+    let vwap = total_cost / target_size;
+    Some((vwap - best_price).abs())
+}
+
+pub fn kalshi_fee(price: Decimal, quantity: Decimal) -> Decimal {
+    let max_fee = rust_decimal_macros::dec!(0.07);
+    let implied_fee = price * rust_decimal_macros::dec!(0.10);
+    max_fee.min(implied_fee) * quantity
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_polymarket_fee() {
+        // Price > 0.5 (e.g. 0.6), quantity = 100, fee = 200 bps (0.02)
+        // Fee = 0.02 * 100 * max(0.6, 0.4) = 2 * 0.6 = 1.2
+        let fee = polymarket_fee(dec!(0.6), dec!(100), 200);
+        assert_eq!(fee, dec!(1.20));
+
+        // Price < 0.5 (e.g. 0.2), quantity = 50, fee = 100 bps (0.01)
+        // Fee = 0.01 * 50 * max(0.2, 0.8) = 0.5 * 0.8 = 0.4
+        let fee2 = polymarket_fee(dec!(0.2), dec!(50), 100);
+        assert_eq!(fee2, dec!(0.40));
+    }
+
+    #[test]
+    fn test_estimate_slippage() {
+        let depth = vec![
+            PriceLevel { price: dec!(0.50), size: dec!(10) },
+            PriceLevel { price: dec!(0.52), size: dec!(20) },
+        ];
+
+        // Target size fully within first level
+        let slip1 = estimate_slippage(dec!(5), &depth);
+        assert_eq!(slip1, Some(dec!(0)));
+
+        // Target size spans both levels:
+        // 10 @ 0.50 = 5.0
+        // 5 @ 0.52 = 2.6
+        // Total cost = 7.6 for 15 contracts -> VWAP = 0.50666...
+        // Best price = 0.50
+        // Slippage = 0.006666...
+        let slip2 = estimate_slippage(dec!(15), &depth).unwrap();
+        assert!(slip2 > dec!(0.006));
+        assert!(slip2 < dec!(0.007));
+
+        // Insufficient depth
+        let slip3 = estimate_slippage(dec!(50), &depth);
+        assert_eq!(slip3, None);
+    }
+}
+```
+
+## File: src/telegram/bot.rs
+```rust
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tracing::warn;
+
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
+const MAX_MESSAGE_LENGTH: usize = 4096;
+const RATE_LIMIT_PER_SECOND: u32 = 1;
+
+#[derive(Clone)]
+pub struct TelegramBot {
+    client: reqwest::Client,
+    token: zeroize::Zeroizing<String>, // HIGH-3: Secure token from memory dumps
+    last_send: Arc<Mutex<Instant>>,
+}
+
+#[derive(Serialize)]
+struct SendMessageRequest<'a> {
+    chat_id: &'a str,
+    text: &'a str,
+    parse_mode: &'a str,
+    disable_web_page_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AnswerCallbackQueryRequest<'a> {
+    callback_query_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct TelegramResponse {
+    ok: bool,
+    description: Option<String>,
+}
+
+impl TelegramBot {
+
+    /// SECURITY NOTE (CRIT-6): Telegram's API inherently requires the bot token to be
+    /// passed in the URL path. Ensure that proxy servers, load balancers, or standard output
+    /// do not log plain HTTP request URLs for api.telegram.org to prevent token leakage.
+    pub fn new(token: String) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("Failed to create HTTP client"),
+            token: zeroize::Zeroizing::new(token),
+            last_send: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2))),
+        }
+    }
+
+    /// Send a message to a specific chat, respecting rate limits
+    pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
+        self.send_message_with_markup(chat_id, text, None).await
+    }
+
+    /// Send a message with an optional inline keyboard markup
+    pub async fn send_message_with_markup(&self, chat_id: &str, text: &str, reply_markup: Option<serde_json::Value>) -> Result<()> {
+        // Rate limiting: compute sleep duration while holding the lock,
+        // then release the lock before sleeping so other callers aren't blocked.
+        {
+            let sleep_for = {
+                let mut last = self.last_send.lock().await;
+                let elapsed = last.elapsed();
+                let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
+                if elapsed < min_interval {
+                    let wait = min_interval - elapsed;
+                    // Pre-emptively advance the timer for the NEXT concurrent caller
+                    *last += min_interval;
+                    Some(wait)
+                } else {
+                    *last = Instant::now();
+                    None
+                }
+            };
+            if let Some(dur) = sleep_for {
+                tokio::time::sleep(dur).await;
+            }
+        }
+
+        // Truncate if too long, respecting UTF-8 boundaries
+        let text = if text.len() > MAX_MESSAGE_LENGTH {
+            let mut end = MAX_MESSAGE_LENGTH - 20;
+            while end > 0 && !text.is_char_boundary(end) { end -= 1; }
+            &text[..end]
+        } else {
+            text
+        };
+
+        let url = format!("{}{}/sendMessage", TELEGRAM_API_BASE, self.token.as_str());
+        let body = SendMessageRequest {
+            chat_id,
+            text,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+            reply_markup,
+        };
+
+        // Retry with exponential backoff (max 3 attempts)
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let resp_body: TelegramResponse = resp.json().await
+                        .unwrap_or(TelegramResponse { ok: false, description: Some("Failed to parse response".into()) });
+
+                    if resp_body.ok {
+                        return Ok(());
+                    }
+
+                    let desc = resp_body.description.unwrap_or_default();
+                    if status.as_u16() == 429 {
+                        warn!(attempt, "Telegram rate limited, backing off");
+                        if attempt >= 3 {
+                            anyhow::bail!("Telegram rate limited after {} attempts: {}", attempt, desc);
+                        }
+                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                        continue;
+                    }
+
+                    anyhow::bail!("Telegram API error ({}): {}", status, desc);
+                }
+                Err(e) => {
+                    if attempt >= 3 {
+                        return Err(e).context("Failed to send Telegram message after 3 attempts");
+                    }
+                    warn!(attempt, error = %e, "Telegram send failed, retrying");
+                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                }
+            }
+        }
+    }
+
+    /// Long-poll the Telegram API to fetch new commands
+    pub async fn get_updates(&self, offset: i64) -> Result<Vec<crate::types::TelegramUpdate>> {
+        // LOW-7: More robust URL construction
+        let url = format!("{}{}/getUpdates?offset={}&timeout=5", 
+            TELEGRAM_API_BASE, 
+            self.token.as_str(), 
+            offset
+        );
+        let resp = self.client.get(&url).send().await?
+            .json::<crate::types::TelegramUpdatesResponse>().await?;
+        
+        if resp.ok {
+            Ok(resp.result)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Escape HTML special characters for Telegram HTML parse mode
+    pub fn escape_html(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+    
+/// Acknowledge a callback query to remove the loading state from Telegram buttons
+    pub async fn answer_callback_query(&self, query_id: &str, text: Option<&str>) -> Result<()> {
+        let url = format!("{}{}/answerCallbackQuery", TELEGRAM_API_BASE, self.token.as_str());
+        let body = AnswerCallbackQueryRequest { callback_query_id: query_id, text };
+        self.client.post(&url).json(&body).send().await?;
+        Ok(())
+    }
+}
+```
+
+## File: src/config.rs
+```rust
+use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
+use tracing::info;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MercuryConfig {
+    pub trading: TradingConfig,
+    pub platforms: PlatformsConfig,
+    pub database: DatabaseConfig,
+    pub telegram: TelegramConfig,
+    pub polygon_rpc: PolygonRpcConfig,
+    pub logging: LoggingConfig,
+    pub health: HealthConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingConfig {
+    pub kelly_fraction_multiplier: Decimal,
+    pub min_net_spread_threshold: Decimal,
+    pub max_single_trade_pct: Decimal,
+    pub max_daily_loss_pct: Decimal,
+    pub max_drawdown_pct: Decimal,
+    pub max_platform_exposure_pct: Decimal,
+    pub stale_data_timeout_ms: u64,
+    pub max_concurrent_arbs: usize,
+    pub gas_price_max_gwei: u64,
+    pub rebalance_threshold_pct: Decimal,
+    pub max_open_positions: usize,
+    pub initial_bankroll: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformsConfig {
+    pub polymarket: PolymarketConfig,
+    pub kalshi: KalshiConfig,
+    pub cdna: CdnaConfig,
+    pub forecastex: ForecastExConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolymarketConfig {
+    pub enabled: bool,
+    pub ws_url: String,
+    pub rest_url: String,
+    pub sports_ws_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KalshiConfig {
+    pub enabled: bool,
+    pub ws_url: String,
+    pub rest_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdnaConfig {
+    pub enabled: bool,
+    pub ws_url: String,
+    pub rest_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForecastExConfig {
+    pub enabled: bool,
+    pub fix_host: String,
+    pub fix_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    pub path: String,
+    pub pool_size: u32,
+    pub busy_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    pub enabled: bool,
+    pub daily_report_hour_utc: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolygonRpcConfig {
+    pub url: String,
+    pub gas_poll_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    pub port: u16,
+}
+
+impl MercuryConfig {
+    pub fn load(path: &str) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path))?;
+        let config: MercuryConfig = serde_yaml::from_str(&contents)
+            .with_context(|| "Failed to parse config YAML")?;
+        config.validate()?;
+        info!("Configuration loaded from {}", path);
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let t = &self.trading;
+        
+        // HIGH-5 FIX: Prevent zero-timeout configurations that would permanently halt trading
+        anyhow::ensure!(t.stale_data_timeout_ms >= 1000,
+            "stale_data_timeout_ms must be at least 1000ms, got {}", t.stale_data_timeout_ms);
+        anyhow::ensure!(t.min_net_spread_threshold > Decimal::ZERO,
+            "min_net_spread_threshold must be positive, got {}", t.min_net_spread_threshold);
+            
+        anyhow::ensure!(t.initial_bankroll > Decimal::ZERO,
+            "initial_bankroll must be positive, got {}", t.initial_bankroll);
+        anyhow::ensure!(t.kelly_fraction_multiplier > Decimal::ZERO && t.kelly_fraction_multiplier <= Decimal::ONE,
+            "kelly_fraction_multiplier must be in (0, 1], got {}", t.kelly_fraction_multiplier);
+        anyhow::ensure!(t.max_daily_loss_pct > Decimal::ZERO && t.max_daily_loss_pct <= Decimal::ONE,
+            "max_daily_loss_pct must be in (0, 1] (fraction scale), got {}", t.max_daily_loss_pct);
+        anyhow::ensure!(t.max_drawdown_pct > Decimal::ZERO && t.max_drawdown_pct <= Decimal::ONE,
+            "max_drawdown_pct must be in (0, 1] (fraction scale), got {}", t.max_drawdown_pct);
+        anyhow::ensure!(t.max_platform_exposure_pct > Decimal::ZERO && t.max_platform_exposure_pct <= Decimal::ONE,
+            "max_platform_exposure_pct must be in (0, 1] (fraction scale), got {}", t.max_platform_exposure_pct);
+        // Hard ceiling: 10% per trade. This cannot be overridden by config YAML.
+        // At 100% a single bug or bad fill wipes the entire bankroll in one trade.
+        // This limit is intentionally conservative for a live trading system.
+        anyhow::ensure!(
+            t.max_single_trade_pct > Decimal::ZERO && t.max_single_trade_pct <= rust_decimal_macros::dec!(0.10),
+            "max_single_trade_pct must be in (0, 0.10] — absolute safety ceiling is 10%; got {}",
+            t.max_single_trade_pct
+        );
+        anyhow::ensure!(t.max_open_positions >= 1,
+            "max_open_positions must be at least 1, got {}", t.max_open_positions);
+        anyhow::ensure!(t.max_concurrent_arbs >= 1,
+            "max_concurrent_arbs must be at least 1, got {}", t.max_concurrent_arbs);
+        anyhow::ensure!(t.rebalance_threshold_pct > Decimal::ZERO && t.rebalance_threshold_pct <= Decimal::ONE,
+            "rebalance_threshold_pct must be in (0, 1], got {}", t.rebalance_threshold_pct);
+            
+        // Validate platform URLs
+        let p = &self.platforms;
+        if p.polymarket.enabled {
+            anyhow::ensure!(!p.polymarket.ws_url.is_empty(),
+                "Polymarket enabled but ws_url is empty");
+            anyhow::ensure!(!p.polymarket.rest_url.is_empty(),
+                "Polymarket enabled but rest_url is empty");
+            anyhow::ensure!(p.polymarket.ws_url.starts_with("wss://") || p.polymarket.ws_url.starts_with("ws://"),
+                "Polymarket ws_url must start with ws:// or wss://, got: {}", p.polymarket.ws_url);
+        }
+        if p.kalshi.enabled {
+            anyhow::ensure!(!p.kalshi.ws_url.is_empty(),
+                "Kalshi enabled but ws_url is empty");
+            anyhow::ensure!(!p.kalshi.rest_url.is_empty(),
+                "Kalshi enabled but rest_url is empty");
+        }
+        if p.cdna.enabled {
+            anyhow::ensure!(!p.cdna.ws_url.is_empty(),
+                "CDNA enabled but ws_url is empty");
+            anyhow::ensure!(!p.cdna.rest_url.is_empty(),
+                "CDNA enabled but rest_url is empty");
+        }
+        if p.forecastex.enabled {
+            anyhow::ensure!(!p.forecastex.fix_host.is_empty(),
+                "ForecastEx enabled but fix_host is empty");
+            anyhow::ensure!(p.forecastex.fix_port > 0,
+                "ForecastEx enabled but fix_port is 0");
+        }
+        Ok(())
+    }
+}
+
+/// Thread-safe config holder with hot-reload support
+#[derive(Clone)]
+pub struct ConfigManager {
+    inner: Arc<RwLock<MercuryConfig>>,
+    path: String,
+}
+
+impl ConfigManager {
+    pub fn new(config: MercuryConfig, path: String) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(config)),
+            path,
+        }
+    }
+
+    pub fn get(&self) -> MercuryConfig {
+        match self.inner.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                tracing::error!("Config RwLock was poisoned — a thread panicked while holding the lock. Using last known config.");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    pub fn reload(&self) -> Result<()> {
+        let new_config = MercuryConfig::load(&self.path)?;
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        *guard = new_config;
+        info!("Configuration reloaded from {}", self.path);
+        Ok(())
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+```
+
+## File: src/engine/detector.rs
+```rust
+use rust_decimal::Decimal;
+use tracing::{debug};
+use uuid::Uuid;
+use rust_decimal::prelude::ToPrimitive;
+
+use crate::engine::market_registry::MarketRegistry;
+use crate::engine::order_book::UnifiedOrderBook;
+use crate::engine::spread::{NetSpreadEngine, SpreadResult};
+use crate::types::*;
+
+/// Rejection reason for the 5-gate pipeline
+#[derive(Debug, Clone)]
+pub enum RejectionReason {
+    BelowSpreadThreshold(Decimal),
+    InsufficientLiquidity { available: Decimal, required: Decimal },
+    StaleData { age_ms: u64, max_ms: u64 },
+    CorrelationExposure { current: Decimal, max: Decimal },
+    RiskBudgetExceeded { reason: String },
+}
+
+/// Detection statistics
+#[derive(Debug, Default)]
+pub struct DetectorStats {
+    pub opportunities_detected: u64,
+    pub gate1_rejected: u64,
+    pub gate2_rejected: u64,
+    pub gate3_rejected: u64,
+    pub gate4_rejected: u64,
+    pub gate5_rejected: u64,
+    pub opportunities_passed: u64,
+}
+
+pub struct ArbitrageDetector {
+    min_spread: Decimal,
+    min_order_size: Decimal,
+    stale_timeout_ms: u64,
+    max_concurrent: usize,
+    active_arbs: usize,
+    pub stats: DetectorStats,
+    paused_until_ns: u64,
+}
+
+impl ArbitrageDetector {
+    pub fn new(
+        min_spread: Decimal,
+        min_order_size: Decimal,
+        stale_timeout_ms: u64,
+        max_concurrent: usize,
+    ) -> Self {
+        Self {
+            min_spread,
+            min_order_size,
+            stale_timeout_ms,
+            max_concurrent,
+            active_arbs: 0,
+            stats: DetectorStats::default(),
+            paused_until_ns: 0,
+        }
+    }
+
+    pub fn pause_detection_until(&mut self, ns: u64) {
+        self.paused_until_ns = ns;
+    }
+
+    pub fn update_thresholds(&mut self, min_spread: Decimal, stale_timeout_ms: u64, max_concurrent: usize) {
+        self.min_spread = min_spread;
+        self.stale_timeout_ms = stale_timeout_ms;
+        self.max_concurrent = max_concurrent;
+    }
+
+    pub fn set_active_arbs(&mut self, count: usize) {
+        self.active_arbs = count;
+    }
+
+    /// Evaluates spreads ONLY for the specific market that just updated.
+    pub fn detect_for_market(
+        &mut self,
+        market_id: &Uuid,
+        registry: &MarketRegistry,
+        uob: &UnifiedOrderBook,
+        spread_engine: &NetSpreadEngine,
+        target_size: Decimal,
+    ) -> Vec<ArbitrageOpportunity> {
+        let mut opportunities = Vec::new();
+
+        // HIGH-1 FIX: Do not evaluate spreads if the engine is in a cooldown period
+        // (e.g., recovering from a broadcast::Lagged event repopulating the order books).
+        if crate::types::now_ns() < self.paused_until_ns {
+            return opportunities;
+        }
+
+        let pairs = match registry.get_arb_pairs_for_market(market_id) {
+            Some(p) => p,
+            None => return opportunities,
+        };
+
+        for pair in pairs {
+            // CRITICAL FIX: The Time-to-Maturity Trap
+            // Do not evaluate spreads if the market resolves in less than 60 seconds.
+            // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 
+            // in time to dump the naked leg before the exchange locks the order book.
+            if let Some(market) = registry.get_market(&pair.market_id) {
+                let seconds_to_exp = (market.expiration - chrono::Utc::now()).num_seconds();
+                if seconds_to_exp < 60 {
+                    continue; 
+                }
+            }
+
+            let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
+                Some(b) => b,
+                None => continue,
+            };
+            let book_b = match uob.get_book(&pair.market_id, &pair.platform_b) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let spreads = spread_engine.compute_spreads(book_a, book_b, target_size);
+
+            for spread in spreads {
+                self.stats.opportunities_detected += 1;
+
+                match self.run_gates(&spread, book_a, book_b, pair.confidence) {
+                    Ok(()) => {
+                        self.stats.opportunities_passed += 1;
+
+                        // Fetch the native exchange identifiers and fee rates from the registry
+                        let info_a = registry.get_platform_info(&pair.market_id, &pair.platform_a);
+                        let info_b = registry.get_platform_info(&pair.market_id, &pair.platform_b);
+                        
+                        let (plat_id_a, fee_bps_a) = if let Some(i) = info_a { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
+                        let (plat_id_b, fee_bps_b) = if let Some(i) = info_b { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
+
+                        let liquidity = spread.leg_a_available.min(spread.leg_b_available);
+                        let log_liq = if liquidity > Decimal::ZERO {
+                            // HIGH-3 FIX: Accepted f64 imprecision with explicit documentation.
+                            // Rust Decimal lacks a native ln() function. The floating-point conversion here 
+                            // only impacts the relative ranking queue of opportunities (the score), 
+                            // not the actual financial math, risk limits, or threshold gates.
+                            // Add 1.0 to the natural log so a liquidity of 1.0 yields a multiplier of 1.0 (ln(1) = 0 + 1 = 1)
+                            let val = liquidity.to_f64().unwrap_or(1.0).ln() + 1.0;
+                            // Natively cast f64 to Decimal to eliminate string allocation in the hot path
+                            Decimal::try_from(val.max(0.1)).unwrap_or(Decimal::ONE)
+                        } else {
+                            Decimal::ONE
+                        };
+                        let confidence_dec = Decimal::try_from(pair.confidence).unwrap_or(Decimal::ONE);
+                        let score = spread.net_spread * log_liq * confidence_dec;
+
+                        opportunities.push(ArbitrageOpportunity {
+                            opp_id: Uuid::new_v4(),
+                            market_id: spread.market_id,
+                            market_question: String::new(), // M-9 FIX: Defer allocation until after truncation
+                            leg_a: LegDetail {
+                                platform: spread.leg_a_platform,
+                                side: spread.leg_a_side,
+                                price: spread.leg_a_price,
+                                available_size: spread.leg_a_available,
+                                fee_estimate: spread.leg_a_fee,
+                                fee_rate_bps: fee_bps_a as u32, 
+                                platform_market_id: plat_id_a, 
+                            },
+                            leg_b: LegDetail {
+                                platform: spread.leg_b_platform,
+                                side: spread.leg_b_side,
+                                price: spread.leg_b_price,
+                                available_size: spread.leg_b_available,
+                                fee_estimate: spread.leg_b_fee,
+                                fee_rate_bps: fee_bps_b as u32,
+                                platform_market_id: plat_id_b, 
+                            },
+                            raw_spread: spread.raw_spread,
+                            net_spread: spread.net_spread,
+                            kelly_fraction: Decimal::ZERO, 
+                            recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
+                            score,
+                            detected_at: now_ns(),
+                            // FIX: Reduce Time-to-Live to 200ms. If the execution queue backs up,
+                            // prices will move. Drops stale arbs before they execute at a loss.
+                            ttl_ms: 200,
+                        });
+                    }
+                    Err(reason) => {
+                        debug!(?reason, market_id = %spread.market_id, "Opportunity rejected");
+                    }
+                }
+            }
+        }
+
+        opportunities.sort_by(|a, b| b.score.cmp(&a.score));
+        let slots = self.max_concurrent.saturating_sub(self.active_arbs);
+        opportunities.truncate(slots);
+
+        // M-9 FIX: Allocate strings only for the opportunities that actually made the cut
+        for opp in &mut opportunities {
+            if let Some(market) = registry.get_market(&opp.market_id) {
+                opp.market_question = market.question.clone();
+            }
+        }
+
+        opportunities
+    }
+
+    fn run_gates(
+        &mut self,
+        spread: &SpreadResult,
+        book_a: &crate::engine::order_book::PlatformBook,
+        book_b: &crate::engine::order_book::PlatformBook,
+        confidence: f64,
+    ) -> Result<(), RejectionReason> {
+        if spread.net_spread < self.min_spread {
+            self.stats.gate1_rejected += 1;
+            return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
+        }
+
+        let min_available = spread.leg_a_available.min(spread.leg_b_available);
+        if min_available < self.min_order_size {
+            self.stats.gate2_rejected += 1;
+            return Err(RejectionReason::InsufficientLiquidity {
+                available: min_available,
+                required: self.min_order_size,
+            });
+        }
+
+        let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
+        let now = now_ns();
+
+        let age_a = now.saturating_sub(book_a.last_update_ns);
+        if age_a > stale_timeout_ns {
+            self.stats.gate3_rejected += 1;
+            return Err(RejectionReason::StaleData {
+                age_ms: age_a / 1_000_000,
+                max_ms: self.stale_timeout_ms,
+            });
+        }
+
+        let age_b = now.saturating_sub(book_b.last_update_ns);
+        if age_b > stale_timeout_ns {
+            self.stats.gate3_rejected += 1;
+            return Err(RejectionReason::StaleData {
+                age_ms: age_b / 1_000_000,
+                max_ms: self.stale_timeout_ms,
+            });
+        }
+
+        if confidence < 0.95 {
+            self.stats.gate4_rejected += 1;
+            return Err(RejectionReason::CorrelationExposure {
+                current: Decimal::ZERO,
+                max: Decimal::ZERO,
+            });
+        }
+
+        if self.active_arbs >= self.max_concurrent {
+            self.stats.gate5_rejected += 1;
+            return Err(RejectionReason::RiskBudgetExceeded {
+                reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
+            });
+        }
+
+        Ok(())
+    }
+}
+```
+
+## File: src/engine/order_book.rs
+```rust
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use uuid::Uuid;
+
+use crate::types::*;
+
+/// Per-platform order book for a single market
+#[derive(Debug, Clone)]
+pub struct PlatformBook {
+    pub platform: Platform,
+    pub market_id: Uuid,
+    pub bids: std::collections::BTreeMap<Decimal, Decimal>,
+    pub asks: std::collections::BTreeMap<Decimal, Decimal>,
+    pub last_update_ns: u64,
+    pub fee_rate_bps: u16,
+    pub sequence: u64,
+}
+
+impl PlatformBook {
+    pub fn new(platform: Platform, market_id: Uuid) -> Self {
+        Self {
+            platform,
+            market_id,
+            bids: std::collections::BTreeMap::new(),
+            asks: std::collections::BTreeMap::new(),
+            last_update_ns: 0,
+            fee_rate_bps: 0,
+            sequence: 0,
+        }
+    }
+
+    pub fn best_bid(&self) -> Option<(Decimal, Decimal)> {
+        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
+    }
+
+    pub fn best_ask(&self) -> Option<(Decimal, Decimal)> {
+        self.asks.iter().next().map(|(&p, &s)| (p, s))
+    }
+
+    pub fn mid_price(&self) -> Decimal {
+        match (self.best_bid(), self.best_ask()) {
+            (Some((b, _)), Some((a, _))) => (b + a) / Decimal::from(2),
+            (Some((b, _)), None) => b,
+            (None, Some((a, _))) => a,
+            _ => Decimal::ZERO,
+        }
+    }
+
+    pub fn ask_depth(&self) -> Vec<PriceLevel> {
+        self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
+    }
+
+    pub fn bid_depth(&self) -> Vec<PriceLevel> {
+        self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
+    }
+
+    pub fn is_stale(&self, timeout_ns: u64) -> bool {
+        let now = crate::types::now_ns();
+        now.saturating_sub(self.last_update_ns) > timeout_ns
+    }
+
+    /// Update from a NormalizedTick
+    ///
+    /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
+    /// to prevent out-of-order or replayed updates from overwriting newer data.
+    /// Sequence-0 ticks are treated as full snapshots and always applied.
+    pub fn update_from_tick(&mut self, tick: &NormalizedTick) {
+        if tick.sequence > 0 && tick.sequence <= self.sequence {
+            return;
+        }
+
+        // Apply depth levels as incremental updates. Zero-size = remove.
+        for level in tick.book_depth.iter() {
+            if level.size == Decimal::ZERO {
+                self.bids.remove(&level.price);
+                self.asks.remove(&level.price);
+                continue;
+            }
+            if level.price <= tick.bid_price {
+                self.bids.insert(level.price, level.size);
+            } else if level.price >= tick.ask_price {
+                self.asks.insert(level.price, level.size);
+            } else {
+                // Mid-spread level: classify by proximity
+                if tick.ask_price - level.price < level.price - tick.bid_price {
+                    self.asks.insert(level.price, level.size);
+                } else {
+                    self.bids.insert(level.price, level.size);
+                }
+            }
+        }
+
+        // Apply BBO and enforce uncrossed book invariant using O(log N) split_off
+        // HIGH-4 FIX: BTreeMap::split_off is O(log N) vs the previous O(N) collect+remove.
+        if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
+            self.bids.insert(tick.bid_price, tick.bid_size);
+            // Remove all asks at or below bid_price.
+            // split_off(key) returns everything >= key, leaving everything < key in self.
+            // We need to remove asks where price <= bid_price.
+            // Increment by smallest possible to get "strictly greater than bid_price".
+            // BTreeMap split trick: split at bid_price + epsilon isn't clean with Decimal.
+            // Instead, we split at bid_price and check if bid_price itself is in asks.
+            let kept = self.asks.split_off(&tick.bid_price);
+            // `self.asks` now contains asks < bid_price (invalid). `kept` has asks >= bid_price.
+            self.asks = kept;
+            // Also remove the ask AT bid_price if it exists (asks must be strictly > bid)
+            self.asks.remove(&tick.bid_price);
+        }
+        if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
+            self.asks.insert(tick.ask_price, tick.ask_size);
+            // Remove all bids at or above ask_price.
+            // split_off(ask_price) gives us everything >= ask_price (invalid bids).
+            let invalid_bids = self.bids.split_off(&tick.ask_price);
+            // `invalid_bids` is dropped, `self.bids` retains only bids < ask_price.
+            drop(invalid_bids);
+        }
+
+        self.last_update_ns = tick.timestamp_ns;
+        self.fee_rate_bps = tick.fee_rate_bps;
+        self.sequence = tick.sequence;
+    }
+}
+
+/// Unified Order Book: aggregates all platform books for all markets
+pub struct UnifiedOrderBook {
+    books: HashMap<(Uuid, Platform), PlatformBook>,
+}
+
+impl UnifiedOrderBook {
+    pub fn new() -> Self {
+        Self { books: HashMap::new() }
+    }
+
+    pub fn clear(&mut self) {
+        self.books.clear();
+    }
+
+    pub fn update(&mut self, tick: &NormalizedTick) {
+        let key = (tick.market_id, tick.platform);
+        let book = self.books
+            .entry(key)
+            .or_insert_with(|| PlatformBook::new(tick.platform, tick.market_id));
+        book.update_from_tick(tick);
+    }
+
+    pub fn get_book(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformBook> {
+        self.books.get(&(*market_id, *platform))
+    }
+}
+```
+
+## File: src/engine/spread.rs
+```rust
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use uuid::Uuid;
+
+use crate::engine::order_book::PlatformBook;
+use crate::feeds::normalizer;
+use crate::types::*;
+
+/// Result of spread computation for one direction of an arb pair
+#[derive(Debug, Clone)]
+pub struct SpreadResult {
+    pub market_id: Uuid,
+    pub leg_a_platform: Platform,
+    pub leg_a_side: Side,
+    pub leg_a_price: Decimal,
+    pub leg_a_available: Decimal,
+    pub leg_a_fee: Decimal,
+    pub leg_b_platform: Platform,
+    pub leg_b_side: Side,
+    pub leg_b_price: Decimal,
+    pub leg_b_available: Decimal,
+    pub leg_b_fee: Decimal,
+    pub raw_spread: Decimal,
+    pub net_spread: Decimal,
+    pub slippage_a: Decimal,
+    pub slippage_b: Decimal,
+    pub gas_cost: Decimal,
+}
+
+pub struct NetSpreadEngine {
+    min_threshold: Decimal,
+    gas_price_gwei: Decimal,
+    /// MATIC/USD spot price (Polymarket runs on Polygon; gas is paid in MATIC, not ETH).
+    /// Default is $0.50 MATIC — do NOT set this to an ETH price (~$2,000+) or gas costs
+    /// will be overestimated 4,000x, suppressing all Polymarket arb opportunities.
+    matic_price_usd: Decimal,
+}
+
+impl NetSpreadEngine {
+    pub fn new(min_threshold: Decimal) -> Self {
+        Self {
+            min_threshold,
+            gas_price_gwei: Decimal::from(50),
+            matic_price_usd: dec!(0.50),
+        }
+    }
+
+    pub fn update_threshold(&mut self, min_threshold: Decimal) {
+        self.min_threshold = min_threshold;
+    }
+
+    pub fn update_gas_price(&mut self, gwei: Decimal) {
+        self.gas_price_gwei = gwei;
+    }
+
+    pub fn update_matic_price(&mut self, price: Decimal) {
+        self.matic_price_usd = price;
+    }
+
+    /// Compute spread for both directions of an arb pair
+    pub fn compute_spreads(
+        &self,
+        book_a: &PlatformBook,
+        book_b: &PlatformBook,
+        target_size: Decimal,
+    ) -> Vec<SpreadResult> {
+        let mut results = Vec::new();
+
+        // Direction 1: Buy YES on A, Buy NO on B
+        if let (Some((ask_a, ask_a_size)), Some((bid_b, bid_b_size))) = (book_a.best_ask(), book_b.best_bid()) {
+            let ask_b_no = Decimal::ONE - bid_b;
+            let raw_spread = Decimal::ONE - ask_a - ask_b_no;
+
+            if raw_spread > Decimal::ZERO {
+                let depth_a = book_a.ask_depth();
+                let depth_b = book_b.bid_depth();
+                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
+                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
+                
+                let actual_target = total_a.min(total_b).min(target_size);
+
+                let fee_a = self.compute_fee(book_a.platform, ask_a, actual_target, book_a.fee_rate_bps);
+                let fee_b = self.compute_fee(book_b.platform, ask_b_no, actual_target, book_b.fee_rate_bps);
+                
+                match (
+                    normalizer::estimate_slippage(actual_target, &depth_a),
+                    normalizer::estimate_slippage(actual_target, &depth_b),
+                ) {
+                    (Some(slippage_a), Some(slippage_b)) => {
+                        let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
+                        
+                        // FIX: Normalize against actual_target to prevent artificial spread inflation
+                        let per_contract_fee_a = fee_a / actual_target;
+                        let per_contract_fee_b = fee_b / actual_target;
+                        let per_contract_gas = gas / actual_target;
+
+                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
+
+                        if net_spread > self.min_threshold {
+                            results.push(SpreadResult {
+                                market_id: book_a.market_id,
+                                leg_a_platform: book_a.platform,
+                                leg_a_side: Side::Yes,
+                                leg_a_price: ask_a,
+                                leg_a_available: ask_a_size.min(target_size),
+                                leg_a_fee: fee_a,
+                                leg_b_platform: book_b.platform,
+                                leg_b_side: Side::No,
+                                leg_b_price: ask_b_no,
+                                leg_b_available: bid_b_size.min(target_size),
+                                leg_b_fee: fee_b,
+                                raw_spread,
+                                net_spread,
+                                slippage_a,
+                                slippage_b,
+                                gas_cost: gas,
+                            });
+                        }
+                    }
+                    _ => {
+                        tracing::debug!(
+                            market_id = %book_a.market_id,
+                            direction = "YES-A/NO-B",
+                            "Insufficient liquidity to size opportunity — skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Direction 2: Buy NO on A, Buy YES on B
+        if let (Some((bid_a, bid_a_size)), Some((ask_b, ask_b_size))) = (book_a.best_bid(), book_b.best_ask()) {
+            let ask_a_no = Decimal::ONE - bid_a;
+            let raw_spread = Decimal::ONE - ask_a_no - ask_b;
+
+            if raw_spread > Decimal::ZERO {
+                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
+                // This allows the VWAP estimator to correctly "walk the book" and consume 
+                // deeper liquidity if the total spread remains profitable.
+                let depth_a = book_a.bid_depth();
+                let depth_b = book_b.ask_depth();
+                
+                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
+                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
+
+                let actual_target = total_a.min(total_b).min(target_size);
+
+                let fee_a = self.compute_fee(book_a.platform, ask_a_no, actual_target, book_a.fee_rate_bps);
+                let fee_b = self.compute_fee(book_b.platform, ask_b, actual_target, book_b.fee_rate_bps);
+                
+                // Optimized: Reuse the previously allocated depth vectors to save CPU cycles 
+                // during the hot-path match evaluation.
+                match (
+                    normalizer::estimate_slippage(actual_target, &depth_a),
+                    normalizer::estimate_slippage(actual_target, &depth_b),
+                ) {
+                    (Some(slippage_a), Some(slippage_b)) => {
+                    let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
+                        
+                        // CRITICAL FIX: Mathematical Unit Mismatch.
+                        // `fee_a` and `fee_b` were computed using `actual_target`, NOT `target_size`. 
+                        // Dividing by the larger `target_size` artificially underestimated the fee drag,
+                        // inflating `net_spread` and causing the engine to execute structurally unprofitable arbs.
+                        let per_contract_fee_a = fee_a / actual_target;
+                        let per_contract_fee_b = fee_b / actual_target;
+                        let per_contract_gas = gas / actual_target;
+
+                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
+
+                        if net_spread > self.min_threshold {
+                            results.push(SpreadResult {
+                                market_id: book_a.market_id,
+                                leg_a_platform: book_a.platform,
+                                leg_a_side: Side::No,
+                                leg_a_price: ask_a_no,
+                                leg_a_available: bid_a_size.min(target_size),
+                                leg_a_fee: fee_a,
+                                leg_b_platform: book_b.platform,
+                                leg_b_side: Side::Yes,
+                                leg_b_price: ask_b,
+                                leg_b_available: ask_b_size.min(target_size),
+                                leg_b_fee: fee_b,
+                                raw_spread,
+                                net_spread,
+                                slippage_a,
+                                slippage_b,
+                                gas_cost: gas,
+                            });
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            market_id = %book_a.market_id,
+                            direction = "NO-A/YES-B",
+                            "Insufficient liquidity to size opportunity — skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    fn compute_fee(&self, platform: Platform, price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
+        match platform {
+            Platform::Polymarket | Platform::PolymarketUs => {
+                normalizer::polymarket_fee(price, quantity, fee_rate_bps)
+            }
+            Platform::Kalshi => {
+                // Use the dynamic fee_rate_bps provided by the Kalshi feed tick
+                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
+                rate * quantity * price
+            }
+            Platform::Cdna => {
+                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
+                rate * quantity * price.max(Decimal::ONE - price)
+            }
+            Platform::ForecastEx => Decimal::ZERO,
+        }
+    }
+
+    fn gas_cost_if_onchain(&self, platform_a: Platform, platform_b: Platform) -> Decimal {
+        let mut tx_count = Decimal::ZERO;
+        if matches!(platform_a, Platform::Polymarket | Platform::PolymarketUs) {
+            tx_count += Decimal::ONE;
+        }
+        if matches!(platform_b, Platform::Polymarket | Platform::PolymarketUs) {
+            tx_count += Decimal::ONE;
+        }
+
+        if tx_count == Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        // CRITICAL FIX (3-B): Update empirical gas limit. 
+        // 200k was an overestimate; CTF exchange averages 120k-150k.
+        let gas_units = Decimal::from(150_000) * tx_count;
+        let gwei_to_matic = dec!(0.000000001); // 1 gwei = 10^-9 MATIC
+        self.gas_price_gwei * gas_units * gwei_to_matic * self.matic_price_usd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_gas_cost_offchain() {
+        let engine = NetSpreadEngine::new(dec!(0.01));
+        // Kalshi <-> CDNA trade uses zero gas
+        assert_eq!(engine.gas_cost_if_onchain(Platform::Kalshi, Platform::Cdna), Decimal::ZERO);
     }
 }
 ```
@@ -5210,6 +6415,9 @@ fn normalize_question(q: &str) -> String {
                 });
             }
         }
+        if markets.len() >= 1000 {
+            tracing::warn!("Polymarket returned 1000 markets — results may be truncated. Consider pagination.");
+        }
         Ok(markets)
     }
 
@@ -5274,1202 +6482,6 @@ fn normalize_question(q: &str) -> String {
             }
         }
         Ok(markets)
-    }
-}
-```
-
-## File: src/telegram/bot.rs
-```rust
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tracing::warn;
-
-const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
-const MAX_MESSAGE_LENGTH: usize = 4096;
-const RATE_LIMIT_PER_SECOND: u32 = 1;
-
-#[derive(Clone)]
-pub struct TelegramBot {
-    client: reqwest::Client,
-    token: zeroize::Zeroizing<String>, // HIGH-3: Secure token from memory dumps
-    last_send: Arc<Mutex<Instant>>,
-}
-
-#[derive(Serialize)]
-struct SendMessageRequest<'a> {
-    chat_id: &'a str,
-    text: &'a str,
-    parse_mode: &'a str,
-    disable_web_page_preview: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_markup: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct AnswerCallbackQueryRequest<'a> {
-    callback_query_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
-}
-
-#[derive(Deserialize)]
-struct TelegramResponse {
-    ok: bool,
-    description: Option<String>,
-}
-
-impl TelegramBot {
-
-    /// SECURITY NOTE (CRIT-6): Telegram's API inherently requires the bot token to be
-    /// passed in the URL path. Ensure that proxy servers, load balancers, or standard output
-    /// do not log plain HTTP request URLs for api.telegram.org to prevent token leakage.
-    pub fn new(token: String) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to create HTTP client"),
-            token: zeroize::Zeroizing::new(token),
-            last_send: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2))),
-        }
-    }
-
-    /// Send a message to a specific chat, respecting rate limits
-    pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
-        self.send_message_with_markup(chat_id, text, None).await
-    }
-
-    /// Send a message with an optional inline keyboard markup
-    pub async fn send_message_with_markup(&self, chat_id: &str, text: &str, reply_markup: Option<serde_json::Value>) -> Result<()> {
-        // Rate limiting: compute sleep duration while holding the lock,
-        // then release the lock before sleeping so other callers aren't blocked.
-        {
-            let sleep_for = {
-                let mut last = self.last_send.lock().await;
-                let elapsed = last.elapsed();
-                let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
-                if elapsed < min_interval {
-                    let wait = min_interval - elapsed;
-                    // Pre-emptively advance the timer for the NEXT concurrent caller
-                    *last += min_interval;
-                    Some(wait)
-                } else {
-                    *last = Instant::now();
-                    None
-                }
-            };
-            if let Some(dur) = sleep_for {
-                tokio::time::sleep(dur).await;
-            }
-        }
-
-        // Truncate if too long, respecting UTF-8 boundaries
-        let text = if text.len() > MAX_MESSAGE_LENGTH {
-            let mut end = MAX_MESSAGE_LENGTH - 20;
-            while end > 0 && !text.is_char_boundary(end) { end -= 1; }
-            &text[..end]
-        } else {
-            text
-        };
-
-        let url = format!("{}{}/sendMessage", TELEGRAM_API_BASE, self.token.as_str());
-        let body = SendMessageRequest {
-            chat_id,
-            text,
-            parse_mode: "HTML",
-            disable_web_page_preview: true,
-            reply_markup,
-        };
-
-        // Retry with exponential backoff (max 3 attempts)
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.client.post(&url).json(&body).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let resp_body: TelegramResponse = resp.json().await
-                        .unwrap_or(TelegramResponse { ok: false, description: Some("Failed to parse response".into()) });
-
-                    if resp_body.ok {
-                        return Ok(());
-                    }
-
-                    let desc = resp_body.description.unwrap_or_default();
-                    if status.as_u16() == 429 {
-                        warn!(attempt, "Telegram rate limited, backing off");
-                        if attempt >= 3 {
-                            anyhow::bail!("Telegram rate limited after {} attempts: {}", attempt, desc);
-                        }
-                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                        continue;
-                    }
-
-                    anyhow::bail!("Telegram API error ({}): {}", status, desc);
-                }
-                Err(e) => {
-                    if attempt >= 3 {
-                        return Err(e).context("Failed to send Telegram message after 3 attempts");
-                    }
-                    warn!(attempt, error = %e, "Telegram send failed, retrying");
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                }
-            }
-        }
-    }
-
-    /// Long-poll the Telegram API to fetch new commands
-    pub async fn get_updates(&self, offset: i64) -> Result<Vec<crate::types::TelegramUpdate>> {
-        // LOW-7: More robust URL construction
-        let url = format!("{}{}/getUpdates?offset={}&timeout=5", 
-            TELEGRAM_API_BASE, 
-            self.token.as_str(), 
-            offset
-        );
-        let resp = self.client.get(&url).send().await?
-            .json::<crate::types::TelegramUpdatesResponse>().await?;
-        
-        if resp.ok {
-            Ok(resp.result)
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    /// Escape HTML special characters for Telegram HTML parse mode
-    pub fn escape_html(text: &str) -> String {
-        text.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    }
-    
-/// Acknowledge a callback query to remove the loading state from Telegram buttons
-    pub async fn answer_callback_query(&self, query_id: &str, text: Option<&str>) -> Result<()> {
-        let url = format!("{}{}/answerCallbackQuery", TELEGRAM_API_BASE, self.token.as_str());
-        let body = AnswerCallbackQueryRequest { callback_query_id: query_id, text };
-        self.client.post(&url).json(&body).send().await?;
-        Ok(())
-    }
-}
-```
-
-## File: src/config.rs
-```rust
-use anyhow::{Context, Result};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
-use tracing::info;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MercuryConfig {
-    pub trading: TradingConfig,
-    pub platforms: PlatformsConfig,
-    pub database: DatabaseConfig,
-    pub telegram: TelegramConfig,
-    pub polygon_rpc: PolygonRpcConfig,
-    pub logging: LoggingConfig,
-    pub health: HealthConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TradingConfig {
-    pub kelly_fraction_multiplier: Decimal,
-    pub min_net_spread_threshold: Decimal,
-    pub max_single_trade_pct: Decimal,
-    pub max_daily_loss_pct: Decimal,
-    pub max_drawdown_pct: Decimal,
-    pub max_platform_exposure_pct: Decimal,
-    pub stale_data_timeout_ms: u64,
-    pub max_concurrent_arbs: usize,
-    pub gas_price_max_gwei: u64,
-    pub rebalance_threshold_pct: Decimal,
-    pub max_open_positions: usize,
-    pub initial_bankroll: Decimal,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformsConfig {
-    pub polymarket: PolymarketConfig,
-    pub kalshi: KalshiConfig,
-    pub cdna: CdnaConfig,
-    pub forecastex: ForecastExConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolymarketConfig {
-    pub enabled: bool,
-    pub ws_url: String,
-    pub rest_url: String,
-    pub sports_ws_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KalshiConfig {
-    pub enabled: bool,
-    pub ws_url: String,
-    pub rest_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CdnaConfig {
-    pub enabled: bool,
-    pub ws_url: String,
-    pub rest_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForecastExConfig {
-    pub enabled: bool,
-    pub fix_host: String,
-    pub fix_port: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatabaseConfig {
-    pub path: String,
-    pub pool_size: u32,
-    pub busy_timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TelegramConfig {
-    pub enabled: bool,
-    pub daily_report_hour_utc: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolygonRpcConfig {
-    pub url: String,
-    pub gas_poll_interval_secs: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoggingConfig {
-    pub level: String,
-    pub file: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthConfig {
-    pub port: u16,
-}
-
-impl MercuryConfig {
-    pub fn load(path: &str) -> Result<Self> {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path))?;
-        let config: MercuryConfig = serde_yaml::from_str(&contents)
-            .with_context(|| "Failed to parse config YAML")?;
-        config.validate()?;
-        info!("Configuration loaded from {}", path);
-        Ok(config)
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        let t = &self.trading;
-        
-        // HIGH-5 FIX: Prevent zero-timeout configurations that would permanently halt trading
-        anyhow::ensure!(t.stale_data_timeout_ms >= 1000,
-            "stale_data_timeout_ms must be at least 1000ms, got {}", t.stale_data_timeout_ms);
-        anyhow::ensure!(t.min_net_spread_threshold > Decimal::ZERO,
-            "min_net_spread_threshold must be positive, got {}", t.min_net_spread_threshold);
-            
-        anyhow::ensure!(t.initial_bankroll > Decimal::ZERO,
-            "initial_bankroll must be positive, got {}", t.initial_bankroll);
-        anyhow::ensure!(t.kelly_fraction_multiplier > Decimal::ZERO && t.kelly_fraction_multiplier <= Decimal::ONE,
-            "kelly_fraction_multiplier must be in (0, 1], got {}", t.kelly_fraction_multiplier);
-        anyhow::ensure!(t.max_daily_loss_pct > Decimal::ZERO && t.max_daily_loss_pct <= Decimal::ONE,
-            "max_daily_loss_pct must be in (0, 1] (fraction scale), got {}", t.max_daily_loss_pct);
-        anyhow::ensure!(t.max_drawdown_pct > Decimal::ZERO && t.max_drawdown_pct <= Decimal::ONE,
-            "max_drawdown_pct must be in (0, 1] (fraction scale), got {}", t.max_drawdown_pct);
-        anyhow::ensure!(t.max_platform_exposure_pct > Decimal::ZERO && t.max_platform_exposure_pct <= Decimal::ONE,
-            "max_platform_exposure_pct must be in (0, 1] (fraction scale), got {}", t.max_platform_exposure_pct);
-        // Hard ceiling: 10% per trade. This cannot be overridden by config YAML.
-        // At 100% a single bug or bad fill wipes the entire bankroll in one trade.
-        // This limit is intentionally conservative for a live trading system.
-        anyhow::ensure!(
-            t.max_single_trade_pct > Decimal::ZERO && t.max_single_trade_pct <= rust_decimal_macros::dec!(0.10),
-            "max_single_trade_pct must be in (0, 0.10] — absolute safety ceiling is 10%; got {}",
-            t.max_single_trade_pct
-        );
-        anyhow::ensure!(t.max_open_positions >= 1,
-            "max_open_positions must be at least 1, got {}", t.max_open_positions);
-        anyhow::ensure!(t.max_concurrent_arbs >= 1,
-            "max_concurrent_arbs must be at least 1, got {}", t.max_concurrent_arbs);
-        anyhow::ensure!(t.rebalance_threshold_pct > Decimal::ZERO && t.rebalance_threshold_pct <= Decimal::ONE,
-            "rebalance_threshold_pct must be in (0, 1], got {}", t.rebalance_threshold_pct);
-            
-        // Validate platform URLs
-        let p = &self.platforms;
-        if p.polymarket.enabled {
-            anyhow::ensure!(!p.polymarket.ws_url.is_empty(),
-                "Polymarket enabled but ws_url is empty");
-            anyhow::ensure!(!p.polymarket.rest_url.is_empty(),
-                "Polymarket enabled but rest_url is empty");
-            anyhow::ensure!(p.polymarket.ws_url.starts_with("wss://") || p.polymarket.ws_url.starts_with("ws://"),
-                "Polymarket ws_url must start with ws:// or wss://, got: {}", p.polymarket.ws_url);
-        }
-        if p.kalshi.enabled {
-            anyhow::ensure!(!p.kalshi.ws_url.is_empty(),
-                "Kalshi enabled but ws_url is empty");
-            anyhow::ensure!(!p.kalshi.rest_url.is_empty(),
-                "Kalshi enabled but rest_url is empty");
-        }
-        if p.cdna.enabled {
-            anyhow::ensure!(!p.cdna.ws_url.is_empty(),
-                "CDNA enabled but ws_url is empty");
-            anyhow::ensure!(!p.cdna.rest_url.is_empty(),
-                "CDNA enabled but rest_url is empty");
-        }
-        if p.forecastex.enabled {
-            anyhow::ensure!(!p.forecastex.fix_host.is_empty(),
-                "ForecastEx enabled but fix_host is empty");
-            anyhow::ensure!(p.forecastex.fix_port > 0,
-                "ForecastEx enabled but fix_port is 0");
-        }
-        Ok(())
-    }
-}
-
-/// Thread-safe config holder with hot-reload support
-#[derive(Clone)]
-pub struct ConfigManager {
-    inner: Arc<RwLock<MercuryConfig>>,
-    path: String,
-}
-
-impl ConfigManager {
-    pub fn new(config: MercuryConfig, path: String) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(config)),
-            path,
-        }
-    }
-
-    pub fn get(&self) -> MercuryConfig {
-        match self.inner.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
-    pub fn reload(&self) -> Result<()> {
-        let new_config = MercuryConfig::load(&self.path)?;
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        *guard = new_config;
-        info!("Configuration reloaded from {}", self.path);
-        Ok(())
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-}
-```
-
-## File: src/engine/order_book.rs
-```rust
-use rust_decimal::Decimal;
-use std::collections::HashMap;
-use uuid::Uuid;
-
-use crate::types::*;
-
-/// Per-platform order book for a single market
-#[derive(Debug, Clone)]
-pub struct PlatformBook {
-    pub platform: Platform,
-    pub market_id: Uuid,
-    pub bids: std::collections::BTreeMap<Decimal, Decimal>,
-    pub asks: std::collections::BTreeMap<Decimal, Decimal>,
-    pub last_update_ns: u64,
-    pub fee_rate_bps: u16,
-    pub sequence: u64,
-}
-
-impl PlatformBook {
-    pub fn new(platform: Platform, market_id: Uuid) -> Self {
-        Self {
-            platform,
-            market_id,
-            bids: std::collections::BTreeMap::new(),
-            asks: std::collections::BTreeMap::new(),
-            last_update_ns: 0,
-            fee_rate_bps: 0,
-            sequence: 0,
-        }
-    }
-
-    pub fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
-    }
-
-    pub fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(&p, &s)| (p, s))
-    }
-
-    pub fn mid_price(&self) -> Decimal {
-        match (self.best_bid(), self.best_ask()) {
-            (Some((b, _)), Some((a, _))) => (b + a) / Decimal::from(2),
-            (Some((b, _)), None) => b,
-            (None, Some((a, _))) => a,
-            _ => Decimal::ZERO,
-        }
-    }
-
-    pub fn ask_depth(&self) -> Vec<PriceLevel> {
-        self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
-    }
-
-    pub fn bid_depth(&self) -> Vec<PriceLevel> {
-        self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
-    }
-
-    pub fn is_stale(&self, timeout_ns: u64) -> bool {
-        let now = crate::types::now_ns();
-        now.saturating_sub(self.last_update_ns) > timeout_ns
-    }
-
-    /// Update from a NormalizedTick
-    ///
-    /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
-    /// to prevent out-of-order or replayed updates from overwriting newer data.
-    /// Sequence-0 ticks are treated as full snapshots and always applied.
-    pub fn update_from_tick(&mut self, tick: &NormalizedTick) {
-        if tick.sequence > 0 && tick.sequence <= self.sequence {
-            return;
-        }
-
-        // Apply depth levels as incremental updates. Zero-size = remove.
-        for level in tick.book_depth.iter() {
-            if level.size == Decimal::ZERO {
-                self.bids.remove(&level.price);
-                self.asks.remove(&level.price);
-                continue;
-            }
-            if level.price <= tick.bid_price {
-                self.bids.insert(level.price, level.size);
-            } else if level.price >= tick.ask_price {
-                self.asks.insert(level.price, level.size);
-            } else {
-                // Mid-spread level: classify by proximity
-                if tick.ask_price - level.price < level.price - tick.bid_price {
-                    self.asks.insert(level.price, level.size);
-                } else {
-                    self.bids.insert(level.price, level.size);
-                }
-            }
-        }
-
-        // Apply BBO and enforce uncrossed book invariant using O(log N) split_off
-        // HIGH-4 FIX: BTreeMap::split_off is O(log N) vs the previous O(N) collect+remove.
-        if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
-            self.bids.insert(tick.bid_price, tick.bid_size);
-            // Remove all asks at or below bid_price.
-            // split_off(key) returns everything >= key, leaving everything < key in self.
-            // We need to remove asks where price <= bid_price.
-            // Increment by smallest possible to get "strictly greater than bid_price".
-            // BTreeMap split trick: split at bid_price + epsilon isn't clean with Decimal.
-            // Instead, we split at bid_price and check if bid_price itself is in asks.
-            let kept = self.asks.split_off(&tick.bid_price);
-            // `self.asks` now contains asks < bid_price (invalid). `kept` has asks >= bid_price.
-            self.asks = kept;
-            // Also remove the ask AT bid_price if it exists (asks must be strictly > bid)
-            self.asks.remove(&tick.bid_price);
-        }
-        if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
-            self.asks.insert(tick.ask_price, tick.ask_size);
-            // Remove all bids at or above ask_price.
-            // split_off(ask_price) gives us everything >= ask_price (invalid bids).
-            let invalid_bids = self.bids.split_off(&tick.ask_price);
-            // `invalid_bids` is dropped, `self.bids` retains only bids < ask_price.
-            drop(invalid_bids);
-        }
-
-        self.last_update_ns = tick.timestamp_ns;
-        self.fee_rate_bps = tick.fee_rate_bps;
-        self.sequence = tick.sequence;
-    }
-}
-
-/// Unified Order Book: aggregates all platform books for all markets
-pub struct UnifiedOrderBook {
-    books: HashMap<(Uuid, Platform), PlatformBook>,
-}
-
-impl UnifiedOrderBook {
-    pub fn new() -> Self {
-        Self { books: HashMap::new() }
-    }
-
-    pub fn clear(&mut self) {
-        self.books.clear();
-    }
-
-    pub fn update(&mut self, tick: &NormalizedTick) {
-        let key = (tick.market_id, tick.platform);
-        let book = self.books
-            .entry(key)
-            .or_insert_with(|| PlatformBook::new(tick.platform, tick.market_id));
-        book.update_from_tick(tick);
-    }
-
-    pub fn get_book(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformBook> {
-        self.books.get(&(*market_id, *platform))
-    }
-}
-```
-
-## File: src/engine/spread.rs
-```rust
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
-use uuid::Uuid;
-
-use crate::engine::order_book::PlatformBook;
-use crate::feeds::normalizer;
-use crate::types::*;
-
-/// Result of spread computation for one direction of an arb pair
-#[derive(Debug, Clone)]
-pub struct SpreadResult {
-    pub market_id: Uuid,
-    pub leg_a_platform: Platform,
-    pub leg_a_side: Side,
-    pub leg_a_price: Decimal,
-    pub leg_a_available: Decimal,
-    pub leg_a_fee: Decimal,
-    pub leg_b_platform: Platform,
-    pub leg_b_side: Side,
-    pub leg_b_price: Decimal,
-    pub leg_b_available: Decimal,
-    pub leg_b_fee: Decimal,
-    pub raw_spread: Decimal,
-    pub net_spread: Decimal,
-    pub slippage_a: Decimal,
-    pub slippage_b: Decimal,
-    pub gas_cost: Decimal,
-}
-
-pub struct NetSpreadEngine {
-    min_threshold: Decimal,
-    gas_price_gwei: Decimal,
-    /// MATIC/USD spot price (Polymarket runs on Polygon; gas is paid in MATIC, not ETH).
-    /// Default is $0.50 MATIC — do NOT set this to an ETH price (~$2,000+) or gas costs
-    /// will be overestimated 4,000x, suppressing all Polymarket arb opportunities.
-    matic_price_usd: Decimal,
-}
-
-impl NetSpreadEngine {
-    pub fn new(min_threshold: Decimal) -> Self {
-        Self {
-            min_threshold,
-            gas_price_gwei: Decimal::from(50),
-            matic_price_usd: dec!(0.50),
-        }
-    }
-
-    pub fn update_threshold(&mut self, min_threshold: Decimal) {
-        self.min_threshold = min_threshold;
-    }
-
-    pub fn update_gas_price(&mut self, gwei: Decimal) {
-        self.gas_price_gwei = gwei;
-    }
-
-    pub fn update_matic_price(&mut self, price: Decimal) {
-        self.matic_price_usd = price;
-    }
-
-    /// Compute spread for both directions of an arb pair
-    pub fn compute_spreads(
-        &self,
-        book_a: &PlatformBook,
-        book_b: &PlatformBook,
-        target_size: Decimal,
-    ) -> Vec<SpreadResult> {
-        let mut results = Vec::new();
-
-        // Direction 1: Buy YES on A, Buy NO on B
-        if let (Some((ask_a, ask_a_size)), Some((bid_b, bid_b_size))) = (book_a.best_ask(), book_b.best_bid()) {
-            let ask_b_no = Decimal::ONE - bid_b;
-            let raw_spread = Decimal::ONE - ask_a - ask_b_no;
-
-            if raw_spread > Decimal::ZERO {
-                let depth_a = book_a.ask_depth();
-                let depth_b = book_b.bid_depth();
-                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
-                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
-                
-                let actual_target = total_a.min(total_b).min(target_size);
-
-                let fee_a = self.compute_fee(book_a.platform, ask_a, actual_target, book_a.fee_rate_bps);
-                let fee_b = self.compute_fee(book_b.platform, ask_b_no, actual_target, book_b.fee_rate_bps);
-                
-                match (
-                    normalizer::estimate_slippage(actual_target, &depth_a),
-                    normalizer::estimate_slippage(actual_target, &depth_b),
-                ) {
-                    (Some(slippage_a), Some(slippage_b)) => {
-                        let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
-                        
-                        // FIX: Normalize against actual_target to prevent artificial spread inflation
-                        let per_contract_fee_a = fee_a / actual_target;
-                        let per_contract_fee_b = fee_b / actual_target;
-                        let per_contract_gas = gas / actual_target;
-
-                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
-
-                        if net_spread > self.min_threshold {
-                            results.push(SpreadResult {
-                                market_id: book_a.market_id,
-                                leg_a_platform: book_a.platform,
-                                leg_a_side: Side::Yes,
-                                leg_a_price: ask_a,
-                                leg_a_available: ask_a_size.min(target_size),
-                                leg_a_fee: fee_a,
-                                leg_b_platform: book_b.platform,
-                                leg_b_side: Side::No,
-                                leg_b_price: ask_b_no,
-                                leg_b_available: bid_b_size.min(target_size),
-                                leg_b_fee: fee_b,
-                                raw_spread,
-                                net_spread,
-                                slippage_a,
-                                slippage_b,
-                                gas_cost: gas,
-                            });
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(
-                            market_id = %book_a.market_id,
-                            direction = "YES-A/NO-B",
-                            "Insufficient liquidity to size opportunity — skipping"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Direction 2: Buy NO on A, Buy YES on B
-        if let (Some((bid_a, bid_a_size)), Some((ask_b, ask_b_size))) = (book_a.best_bid(), book_b.best_ask()) {
-            let ask_a_no = Decimal::ONE - bid_a;
-            let raw_spread = Decimal::ONE - ask_a_no - ask_b;
-
-            if raw_spread > Decimal::ZERO {
-                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
-                // This allows the VWAP estimator to correctly "walk the book" and consume 
-                // deeper liquidity if the total spread remains profitable.
-                let depth_a = book_a.bid_depth();
-                let depth_b = book_b.ask_depth();
-                
-                let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
-                let total_b: Decimal = depth_b.iter().map(|l| l.size).sum();
-
-                let actual_target = total_a.min(total_b).min(target_size);
-
-                let fee_a = self.compute_fee(book_a.platform, ask_a_no, actual_target, book_a.fee_rate_bps);
-                let fee_b = self.compute_fee(book_b.platform, ask_b, actual_target, book_b.fee_rate_bps);
-                
-                // Optimized: Reuse the previously allocated depth vectors to save CPU cycles 
-                // during the hot-path match evaluation.
-                match (
-                    normalizer::estimate_slippage(actual_target, &depth_a),
-                    normalizer::estimate_slippage(actual_target, &depth_b),
-                ) {
-                    (Some(slippage_a), Some(slippage_b)) => {
-                    let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
-                        
-                        // CRITICAL FIX: Mathematical Unit Mismatch.
-                        // `fee_a` and `fee_b` were computed using `actual_target`, NOT `target_size`. 
-                        // Dividing by the larger `target_size` artificially underestimated the fee drag,
-                        // inflating `net_spread` and causing the engine to execute structurally unprofitable arbs.
-                        let per_contract_fee_a = fee_a / actual_target;
-                        let per_contract_fee_b = fee_b / actual_target;
-                        let per_contract_gas = gas / actual_target;
-
-                        let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
-
-                        if net_spread > self.min_threshold {
-                            results.push(SpreadResult {
-                                market_id: book_a.market_id,
-                                leg_a_platform: book_a.platform,
-                                leg_a_side: Side::No,
-                                leg_a_price: ask_a_no,
-                                leg_a_available: bid_a_size.min(target_size),
-                                leg_a_fee: fee_a,
-                                leg_b_platform: book_b.platform,
-                                leg_b_side: Side::Yes,
-                                leg_b_price: ask_b,
-                                leg_b_available: ask_b_size.min(target_size),
-                                leg_b_fee: fee_b,
-                                raw_spread,
-                                net_spread,
-                                slippage_a,
-                                slippage_b,
-                                gas_cost: gas,
-                            });
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(
-                            market_id = %book_a.market_id,
-                            direction = "NO-A/YES-B",
-                            "Insufficient liquidity to size opportunity — skipping"
-                        );
-                    }
-                }
-            }
-        }
-
-        results
-    }
-
-    fn compute_fee(&self, platform: Platform, price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
-        match platform {
-            Platform::Polymarket | Platform::PolymarketUs => {
-                normalizer::polymarket_fee(price, quantity, fee_rate_bps)
-            }
-            Platform::Kalshi => {
-                // Use the dynamic fee_rate_bps provided by the Kalshi feed tick
-                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-                rate * quantity * price
-            }
-            Platform::Cdna => {
-                let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-                rate * quantity * price.max(Decimal::ONE - price)
-            }
-            Platform::ForecastEx => Decimal::ZERO,
-        }
-    }
-
-    fn gas_cost_if_onchain(&self, platform_a: Platform, platform_b: Platform) -> Decimal {
-        let mut tx_count = Decimal::ZERO;
-        if matches!(platform_a, Platform::Polymarket | Platform::PolymarketUs) {
-            tx_count += Decimal::ONE;
-        }
-        if matches!(platform_b, Platform::Polymarket | Platform::PolymarketUs) {
-            tx_count += Decimal::ONE;
-        }
-
-        if tx_count == Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-
-        // CRITICAL FIX (3-B): Update empirical gas limit. 
-        // 200k was an overestimate; CTF exchange averages 120k-150k.
-        let gas_units = Decimal::from(150_000) * tx_count;
-        let gwei_to_matic = dec!(0.000000001); // 1 gwei = 10^-9 MATIC
-        self.gas_price_gwei * gas_units * gwei_to_matic * self.matic_price_usd
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn test_gas_cost_offchain() {
-        let engine = NetSpreadEngine::new(dec!(0.01));
-        // Kalshi <-> CDNA trade uses zero gas
-        assert_eq!(engine.gas_cost_if_onchain(Platform::Kalshi, Platform::Cdna), Decimal::ZERO);
-    }
-}
-```
-
-## File: src/feeds/normalizer.rs
-```rust
-use rust_decimal::Decimal;
-use uuid::Uuid;
-
-use crate::types::*;
-
-/// Compute a deterministic unified market ID from question + resolution + expiry
-pub fn compute_unified_market_id(question: &str, resolution_source: &str, expiry: &str) -> Uuid {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(question.to_lowercase().as_bytes());
-    hasher.update(b"|");
-    hasher.update(resolution_source.to_lowercase().as_bytes());
-    hasher.update(b"|");
-    hasher.update(expiry.as_bytes());
-    let hash = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
-}
-
-/// Calculate Polymarket fee for given price and fee_rate_bps
-pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
-    let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-    let max_side = price.max(Decimal::ONE - price);
-    rate * quantity * max_side
-}
-
-/// Calculate VWAP slippage for a target order size against order book depth.
-///
-/// `depth` **must** be pre-sorted in fill-walk order by the caller:
-///   - For buys against asks: ascending price (`PlatformBook::ask_depth()`)
-///   - For sells into bids: descending price (`PlatformBook::bid_depth()`)
-///
-/// Returns `None` when the available depth is insufficient to fill `target_size`.
-/// Returns `Some(slippage)` — the absolute VWAP deviation from best quoted price.
-pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<Decimal> {
-    // CRITICAL FIX: If target size is zero or less, we must return None.
-    // Returning Some(0) causes a fatal Divide-By-Zero panic in the spread engine 
-    // when it attempts to normalize fees (fee_a / actual_target).
-    if depth.is_empty() || target_size <= Decimal::ZERO {
-        return None; 
-    }
-
-    let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();
-    if levels.is_empty() {
-        // Return None to explicitly signal a complete lack of liquidity
-        return None;
-    }
-
-    let best_price = levels[0].price;
-    let mut remaining = target_size;
-    let mut total_cost = Decimal::ZERO;
-
-    for level in &levels {
-        let fill_qty = remaining.min(level.size);
-        total_cost += fill_qty * level.price;
-        remaining -= fill_qty;
-        if remaining <= Decimal::ZERO {
-            break;
-        }
-    }
-
-    if remaining > Decimal::ZERO {
-        return None;
-    }
-
-    let vwap = total_cost / target_size;
-    Some((vwap - best_price).abs())
-}
-
-pub fn kalshi_fee(price: Decimal, quantity: Decimal) -> Decimal {
-    let max_fee = rust_decimal_macros::dec!(0.07);
-    let implied_fee = price * rust_decimal_macros::dec!(0.10);
-    max_fee.min(implied_fee) * quantity
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_decimal_macros::dec;
-
-    #[test]
-    fn test_polymarket_fee() {
-        // Price > 0.5 (e.g. 0.6), quantity = 100, fee = 200 bps (0.02)
-        // Fee = 0.02 * 100 * max(0.6, 0.4) = 2 * 0.6 = 1.2
-        let fee = polymarket_fee(dec!(0.6), dec!(100), 200);
-        assert_eq!(fee, dec!(1.20));
-
-        // Price < 0.5 (e.g. 0.2), quantity = 50, fee = 100 bps (0.01)
-        // Fee = 0.01 * 50 * max(0.2, 0.8) = 0.5 * 0.8 = 0.4
-        let fee2 = polymarket_fee(dec!(0.2), dec!(50), 100);
-        assert_eq!(fee2, dec!(0.40));
-    }
-
-    #[test]
-    fn test_estimate_slippage() {
-        let depth = vec![
-            PriceLevel { price: dec!(0.50), size: dec!(10) },
-            PriceLevel { price: dec!(0.52), size: dec!(20) },
-        ];
-
-        // Target size fully within first level
-        let slip1 = estimate_slippage(dec!(5), &depth);
-        assert_eq!(slip1, Some(dec!(0)));
-
-        // Target size spans both levels:
-        // 10 @ 0.50 = 5.0
-        // 5 @ 0.52 = 2.6
-        // Total cost = 7.6 for 15 contracts -> VWAP = 0.50666...
-        // Best price = 0.50
-        // Slippage = 0.006666...
-        let slip2 = estimate_slippage(dec!(15), &depth).unwrap();
-        assert!(slip2 > dec!(0.006));
-        assert!(slip2 < dec!(0.007));
-
-        // Insufficient depth
-        let slip3 = estimate_slippage(dec!(50), &depth);
-        assert_eq!(slip3, None);
-    }
-}
-```
-
-## File: src/engine/detector.rs
-```rust
-use rust_decimal::Decimal;
-use tracing::{debug};
-use uuid::Uuid;
-use rust_decimal::prelude::ToPrimitive;
-
-use crate::engine::market_registry::MarketRegistry;
-use crate::engine::order_book::UnifiedOrderBook;
-use crate::engine::spread::{NetSpreadEngine, SpreadResult};
-use crate::types::*;
-
-/// Rejection reason for the 5-gate pipeline
-#[derive(Debug, Clone)]
-pub enum RejectionReason {
-    BelowSpreadThreshold(Decimal),
-    InsufficientLiquidity { available: Decimal, required: Decimal },
-    StaleData { age_ms: u64, max_ms: u64 },
-    CorrelationExposure { current: Decimal, max: Decimal },
-    RiskBudgetExceeded { reason: String },
-}
-
-/// Detection statistics
-#[derive(Debug, Default)]
-pub struct DetectorStats {
-    pub opportunities_detected: u64,
-    pub gate1_rejected: u64,
-    pub gate2_rejected: u64,
-    pub gate3_rejected: u64,
-    pub gate4_rejected: u64,
-    pub gate5_rejected: u64,
-    pub opportunities_passed: u64,
-}
-
-pub struct ArbitrageDetector {
-    min_spread: Decimal,
-    min_order_size: Decimal,
-    stale_timeout_ms: u64,
-    max_concurrent: usize,
-    active_arbs: usize,
-    pub stats: DetectorStats,
-    paused_until_ns: u64,
-}
-
-impl ArbitrageDetector {
-    pub fn new(
-        min_spread: Decimal,
-        min_order_size: Decimal,
-        stale_timeout_ms: u64,
-        max_concurrent: usize,
-    ) -> Self {
-        Self {
-            min_spread,
-            min_order_size,
-            stale_timeout_ms,
-            max_concurrent,
-            active_arbs: 0,
-            stats: DetectorStats::default(),
-            paused_until_ns: 0,
-        }
-    }
-
-    pub fn pause_detection_until(&mut self, ns: u64) {
-        self.paused_until_ns = ns;
-    }
-
-    pub fn update_thresholds(&mut self, min_spread: Decimal, stale_timeout_ms: u64, max_concurrent: usize) {
-        self.min_spread = min_spread;
-        self.stale_timeout_ms = stale_timeout_ms;
-        self.max_concurrent = max_concurrent;
-    }
-
-    pub fn set_active_arbs(&mut self, count: usize) {
-        self.active_arbs = count;
-    }
-
-    /// Evaluates spreads ONLY for the specific market that just updated.
-    pub fn detect_for_market(
-        &mut self,
-        market_id: &Uuid,
-        registry: &MarketRegistry,
-        uob: &UnifiedOrderBook,
-        spread_engine: &NetSpreadEngine,
-        target_size: Decimal,
-    ) -> Vec<ArbitrageOpportunity> {
-        let mut opportunities = Vec::new();
-
-        // HIGH-1 FIX: Do not evaluate spreads if the engine is in a cooldown period
-        // (e.g., recovering from a broadcast::Lagged event repopulating the order books).
-        if crate::types::now_ns() < self.paused_until_ns {
-            return opportunities;
-        }
-
-        let pairs = match registry.get_arb_pairs_for_market(market_id) {
-            Some(p) => p,
-            None => return opportunities,
-        };
-
-        for pair in pairs {
-            // CRITICAL FIX: The Time-to-Maturity Trap
-            // Do not evaluate spreads if the market resolves in less than 60 seconds.
-            // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 
-            // in time to dump the naked leg before the exchange locks the order book.
-            if let Some(market) = registry.get_market(&pair.market_id) {
-                let seconds_to_exp = (market.expiration - chrono::Utc::now()).num_seconds();
-                if seconds_to_exp < 60 {
-                    continue; 
-                }
-            }
-
-            let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
-                Some(b) => b,
-                None => continue,
-            };
-            let book_b = match uob.get_book(&pair.market_id, &pair.platform_b) {
-                Some(b) => b,
-                None => continue,
-            };
-
-            let spreads = spread_engine.compute_spreads(book_a, book_b, target_size);
-
-            for spread in spreads {
-                self.stats.opportunities_detected += 1;
-
-                match self.run_gates(&spread, book_a, book_b, pair.confidence) {
-                    Ok(()) => {
-                        self.stats.opportunities_passed += 1;
-
-                        // Fetch the native exchange identifiers and fee rates from the registry
-                        let info_a = registry.get_platform_info(&pair.market_id, &pair.platform_a);
-                        let info_b = registry.get_platform_info(&pair.market_id, &pair.platform_b);
-                        
-                        let (plat_id_a, fee_bps_a) = if let Some(i) = info_a { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
-                        let (plat_id_b, fee_bps_b) = if let Some(i) = info_b { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
-
-                        let liquidity = spread.leg_a_available.min(spread.leg_b_available);
-                        let log_liq = if liquidity > Decimal::ZERO {
-                            // HIGH-3 FIX: Accepted f64 imprecision with explicit documentation.
-                            // Rust Decimal lacks a native ln() function. The floating-point conversion here 
-                            // only impacts the relative ranking queue of opportunities (the score), 
-                            // not the actual financial math, risk limits, or threshold gates.
-                            // Add 1.0 to the natural log so a liquidity of 1.0 yields a multiplier of 1.0 (ln(1) = 0 + 1 = 1)
-                            let val = liquidity.to_f64().unwrap_or(1.0).ln() + 1.0;
-                            // Natively cast f64 to Decimal to eliminate string allocation in the hot path
-                            Decimal::try_from(val.max(0.1)).unwrap_or(Decimal::ONE)
-                        } else {
-                            Decimal::ONE
-                        };
-                        let confidence_dec = Decimal::try_from(pair.confidence).unwrap_or(Decimal::ONE);
-                        let score = spread.net_spread * log_liq * confidence_dec;
-
-                        opportunities.push(ArbitrageOpportunity {
-                            opp_id: Uuid::new_v4(),
-                            market_id: spread.market_id,
-                            market_question: String::new(), // M-9 FIX: Defer allocation until after truncation
-                            leg_a: LegDetail {
-                                platform: spread.leg_a_platform,
-                                side: spread.leg_a_side,
-                                price: spread.leg_a_price,
-                                available_size: spread.leg_a_available,
-                                fee_estimate: spread.leg_a_fee,
-                                fee_rate_bps: fee_bps_a as u32, 
-                                platform_market_id: plat_id_a, 
-                            },
-                            leg_b: LegDetail {
-                                platform: spread.leg_b_platform,
-                                side: spread.leg_b_side,
-                                price: spread.leg_b_price,
-                                available_size: spread.leg_b_available,
-                                fee_estimate: spread.leg_b_fee,
-                                fee_rate_bps: fee_bps_b as u32,
-                                platform_market_id: plat_id_b, 
-                            },
-                            raw_spread: spread.raw_spread,
-                            net_spread: spread.net_spread,
-                            kelly_fraction: Decimal::ZERO, 
-                            recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
-                            score,
-                            detected_at: now_ns(),
-                            // FIX: Reduce Time-to-Live to 200ms. If the execution queue backs up,
-                            // prices will move. Drops stale arbs before they execute at a loss.
-                            ttl_ms: 200,
-                        });
-                    }
-                    Err(reason) => {
-                        debug!(?reason, market_id = %spread.market_id, "Opportunity rejected");
-                    }
-                }
-            }
-        }
-
-        opportunities.sort_by(|a, b| b.score.cmp(&a.score));
-        let slots = self.max_concurrent.saturating_sub(self.active_arbs);
-        opportunities.truncate(slots);
-
-        // M-9 FIX: Allocate strings only for the opportunities that actually made the cut
-        for opp in &mut opportunities {
-            if let Some(market) = registry.get_market(&opp.market_id) {
-                opp.market_question = market.question.clone();
-            }
-        }
-
-        opportunities
-    }
-
-    fn run_gates(
-        &mut self,
-        spread: &SpreadResult,
-        book_a: &crate::engine::order_book::PlatformBook,
-        book_b: &crate::engine::order_book::PlatformBook,
-        confidence: f64,
-    ) -> Result<(), RejectionReason> {
-        if spread.net_spread < self.min_spread {
-            self.stats.gate1_rejected += 1;
-            return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
-        }
-
-        let min_available = spread.leg_a_available.min(spread.leg_b_available);
-        if min_available < self.min_order_size {
-            self.stats.gate2_rejected += 1;
-            return Err(RejectionReason::InsufficientLiquidity {
-                available: min_available,
-                required: self.min_order_size,
-            });
-        }
-
-        let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
-        let now = now_ns();
-
-        let age_a = now.saturating_sub(book_a.last_update_ns);
-        if age_a > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
-            return Err(RejectionReason::StaleData {
-                age_ms: age_a / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
-        }
-
-        let age_b = now.saturating_sub(book_b.last_update_ns);
-        if age_b > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
-            return Err(RejectionReason::StaleData {
-                age_ms: age_b / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
-        }
-
-        if confidence < 0.95 {
-            self.stats.gate4_rejected += 1;
-            return Err(RejectionReason::CorrelationExposure {
-                current: Decimal::ZERO,
-                max: Decimal::ZERO,
-            });
-        }
-
-        if self.active_arbs >= self.max_concurrent {
-            self.stats.gate5_rejected += 1;
-            return Err(RejectionReason::RiskBudgetExceeded {
-                reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
-            });
-        }
-
-        Ok(())
     }
 }
 ```
@@ -7504,6 +7516,257 @@ impl KalshiFeed {
 }
 ```
 
+## File: src/execution/kalshi_client.rs
+```rust
+use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use tracing::info;
+
+use super::executor::{OrderResult, PlatformOrderClient};
+use crate::crypto::jwt::KalshiAuth;
+use crate::types::Side;
+
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct KalshiClient {
+    http: reqwest::Client,
+    rest_url: String,
+    auth: Arc<KalshiAuth>,
+}
+
+#[derive(Serialize)]
+struct KalshiOrderRequest {
+    ticker: String,
+    action: String,
+    side: String,
+    #[serde(rename = "type")]
+    order_type: String,
+    count: i64,
+    yes_price: Option<i64>,
+    no_price: Option<i64>,
+    expiration_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_in_force: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KalshiOrderResponse {
+    #[serde(default)]
+    order: Option<KalshiOrder>,
+    #[serde(default)]
+    error: Option<KalshiError>,
+}
+
+#[derive(Deserialize)]
+struct KalshiOrder {
+    order_id: String,
+    #[serde(default)]
+    yes_price: i64,
+    #[serde(default)]
+    no_price: i64,
+    #[serde(default)]
+    count: i64,
+    #[serde(default)]
+    remaining_count: i64,
+}
+
+#[derive(Deserialize)]
+struct KalshiError {
+    message: String,
+}
+
+impl KalshiClient {
+    pub fn new(rest_url: String, auth: KalshiAuth) -> Self {
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5));
+            
+        // M-8 FIX: Explicit TLS Cert Pinning
+        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+            
+        let http = builder.build().expect("failed to build Kalshi HTTP client");
+        Self { http, rest_url, auth: Arc::new(auth) }
+    }
+}
+
+use crate::execution::executor::OrderAction;
+
+#[async_trait::async_trait]
+impl PlatformOrderClient for KalshiClient {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
+        // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
+
+        // Avoid string parsing panics by directly safely converting rounded decimals
+        let mut price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
+        
+        // CRITICAL FIX: Kalshi explicitly rejects prices of 0 or 100.
+        price_cents = price_cents.clamp(1, 99);
+        
+        // CRIT-1 / MED-10 FIX: Prevent catastrophic fallback to i64::MAX on extreme size overflows
+        let count = size.floor().to_i64().unwrap_or(0).clamp(1, 10_000);
+
+        // MED-5: Basic rate limiting to prevent 429s on burst arbs
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (kalshi_side, yes_price, no_price) = match side {
+            Side::Yes => ("yes".to_string(), Some(price_cents), None),
+            Side::No => ("no".to_string(), None, Some(price_cents)),
+        };
+
+        let kalshi_action = match action {
+            OrderAction::Buy => "buy".to_string(),
+            OrderAction::Sell => "sell".to_string(),
+        };
+
+        info!(ticker = market_id, action = %kalshi_action, side = %kalshi_side, price_cents, count, "Submitting Kalshi order");
+
+        let url = format!("{}/portfolio/orders", self.rest_url);
+        let auth_header = self.auth.auth_header().await?;
+
+        let req = KalshiOrderRequest {
+            ticker: market_id.to_string(),
+            action: kalshi_action,
+            side: kalshi_side,
+            order_type: "limit".to_string(),
+            count,
+            yes_price,
+            no_price,
+            expiration_ts: None,
+            client_order_id: None,
+            // CRITICAL FIX: Ensure the order is Fill-or-Kill so it doesn't rest on the book
+            time_in_force: Some("fok".to_string()), 
+        };
+
+        let resp = self.http
+            .post(&url)
+            .header("Authorization", &auth_header)
+            .header("Content-Type", "application/json")
+            .json(&req)
+            .send()
+            .await
+            .context("Kalshi order submission failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                tracing::warn!("Kalshi rate limited: {}", body);
+            }
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: Decimal::ZERO,
+                fill_size: Decimal::ZERO,
+                fee: Decimal::ZERO,
+                order_id: String::new(),
+                error: Some(format!("HTTP {}: {}", status, body)),
+            });
+        }
+
+        let body: KalshiOrderResponse = resp.json().await.unwrap_or(KalshiOrderResponse {
+            order: None,
+            error: Some(KalshiError { message: "Failed to decode response".to_string() }),
+        });
+
+        if let Some(order) = body.order {
+            let filled_count = order.count - order.remaining_count;
+            let filled = filled_count > 0;
+            let fill_price = Decimal::from(order.yes_price.max(order.no_price)) / Decimal::from(100);
+            // CRIT-5 FIX: Centralize fee math to ensure consistency with spread engine
+            let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count));
+            Ok(OrderResult {
+                filled,
+                fill_price,
+                fill_size: Decimal::from(filled_count),
+                fee: total_fee,
+                order_id: order.order_id,
+                error: if !filled { Some("Order not filled".into()) } else { None },
+            })
+        } else {
+            let error_msg = body.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".into());
+            Ok(OrderResult { filled: false, fill_price: Decimal::ZERO, fill_size: Decimal::ZERO, fee: Decimal::ZERO, order_id: String::new(), error: Some(error_msg) })
+        }
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let url = format!("{}/portfolio/orders/{}", self.rest_url, order_id);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.delete(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .context("Kalshi cancel failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!("Kalshi cancel_order failed: HTTP {}", status);
+        }
+        Ok(())
+    }
+}
+
+impl KalshiClient {
+    /// Queries the Kalshi API for the actual revenue generated by a settled market position.
+    pub async fn fetch_settlement_payout(&self, ticker: &str, quantity: Decimal, avg_entry: Decimal) -> Result<Decimal> {
+        let url = format!("{}/portfolio/settlements?ticker={}", self.rest_url, ticker);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.get(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .context("Kalshi settlement fetch failed")?;
+            
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        
+        let mut total_revenue_cents: i64 = 0;
+        let mut total_contracts: i64 = 0;
+        
+        // FIX: Compute the average payout per contract to prevent multi-arb double counting
+        if let Some(settlements) = body.get("settlements").and_then(|v| v.as_array()) {
+            for settlement in settlements {
+                total_revenue_cents += settlement.get("revenue").and_then(|v| v.as_i64()).unwrap_or(0);
+                total_contracts += settlement.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            }
+        }
+        
+        let revenue_per_contract = if total_contracts > 0 {
+            Decimal::from(total_revenue_cents) / Decimal::from(total_contracts) / Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        };
+        
+        let total_revenue = quantity * revenue_per_contract;
+        let cost_basis = quantity * avg_entry;
+        let realized_pnl = total_revenue - cost_basis;
+        
+        Ok(realized_pnl)
+    }
+
+    /// Queries the Kalshi API for the actual live balance of the wallet
+    pub async fn get_balance(&self) -> Result<Decimal> {
+        let url = format!("{}/portfolio/balance", self.rest_url);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.get(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Kalshi get_balance failed: {}", resp.status());
+        }
+        let body: serde_json::Value = resp.json().await?;
+        let balance_cents = body.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+        Ok(Decimal::from(balance_cents) / Decimal::from(100))
+    }
+}
+```
+
 ## File: src/feeds/polymarket.rs
 ```rust
 use anyhow::{Context, Result};
@@ -7573,6 +7836,7 @@ impl LocalOrderBook {
         }
     }
 
+    #[allow(dead_code)]
     fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
         self.bids.clear();
         self.asks.clear();
@@ -8029,9 +8293,30 @@ impl ExecutionEngine {
 
     pub async fn run(mut self) {
         info!("Execution engine started");
-        while let Some(opp) = self.rx.recv().await {
-            if let Err(e) = self.execute_arbitrage(opp).await {
-                error!(error = %e, "Arbitrage execution error");
+        loop {
+            // HIGH-3 FIX: Use recv() with a periodic timeout so the task
+            // doesn't block forever if the sender is dropped or the system
+            // is shutting down. This allows the JoinSet monitor to detect
+            // executor health issues within 5 seconds.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.rx.recv(),
+            ).await {
+                Ok(Some(opp)) => {
+                    if let Err(e) = self.execute_arbitrage(opp).await {
+                        error!(error = %e, "Arbitrage execution error");
+                    }
+                }
+                Ok(None) => {
+                    // Channel closed — sender dropped, begin graceful shutdown
+                    info!("Execution engine: opportunity channel closed, draining");
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — no opportunities in 5s, just loop and check again.
+                    // This prevents the task from appearing "stuck" to the JoinSet monitor.
+                    continue;
+                }
             }
         }
         info!("Execution engine stopped");
@@ -8465,257 +8750,6 @@ impl ExecutionEngine {
             let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
             (TradeStatus::Fail, Decimal::ZERO, Some(reason))
         }
-    }
-}
-```
-
-## File: src/execution/kalshi_client.rs
-```rust
-use anyhow::{Context, Result};
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
-use serde::{Deserialize, Serialize};
-use tracing::info;
-
-use super::executor::{OrderResult, PlatformOrderClient};
-use crate::crypto::jwt::KalshiAuth;
-use crate::types::Side;
-
-use std::sync::Arc;
-
-#[derive(Clone)]
-pub struct KalshiClient {
-    http: reqwest::Client,
-    rest_url: String,
-    auth: Arc<KalshiAuth>,
-}
-
-#[derive(Serialize)]
-struct KalshiOrderRequest {
-    ticker: String,
-    action: String,
-    side: String,
-    #[serde(rename = "type")]
-    order_type: String,
-    count: i64,
-    yes_price: Option<i64>,
-    no_price: Option<i64>,
-    expiration_ts: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    client_order_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    time_in_force: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct KalshiOrderResponse {
-    #[serde(default)]
-    order: Option<KalshiOrder>,
-    #[serde(default)]
-    error: Option<KalshiError>,
-}
-
-#[derive(Deserialize)]
-struct KalshiOrder {
-    order_id: String,
-    #[serde(default)]
-    yes_price: i64,
-    #[serde(default)]
-    no_price: i64,
-    #[serde(default)]
-    count: i64,
-    #[serde(default)]
-    remaining_count: i64,
-}
-
-#[derive(Deserialize)]
-struct KalshiError {
-    message: String,
-}
-
-impl KalshiClient {
-    pub fn new(rest_url: String, auth: KalshiAuth) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5));
-            
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-            
-        let http = builder.build().expect("failed to build Kalshi HTTP client");
-        Self { http, rest_url, auth: Arc::new(auth) }
-    }
-}
-
-use crate::execution::executor::OrderAction;
-
-#[async_trait::async_trait]
-impl PlatformOrderClient for KalshiClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
-        // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
-
-        // Avoid string parsing panics by directly safely converting rounded decimals
-        let mut price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
-        
-        // CRITICAL FIX: Kalshi explicitly rejects prices of 0 or 100.
-        price_cents = price_cents.clamp(1, 99);
-        
-        // CRIT-1 / MED-10 FIX: Prevent catastrophic fallback to i64::MAX on extreme size overflows
-        let count = size.floor().to_i64().unwrap_or(0).clamp(1, 10_000);
-
-        // MED-5: Basic rate limiting to prevent 429s on burst arbs
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let (kalshi_side, yes_price, no_price) = match side {
-            Side::Yes => ("yes".to_string(), Some(price_cents), None),
-            Side::No => ("no".to_string(), None, Some(price_cents)),
-        };
-
-        let kalshi_action = match action {
-            OrderAction::Buy => "buy".to_string(),
-            OrderAction::Sell => "sell".to_string(),
-        };
-
-        info!(ticker = market_id, action = %kalshi_action, side = %kalshi_side, price_cents, count, "Submitting Kalshi order");
-
-        let url = format!("{}/portfolio/orders", self.rest_url);
-        let auth_header = self.auth.auth_header().await?;
-
-        let req = KalshiOrderRequest {
-            ticker: market_id.to_string(),
-            action: kalshi_action,
-            side: kalshi_side,
-            order_type: "limit".to_string(),
-            count,
-            yes_price,
-            no_price,
-            expiration_ts: None,
-            client_order_id: None,
-            // CRITICAL FIX: Ensure the order is Fill-or-Kill so it doesn't rest on the book
-            time_in_force: Some("fok".to_string()), 
-        };
-
-        let resp = self.http
-            .post(&url)
-            .header("Authorization", &auth_header)
-            .header("Content-Type", "application/json")
-            .json(&req)
-            .send()
-            .await
-            .context("Kalshi order submission failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                tracing::warn!("Kalshi rate limited: {}", body);
-            }
-            return Ok(OrderResult {
-                filled: false,
-                fill_price: Decimal::ZERO,
-                fill_size: Decimal::ZERO,
-                fee: Decimal::ZERO,
-                order_id: String::new(),
-                error: Some(format!("HTTP {}: {}", status, body)),
-            });
-        }
-
-        let body: KalshiOrderResponse = resp.json().await.unwrap_or(KalshiOrderResponse {
-            order: None,
-            error: Some(KalshiError { message: "Failed to decode response".to_string() }),
-        });
-
-        if let Some(order) = body.order {
-            let filled_count = order.count - order.remaining_count;
-            let filled = filled_count > 0;
-            let fill_price = Decimal::from(order.yes_price.max(order.no_price)) / Decimal::from(100);
-            // CRIT-5 FIX: Centralize fee math to ensure consistency with spread engine
-            let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count));
-            Ok(OrderResult {
-                filled,
-                fill_price,
-                fill_size: Decimal::from(filled_count),
-                fee: total_fee,
-                order_id: order.order_id,
-                error: if !filled { Some("Order not filled".into()) } else { None },
-            })
-        } else {
-            let error_msg = body.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".into());
-            Ok(OrderResult { filled: false, fill_price: Decimal::ZERO, fill_size: Decimal::ZERO, fee: Decimal::ZERO, order_id: String::new(), error: Some(error_msg) })
-        }
-    }
-
-    async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let url = format!("{}/portfolio/orders/{}", self.rest_url, order_id);
-        let auth_header = self.auth.auth_header().await?;
-        let resp = self.http.delete(&url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await
-            .context("Kalshi cancel failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            tracing::warn!("Kalshi cancel_order failed: HTTP {}", status);
-        }
-        Ok(())
-    }
-}
-
-impl KalshiClient {
-    /// Queries the Kalshi API for the actual revenue generated by a settled market position.
-    pub async fn fetch_settlement_payout(&self, ticker: &str, quantity: Decimal, avg_entry: Decimal) -> Result<Decimal> {
-        let url = format!("{}/portfolio/settlements?ticker={}", self.rest_url, ticker);
-        let auth_header = self.auth.auth_header().await?;
-        let resp = self.http.get(&url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await
-            .context("Kalshi settlement fetch failed")?;
-            
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        
-        let mut total_revenue_cents: i64 = 0;
-        let mut total_contracts: i64 = 0;
-        
-        // FIX: Compute the average payout per contract to prevent multi-arb double counting
-        if let Some(settlements) = body.get("settlements").and_then(|v| v.as_array()) {
-            for settlement in settlements {
-                total_revenue_cents += settlement.get("revenue").and_then(|v| v.as_i64()).unwrap_or(0);
-                total_contracts += settlement.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            }
-        }
-        
-        let revenue_per_contract = if total_contracts > 0 {
-            Decimal::from(total_revenue_cents) / Decimal::from(total_contracts) / Decimal::from(100)
-        } else {
-            Decimal::ZERO
-        };
-        
-        let total_revenue = quantity * revenue_per_contract;
-        let cost_basis = quantity * avg_entry;
-        let realized_pnl = total_revenue - cost_basis;
-        
-        Ok(realized_pnl)
-    }
-
-    /// Queries the Kalshi API for the actual live balance of the wallet
-    pub async fn get_balance(&self) -> Result<Decimal> {
-        let url = format!("{}/portfolio/balance", self.rest_url);
-        let auth_header = self.auth.auth_header().await?;
-        let resp = self.http.get(&url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Kalshi get_balance failed: {}", resp.status());
-        }
-        let body: serde_json::Value = resp.json().await?;
-        let balance_cents = body.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-        Ok(Decimal::from(balance_cents) / Decimal::from(100))
     }
 }
 ```
@@ -9479,10 +9513,15 @@ mod monitoring;
 mod risk;
 mod telegram;
 mod types;
+#[cfg(test)]
+#[path = "integration.rs"]
+mod integration;
 
 use config::MercuryConfig;
 use db::SqliteDb;
 use types::*;
+
+
 
 #[derive(Parser)]
 #[command(name = "mercury", about = "MERCURY - Cross-Market Prediction Arbitrage Engine")]
@@ -9579,113 +9618,6 @@ fn seconds_until_report_hour(hour_utc: u32) -> u64 {
     (target - now).num_seconds().max(1) as u64
 }
 
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
-    use rust_decimal_macros::dec;
-    use crate::engine::order_book::UnifiedOrderBook;
-    use crate::engine::spread::NetSpreadEngine;
-    use crate::engine::detector::ArbitrageDetector;
-    use crate::engine::market_registry::MarketRegistry;
-    use crate::types::*;
-    use uuid::Uuid;
-
-    #[tokio::test]
-    async fn test_main_event_loop_discovery_and_execution() {
-        // L-4 FIX: Basic integration test scaffolding for the engine pipeline
-        let mut registry = MarketRegistry::new();
-        let market_id = Uuid::new_v4();
-        let mut platforms = std::collections::HashMap::new();
-        platforms.insert(Platform::Polymarket, PlatformMarketInfo {
-            platform: Platform::Polymarket,
-            platform_market_id: "poly_token".into(),
-            fee_rate_bps: 200,
-            min_order_size: dec!(1.0),
-            tick_size: dec!(0.01),
-        });
-        platforms.insert(Platform::Kalshi, PlatformMarketInfo {
-            platform: Platform::Kalshi,
-            platform_market_id: "kalshi_ticker".into(),
-            fee_rate_bps: 175,
-            min_order_size: dec!(1.0),
-            tick_size: dec!(0.01),
-        });
-
-        registry.register_market(Market {
-            unified_id: market_id,
-            question: "Test Market".into(),
-            resolution_source: "Test".into(),
-            expiration: chrono::Utc::now() + chrono::Duration::hours(1),
-            platforms,
-            category: MarketCategory::Other,
-            confidence: 0.99,
-            status: MarketStatus::Active,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        });
-
-        let mut uob = UnifiedOrderBook::new();
-        let mut spread_engine = NetSpreadEngine::new(dec!(0.01));
-        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
-
-        // Simulate Polymarket Tick (Ask YES at 0.40)
-        let poly_tick = NormalizedTick {
-            platform: Platform::Polymarket,
-            market_id,
-            timestamp_ns: now_ns(),
-            bid_price: dec!(0.38),
-            bid_size: dec!(100),
-            ask_price: dec!(0.40),
-            ask_size: dec!(100),
-            mid_price: dec!(0.39),
-            last_trade_price: dec!(0.39),
-            last_trade_size: dec!(10),
-            book_depth: std::sync::Arc::new(vec![
-                PriceLevel { price: dec!(0.40), size: dec!(100) },
-                PriceLevel { price: dec!(0.38), size: dec!(100) },
-            ]),
-            fee_rate_bps: 200,
-            sequence: 1,
-        };
-        uob.update(&poly_tick);
-
-        // Simulate Kalshi Tick (Ask NO at 0.50 -> Implies YES Bid at 0.50)
-        let kalshi_tick = NormalizedTick {
-            platform: Platform::Kalshi,
-            market_id,
-            timestamp_ns: now_ns(),
-            bid_price: dec!(0.50), // Someone bidding YES at 0.50
-            bid_size: dec!(100),
-            ask_price: dec!(0.52),
-            ask_size: dec!(100),
-            mid_price: dec!(0.51),
-            last_trade_price: dec!(0.51),
-            last_trade_size: dec!(10),
-            book_depth: std::sync::Arc::new(vec![
-                PriceLevel { price: dec!(0.52), size: dec!(100) },
-                PriceLevel { price: dec!(0.50), size: dec!(100) },
-            ]),
-            fee_rate_bps: 175,
-            sequence: 1,
-        };
-        uob.update(&kalshi_tick);
-
-        let opps = detector.detect_for_market(
-            &market_id,
-            &registry,
-            &uob,
-            &spread_engine,
-            dec!(10.0),
-        );
-
-        assert_eq!(opps.len(), 1, "Should detect 1 arb opportunity");
-        let opp = &opps[0];
-        assert_eq!(opp.leg_a.platform, Platform::Polymarket);
-        assert_eq!(opp.leg_b.platform, Platform::Kalshi);
-        assert!(opp.net_spread > dec!(0.05), "Net spread should be positive");
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -9722,6 +9654,12 @@ async fn main() -> Result<()> {
         mercury_config.database.busy_timeout_ms,
     ).await?);
     info!("Database initialized via SQLx");
+
+    // Salva uma referência concreta para usar no shutdown
+    let db_for_shutdown = sqlite_db.clone(); 
+    
+    // Converte para o Trait Object para o resto do sistema usar
+    let db: Arc<dyn db::Database> = Arc::new(sqlite_db);
 
     let metrics = monitoring::metrics::Metrics::new();
 
@@ -10252,15 +10190,16 @@ loop {
                 let tick = match tick_result {
                     Ok(t) => t,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Books may be stale.", n);
-                        // H-4 FIX: DO NOT clear all books globally. 
-                        // The stale feed detector (CB9) and individual tick sequence numbers 
-                        // will natively handle staleness and overwrite with fresh data.
+                        tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Clearing UOB and cooling down.", n);
+                        // Clear all books to prevent stale data from being visible to the spread
+                        // engine during the cooldown period. Feed handlers will repopulate from
+                        // authoritative exchange snapshots on their next tick.
+                        uob.write().await.clear();
                         let _ = alert_tx.try_send(AlertMessage::SystemAlert {
                             severity: "warning".into(),
-                            message: format!("HFT Engine lagging! Missed {} ticks. Cooling down detection.", n),
+                            message: format!("HFT Engine lagging! Missed {} ticks. Books cleared, cooling down detection.", n),
                         });
-                        // Cooldown detection for 5 seconds to prevent single-sided executions
+                        // Cooldown detection for 5 seconds to allow books to rebuild
                         detector.pause_detection_until(crate::types::now_ns() + 5_000_000_000);
                         continue;
                     }
@@ -10675,6 +10614,15 @@ loop {
     // Abort all remaining tasks and wait for them to finish.
     join_set.abort_all();
     while join_set.join_next().await.is_some() {}
+
+    // HIGH-5 FIX: Final WAL checkpoint to ensure all recent writes are durable.
+    // Without this, the last few minutes of trades/audit entries could be lost
+    // if the WAL file is corrupted or truncated on unclean shutdown.
+    if let Err(e) = db_for_shutdown.final_checkpoint().await {
+        error!(error = %e, "Failed to perform final WAL checkpoint on shutdown");
+    } else {
+        info!("Final WAL checkpoint complete");
+    }
 
     Ok(())
 }

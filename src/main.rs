@@ -155,12 +155,19 @@ async fn main() -> Result<()> {
         panic!("CRITICAL: ForecastEx FIX execution is not fully implemented. Do not run with forecastex.enabled = true to prevent unhedged dual-leg exposure.");
     }
 
-    let db: Arc<dyn db::Database> = Arc::new(SqliteDb::new(
+    // 1. Create the database and assign it to sqlite_db (No Arc::new here yet)
+    let sqlite_db = SqliteDb::new(
         &mercury_config.database.path,
         mercury_config.database.pool_size,
         mercury_config.database.busy_timeout_ms,
-    ).await?);
+    ).await?;
     info!("Database initialized via SQLx");
+
+    // 2. Salva uma referência concreta para usar no shutdown
+    let db_for_shutdown = sqlite_db.clone(); 
+    
+    // 3. Converte para o Trait Object para o resto do sistema usar
+    let db: Arc<dyn db::Database> = Arc::new(sqlite_db);
 
     let metrics = monitoring::metrics::Metrics::new();
 
@@ -1119,12 +1126,10 @@ loop {
     // HIGH-5 FIX: Final WAL checkpoint to ensure all recent writes are durable.
     // Without this, the last few minutes of trades/audit entries could be lost
     // if the WAL file is corrupted or truncated on unclean shutdown.
-    if let Some(sqlite_db) = (db.as_ref() as &dyn std::any::Any).downcast_ref::<SqliteDb>() {
-        if let Err(e) = sqlite_db.final_checkpoint().await {
-            error!(error = %e, "Failed to perform final WAL checkpoint on shutdown");
-        } else {
-            info!("Final WAL checkpoint complete");
-        }
+    if let Err(e) = db_for_shutdown.final_checkpoint().await {
+        error!(error = %e, "Failed to perform final WAL checkpoint on shutdown");
+    } else {
+        info!("Final WAL checkpoint complete");
     }
 
     Ok(())
