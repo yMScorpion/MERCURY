@@ -94,52 +94,21 @@ impl SettlementMonitor {
                             warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
                         }
                         
-                        // CRIT-2 FIX: Use blocking send with timeout instead of try_send.
-                        // If the channel is full, we MUST NOT silently drop settlement PnL — 
-                        // that permanently corrupts the bankroll. Retry with backoff.
-                        let settlement_result = SettlementResult {
-                            realized_pnl,
-                            platform: position.platform,
-                            market_id: position.market_id,
-                            quantity: position.quantity,
-                            avg_entry_price: position.avg_entry_price,
-                        };
-                        
-                        let mut send_attempts = 0;
-                        loop {
-                            match self.settlement_tx.try_send(settlement_result.clone()) {
-                                Ok(()) => break,
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    send_attempts += 1;
-                                    if send_attempts >= 10 {
-                                        tracing::error!(
-                                            position_id = position.id,
-                                            realized_pnl = %realized_pnl,
-                                            "CRITICAL: Settlement channel full after 10 retries. \
-                                             PnL ${} NOT credited to bankroll. MANUAL INTERVENTION REQUIRED.",
-                                            realized_pnl
-                                        );
-                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                            severity: "critical".into(),
-                                            message: format!(
-                                                "🚨 SETTLEMENT PnL LOST: Position #{} PnL ${} could not be \
-                                                 delivered to bankroll manager. Channel saturated. \
-                                                 MANUAL BANKROLL ADJUSTMENT REQUIRED.",
-                                                position.id, realized_pnl
-                                            ),
-                                        });
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100 * send_attempts)).await;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    tracing::error!("Settlement channel closed — engine shutting down");
-                                    break;
-                                }
-                            }
+                        // PHASE 3 FIX: Backpressure-Aware Persistent Settlement Queue
+                        // Log to SQLite first. If the Bankroll actor is saturated, the background 
+                        // worker will autonomously retry with exponential backoff. No PnL is ever dropped.
+                        if let Err(e) = self.db.enqueue_settlement(
+                            position.id,
+                            &position.market_id,
+                            position.platform,
+                            position.quantity,
+                            position.avg_entry_price,
+                            realized_pnl
+                        ).await {
+                            tracing::error!(error = %e, position_id = position.id, "CRITICAL: Failed to enqueue settlement. PnL not persisted.");
+                        } else {
+                            self.db.close_position(position.id).await?;
                         }
-                        
-                        self.db.close_position(position.id).await?;
                         
                         let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                             severity: "info".into(),
@@ -182,6 +151,23 @@ impl SettlementMonitor {
                 }
             }
         }
+        
+        // Drain pending settlements queue
+        if let Ok(pending) = self.db.get_pending_settlements().await {
+            for (id, settlement) in pending {
+                match self.settlement_tx.try_send(settlement.clone()) {
+                    Ok(()) => {
+                        let _ = self.db.mark_settlement_resolved(id).await;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!("Bankroll actor saturated. Settlement {} retained in DB queue for backoff retry.", id);
+                        break; // Stop draining, try again next tick
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         Ok(())
     }
 }

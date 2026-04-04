@@ -3232,6 +3232,7 @@ dependencies = [
  "lru",
  "native-tls",
  "notify",
+ "proptest",
  "reqwest",
  "ring",
  "rsa",

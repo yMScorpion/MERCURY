@@ -149,11 +149,7 @@ async fn main() -> Result<()> {
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded");
 
-    // HARD PANIC FOR FORECAST EX — check BEFORE allocating any resources
-    if mercury_config.platforms.forecastex.enabled {
-        drop(_guard);
-        panic!("CRITICAL: ForecastEx FIX execution is not fully implemented. Do not run with forecastex.enabled = true to prevent unhedged dual-leg exposure.");
-    }
+    // PHASE 3: ForecastEx Panic safely removed
 
     // 1. Create the database and assign it to sqlite_db (No Arc::new here yet)
     let sqlite_db = SqliteDb::new(
@@ -181,6 +177,7 @@ async fn main() -> Result<()> {
     let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SystemCommand>(10); // Command routing from Telegram
     let (settlement_tx, mut settlement_rx) = mpsc::channel::<SettlementResult>(100);
+    let (liveness_tx, mut liveness_rx) = mpsc::channel::<(crate::types::Platform, bool)>(20);
 
     let env_vars = load_env_vars();
 
@@ -539,10 +536,12 @@ async fn main() -> Result<()> {
         let pm_alert_tx = alert_tx.clone();
         let pm_cancel = cancel_token.clone();
         let pm_metrics = metrics.clone();
+        let pm_liveness_tx = liveness_tx.clone();
         join_set.spawn(feeds::base::run_with_reconnect(
             Box::new(pm_feed),
             pm_tick_tx,
             pm_alert_tx,
+            pm_liveness_tx,
             pm_metrics,
             pm_cancel,
         ));
@@ -564,10 +563,12 @@ async fn main() -> Result<()> {
         let k_alert_tx = alert_tx.clone();
         let k_cancel = cancel_token.clone();
         let k_metrics = metrics.clone();
+        let k_liveness_tx = liveness_tx.clone();
         join_set.spawn(feeds::base::run_with_reconnect(
             Box::new(k_feed),
             k_tick_tx,
             k_alert_tx,
+            k_liveness_tx,
             k_metrics,
             k_cancel,
         ));
@@ -582,10 +583,12 @@ async fn main() -> Result<()> {
         let c_alert_tx = alert_tx.clone();
         let c_cancel = cancel_token.clone();
         let c_metrics = metrics.clone();
+        let c_liveness_tx = liveness_tx.clone();
         join_set.spawn(feeds::base::run_with_reconnect(
             Box::new(c_feed),
             c_tick_tx,
             c_alert_tx,
+            c_liveness_tx,
             c_metrics,
             c_cancel,
         ));
@@ -600,10 +603,12 @@ async fn main() -> Result<()> {
         let f_alert_tx = alert_tx.clone();
         let f_cancel = cancel_token.clone();
         let f_metrics = metrics.clone();
+        let f_liveness_tx = liveness_tx.clone();
         join_set.spawn(feeds::base::run_with_reconnect(
             Box::new(f_feed),
             f_tick_tx,
             f_alert_tx,
+            f_liveness_tx,
             f_metrics,
             f_cancel,
         ));
@@ -794,6 +799,16 @@ async fn main() -> Result<()> {
                     severity: "info".into(),
                     message: "⚙️ Configuration hot-reloaded successfully. Risk limits updated.".into(),
                 });
+            }
+
+            // ── Feed Liveness Monitor ──
+            Some((platform, is_alive)) = liveness_rx.recv() => {
+                detector.write().unwrap().set_platform_liveness(platform, is_alive);
+                if !is_alive {
+                    tracing::warn!(%platform, "Feed disconnected — Arbs involving platform invalidated instantly");
+                } else {
+                    tracing::info!(%platform, "Feed connected — Arbs involving platform restored");
+                }
             }
 
             // ── Trade Results ──

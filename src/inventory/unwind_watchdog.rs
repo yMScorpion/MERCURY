@@ -127,17 +127,17 @@ impl UnwindWatchdog {
                                 let result = match plat {
                                     Platform::Polymarket | Platform::PolymarketUs => {
                                         if let Some(c) = &self.polymarket {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(rust_decimal_macros::dec!(0.01)), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
                                         } else { None }
                                     },
                                     Platform::Kalshi => {
                                         if let Some(c) = &self.kalshi {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(rust_decimal_macros::dec!(0.01)), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
                                         } else { None }
                                     },
                                     Platform::Cdna => {
                                         if let Some(c) = &self.cdna {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(rust_decimal_macros::dec!(0.01)), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
                                         } else { None }
                                     },
                                     Platform::ForecastEx => None,

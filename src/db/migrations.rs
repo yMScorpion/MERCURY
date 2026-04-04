@@ -2,7 +2,7 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 /// Current schema version.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Rollback migrations for safety
 pub async fn rollback_migrations(pool: &SqlitePool) -> Result<()> {
@@ -37,6 +37,13 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
         // sqlx allows multiple statements in one query execution
         sqlx::query(MIGRATION_V1).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO schema_version (version) VALUES (1)").execute(&mut *tx).await?;
+        tx.commit().await?;
+    }
+
+    if version < 2 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(MIGRATION_V2).execute(&mut *tx).await?;
+        sqlx::query("UPDATE schema_version SET version = 2").execute(&mut *tx).await?;
         tx.commit().await?;
     }
 
@@ -156,4 +163,21 @@ CREATE TABLE IF NOT EXISTS config_history (
     new_value TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_config_hist_ts ON config_history(changed_at);
+"#;
+
+const MIGRATION_V2: &str = r#"
+-- Pending Settlements (Backpressure Queue)
+CREATE TABLE IF NOT EXISTS pending_settlements (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id     INTEGER NOT NULL,
+    market_id       TEXT NOT NULL,
+    platform        TEXT NOT NULL,
+    quantity        TEXT NOT NULL,
+    avg_entry_price TEXT NOT NULL,
+    realized_pnl    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      TEXT NOT NULL,
+    resolved_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_settlements_status ON pending_settlements(status);
 "#;

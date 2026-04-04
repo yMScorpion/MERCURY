@@ -1,7 +1,6 @@
 use rust_decimal::Decimal;
 use tracing::{debug};
 use uuid::Uuid;
-use rust_decimal::prelude::ToPrimitive;
 
 use crate::engine::market_registry::MarketRegistry;
 use crate::engine::order_book::UnifiedOrderBook;
@@ -69,6 +68,7 @@ pub struct ArbitrageDetector {
     active_arbs: usize,
     pub stats: DetectorStats,
     paused_until_ns: u64,
+    platform_liveness: std::collections::HashMap<Platform, bool>,
 }
 
 impl ArbitrageDetector {
@@ -86,7 +86,12 @@ impl ArbitrageDetector {
             active_arbs: 0,
             stats: DetectorStats::default(),
             paused_until_ns: 0,
+            platform_liveness: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn set_platform_liveness(&mut self, platform: Platform, is_alive: bool) {
+        self.platform_liveness.insert(platform, is_alive);
     }
 
     pub fn pause_detection_until(&mut self, ns: u64) {
@@ -126,6 +131,14 @@ impl ArbitrageDetector {
         };
 
         for pair in pairs {
+            // PHASE 3 FIX: Enhanced Feed Health Guard
+            // Invalidate the pair if either platform feed is currently offline
+            let a_alive = self.platform_liveness.get(&pair.platform_a).copied().unwrap_or(true);
+            let b_alive = self.platform_liveness.get(&pair.platform_b).copied().unwrap_or(true);
+            if !a_alive || !b_alive {
+                continue;
+            }
+
             // CRITICAL FIX: The Time-to-Maturity Trap
             // Do not evaluate spreads if the market resolves in less than 60 seconds.
             // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 

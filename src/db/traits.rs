@@ -31,6 +31,11 @@ pub trait Database: Send + Sync + 'static {
     async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()>;
     async fn get_open_positions(&self) -> Result<Vec<Position>>;
     async fn close_position(&self, id: i64) -> Result<()>;
+    
+    // Settlement Queue
+    async fn enqueue_settlement(&self, position_id: i64, market_id: &Uuid, platform: Platform, quantity: Decimal, avg_entry: Decimal, pnl: Decimal) -> Result<()>;
+    async fn get_pending_settlements(&self) -> Result<Vec<(i64, SettlementResult)>>;
+    async fn mark_settlement_resolved(&self, id: i64) -> Result<()>;
 
     // Balances
     async fn update_balance(&self, balance: &PlatformBalance) -> Result<()>;

@@ -30,6 +30,7 @@ pub async fn run_with_reconnect(
     mut handler: Box<dyn FeedHandler>,
     tick_tx: broadcast::Sender<NormalizedTick>,
     alert_tx: tokio::sync::mpsc::Sender<crate::types::AlertMessage>,
+    liveness_tx: tokio::sync::mpsc::Sender<(crate::types::Platform, bool)>,
     metrics: std::sync::Arc<crate::monitoring::metrics::Metrics>,
     token: CancellationToken,
 ) {
@@ -42,6 +43,7 @@ pub async fn run_with_reconnect(
 
     loop {
         info!(%platform, "Connecting feed handler");
+        let _ = liveness_tx.send((platform, true)).await; // Mark Alive
 
         tokio::select! {
             _ = token.cancelled() => {
@@ -49,10 +51,9 @@ pub async fn run_with_reconnect(
                 break;
             }
             result = handler.connect_and_run(tick_tx.clone()) => {
-                // Immediately discard all book state so no stale prices are visible
-                // to the spread engine during the reconnect window. The first snapshot
-                // after reconnect will rebuild from authoritative exchange data.
                 handler.clear_books();
+                let _ = liveness_tx.send((platform, false)).await; // Mark Dead
+
                 match result {
                     Ok(()) => {
                         info!(%platform, "Feed handler disconnected cleanly — books cleared");

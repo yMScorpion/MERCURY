@@ -447,6 +447,53 @@ impl Database for SqliteDb {
         Ok(())
     }
 
+    // -- Settlement Queue -----------------------------------------------
+
+    async fn enqueue_settlement(&self, position_id: i64, market_id: &Uuid, platform: Platform, quantity: Decimal, avg_entry: Decimal, pnl: Decimal) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pending_settlements (position_id, market_id, platform, quantity, avg_entry_price, realized_pnl, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)"
+        )
+        .bind(position_id)
+        .bind(market_id.to_string())
+        .bind(platform.to_string())
+        .bind(dec_to_string(&quantity))
+        .bind(dec_to_string(&avg_entry))
+        .bind(dec_to_string(&pnl))
+        .bind(dt_to_str(&Utc::now()))
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn get_pending_settlements(&self) -> Result<Vec<(i64, SettlementResult)>> {
+        let rows = sqlx::query(
+            "SELECT id, market_id, platform, quantity, avg_entry_price, realized_pnl
+             FROM pending_settlements WHERE status = 'pending' ORDER BY created_at ASC"
+        ).fetch_all(&self.pool).await?;
+
+        let mut pending = Vec::new();
+        for row in rows {
+            let id: i64 = row.try_get(0)?;
+            let res = SettlementResult {
+                market_id: Uuid::parse_str(&row.try_get::<String, _>(1)?).unwrap_or_default(),
+                platform: platform_from_db(&row.try_get::<String, _>(2)?)?,
+                quantity: dec(&row.try_get::<String, _>(3)?)?,
+                avg_entry_price: dec(&row.try_get::<String, _>(4)?)?,
+                realized_pnl: dec(&row.try_get::<String, _>(5)?)?,
+            };
+            pending.push((id, res));
+        }
+        Ok(pending)
+    }
+
+    async fn mark_settlement_resolved(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE pending_settlements SET status = 'resolved', resolved_at = $1 WHERE id = $2")
+            .bind(dt_to_str(&Utc::now()))
+            .bind(id)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
     // -- Balances -------------------------------------------------------
 
     async fn update_balance(&self, bal: &PlatformBalance) -> Result<()> {

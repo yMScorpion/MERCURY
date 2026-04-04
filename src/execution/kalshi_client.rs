@@ -145,9 +145,9 @@ impl PlatformOrderClient for KalshiClient {
             }
             return Ok(OrderResult {
                 filled: false,
-                fill_price: Decimal::ZERO,
-                fill_size: Decimal::ZERO,
-                fee: Decimal::ZERO,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
                 order_id: String::new(),
                 error: Some(format!("HTTP {}: {}", status, body)),
             });
