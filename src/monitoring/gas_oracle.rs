@@ -95,9 +95,10 @@ impl GasOracle {
 
             match self.fetch_matic_usd().await {
                 Ok(raw_price) => {
-                    // CRITICAL FIX (3-D): Hard floor/ceiling to prevent severe oracle glitches
-                    // from multiplying gas estimates by 1000x and breaking the spread math.
-                    let price = raw_price.clamp(dec!(0.20), dec!(5.00));
+                    // Hard floor/ceiling to prevent severe oracle glitches.
+                    // MATIC historically traded up to ~$2.92. Ceiling at $10 gives headroom
+                    // for appreciation while still blocking 1000x glitches.
+                    let price = raw_price.clamp(dec!(0.10), dec!(10.00));
                     
                     let change_pct = if last_matic > Decimal::ZERO {
                         ((price - last_matic) / last_matic * Decimal::from(100)).abs()

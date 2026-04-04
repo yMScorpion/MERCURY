@@ -84,9 +84,11 @@ impl fmt::Display for MarketStatus {
 }
 
 // ─── Platform Health ───
+// Reserved for future per-platform health tracking in the monitoring subsystem.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum PlatformHealth {
     Healthy,
     Degraded,
@@ -210,9 +212,11 @@ impl fmt::Display for TradeStatus {
 }
 
 // ─── Execution State ───
+// Reserved for future stateful execution tracking in the executor.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum ExecutionState {
     Pending,
     PartialFill,

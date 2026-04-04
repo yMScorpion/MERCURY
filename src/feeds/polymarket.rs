@@ -65,6 +65,7 @@ impl LocalOrderBook {
         }
     }
 
+    #[allow(dead_code)]
     fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
         self.bids.clear();
         self.asks.clear();

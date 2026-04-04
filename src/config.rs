@@ -193,7 +193,10 @@ impl ConfigManager {
     pub fn get(&self) -> MercuryConfig {
         match self.inner.read() {
             Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+            Err(poisoned) => {
+                tracing::error!("Config RwLock was poisoned — a thread panicked while holding the lock. Using last known config.");
+                poisoned.into_inner().clone()
+            }
         }
     }
 

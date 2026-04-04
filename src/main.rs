@@ -21,8 +21,8 @@ mod risk;
 mod telegram;
 mod types;
 #[cfg(test)]
-#[path = "tests/integration.rs"] 
-mod integration_tests;
+#[path = "integration.rs"]
+mod integration;
 
 use config::MercuryConfig;
 use db::SqliteDb;
@@ -123,113 +123,6 @@ fn seconds_until_report_hour(hour_utc: u32) -> u64 {
         today_target + chrono::Duration::days(1)
     };
     (target - now).num_seconds().max(1) as u64
-}
-
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
-    use rust_decimal_macros::dec;
-    use crate::engine::order_book::UnifiedOrderBook;
-    use crate::engine::spread::NetSpreadEngine;
-    use crate::engine::detector::ArbitrageDetector;
-    use crate::engine::market_registry::MarketRegistry;
-    use crate::types::*;
-    use uuid::Uuid;
-
-    #[tokio::test]
-    async fn test_main_event_loop_discovery_and_execution() {
-        // L-4 FIX: Basic integration test scaffolding for the engine pipeline
-        let mut registry = MarketRegistry::new();
-        let market_id = Uuid::new_v4();
-        let mut platforms = std::collections::HashMap::new();
-        platforms.insert(Platform::Polymarket, PlatformMarketInfo {
-            platform: Platform::Polymarket,
-            platform_market_id: "poly_token".into(),
-            fee_rate_bps: 200,
-            min_order_size: dec!(1.0),
-            tick_size: dec!(0.01),
-        });
-        platforms.insert(Platform::Kalshi, PlatformMarketInfo {
-            platform: Platform::Kalshi,
-            platform_market_id: "kalshi_ticker".into(),
-            fee_rate_bps: 175,
-            min_order_size: dec!(1.0),
-            tick_size: dec!(0.01),
-        });
-
-        registry.register_market(Market {
-            unified_id: market_id,
-            question: "Test Market".into(),
-            resolution_source: "Test".into(),
-            expiration: chrono::Utc::now() + chrono::Duration::hours(1),
-            platforms,
-            category: MarketCategory::Other,
-            confidence: 0.99,
-            status: MarketStatus::Active,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        });
-
-        let mut uob = UnifiedOrderBook::new();
-        let mut spread_engine = NetSpreadEngine::new(dec!(0.01));
-        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
-
-        // Simulate Polymarket Tick (Ask YES at 0.40)
-        let poly_tick = NormalizedTick {
-            platform: Platform::Polymarket,
-            market_id,
-            timestamp_ns: now_ns(),
-            bid_price: dec!(0.38),
-            bid_size: dec!(100),
-            ask_price: dec!(0.40),
-            ask_size: dec!(100),
-            mid_price: dec!(0.39),
-            last_trade_price: dec!(0.39),
-            last_trade_size: dec!(10),
-            book_depth: std::sync::Arc::new(vec![
-                PriceLevel { price: dec!(0.40), size: dec!(100) },
-                PriceLevel { price: dec!(0.38), size: dec!(100) },
-            ]),
-            fee_rate_bps: 200,
-            sequence: 1,
-        };
-        uob.update(&poly_tick);
-
-        // Simulate Kalshi Tick (Ask NO at 0.50 -> Implies YES Bid at 0.50)
-        let kalshi_tick = NormalizedTick {
-            platform: Platform::Kalshi,
-            market_id,
-            timestamp_ns: now_ns(),
-            bid_price: dec!(0.50), // Someone bidding YES at 0.50
-            bid_size: dec!(100),
-            ask_price: dec!(0.52),
-            ask_size: dec!(100),
-            mid_price: dec!(0.51),
-            last_trade_price: dec!(0.51),
-            last_trade_size: dec!(10),
-            book_depth: std::sync::Arc::new(vec![
-                PriceLevel { price: dec!(0.52), size: dec!(100) },
-                PriceLevel { price: dec!(0.50), size: dec!(100) },
-            ]),
-            fee_rate_bps: 175,
-            sequence: 1,
-        };
-        uob.update(&kalshi_tick);
-
-        let opps = detector.detect_for_market(
-            &market_id,
-            &registry,
-            &uob,
-            &spread_engine,
-            dec!(10.0),
-        );
-
-        assert_eq!(opps.len(), 1, "Should detect 1 arb opportunity");
-        let opp = &opps[0];
-        assert_eq!(opp.leg_a.platform, Platform::Polymarket);
-        assert_eq!(opp.leg_b.platform, Platform::Kalshi);
-        assert!(opp.net_spread > dec!(0.05), "Net spread should be positive");
-    }
 }
 
 #[tokio::main]
@@ -798,15 +691,16 @@ loop {
                 let tick = match tick_result {
                     Ok(t) => t,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Books may be stale.", n);
-                        // H-4 FIX: DO NOT clear all books globally. 
-                        // The stale feed detector (CB9) and individual tick sequence numbers 
-                        // will natively handle staleness and overwrite with fresh data.
+                        tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Clearing UOB and cooling down.", n);
+                        // Clear all books to prevent stale data from being visible to the spread
+                        // engine during the cooldown period. Feed handlers will repopulate from
+                        // authoritative exchange snapshots on their next tick.
+                        uob.write().await.clear();
                         let _ = alert_tx.try_send(AlertMessage::SystemAlert {
                             severity: "warning".into(),
-                            message: format!("HFT Engine lagging! Missed {} ticks. Cooling down detection.", n),
+                            message: format!("HFT Engine lagging! Missed {} ticks. Books cleared, cooling down detection.", n),
                         });
-                        // Cooldown detection for 5 seconds to prevent single-sided executions
+                        // Cooldown detection for 5 seconds to allow books to rebuild
                         detector.pause_detection_until(crate::types::now_ns() + 5_000_000_000);
                         continue;
                     }

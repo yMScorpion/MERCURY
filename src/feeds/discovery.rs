@@ -330,10 +330,10 @@ fn normalize_question(q: &str) -> String {
                 });
             }
         }
-        Ok(markets)
         if markets.len() >= 1000 {
             tracing::warn!("Polymarket returned 1000 markets — results may be truncated. Consider pagination.");
         }
+        Ok(markets)
     }
 
     async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {
