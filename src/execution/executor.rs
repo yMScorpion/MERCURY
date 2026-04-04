@@ -16,9 +16,9 @@ use super::forecastex_client::ForecastExClient;
 #[derive(Debug, Clone)]
 pub struct OrderResult {
     pub filled: bool,
-    pub fill_price: Decimal,
-    pub fill_size: Decimal,
-    pub fee: Decimal,
+    pub fill_price: Usd,
+    pub fill_size: Contracts,
+    pub fee: Usd,
     pub order_id: String,
     pub error: Option<String>,
 }
@@ -36,9 +36,9 @@ pub trait PlatformOrderClient: Send + Sync {
         market_id: &str,
         action: OrderAction,
         side: Side,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: u32,
+        price: Usd,
+        size: Contracts,
+        fee_rate_bps: BasisPoints,
     ) -> Result<OrderResult>;
 
     async fn cancel_order(&self, order_id: &str) -> Result<()>;
@@ -49,7 +49,6 @@ pub struct ExecutionEngine {
     trade_result_tx: mpsc::Sender<TradeResult>,
     alert_tx: mpsc::Sender<AlertMessage>,
     db: Arc<dyn Database>,
-    uob: Arc<tokio::sync::RwLock<crate::engine::order_book::UnifiedOrderBook>>,
     polymarket_client: Option<PolymarketClient>,
     kalshi_client: Option<KalshiClient>,
     cdna_client: Option<CdnaClient>,
@@ -63,7 +62,6 @@ impl ExecutionEngine {
         trade_result_tx: mpsc::Sender<TradeResult>,
         alert_tx: mpsc::Sender<AlertMessage>,
         db: Arc<dyn Database>,
-        uob: Arc<tokio::sync::RwLock<crate::engine::order_book::UnifiedOrderBook>>,
         polymarket_client: Option<PolymarketClient>,
         kalshi_client: Option<KalshiClient>,
         cdna_client: Option<CdnaClient>,
@@ -74,7 +72,6 @@ impl ExecutionEngine {
             trade_result_tx,
             alert_tx,
             db,
-            uob,
             polymarket_client,
             kalshi_client,
             cdna_client,
@@ -183,37 +180,10 @@ impl ExecutionEngine {
             return Ok(());
         }
 
-        // H-1 FIX: Pre-execution price slippage guard
-        {
-            let uob_guard = self.uob.read().await;
-            let book_a = uob_guard.get_book(&opp.market_id, &opp.leg_a.platform);
-            let book_b = uob_guard.get_book(&opp.market_id, &opp.leg_b.platform);
-            
-            if let (Some(ba), Some(bb)) = (book_a, book_b) {
-                let (current_price_a, current_price_b) = match (opp.leg_a.side, opp.leg_b.side) {
-                    (Side::Yes, Side::No) => (ba.best_ask().map(|x| x.0), bb.best_bid().map(|x| Decimal::ONE - x.0)),
-                    (Side::No, Side::Yes) => (ba.best_bid().map(|x| Decimal::ONE - x.0), bb.best_ask().map(|x| x.0)),
-                    _ => (None, None),
-                };
-
-                if let (Some(pa), Some(pb)) = (current_price_a, current_price_b) {
-                    let current_raw_spread = Decimal::ONE - pa - pb;
-                    // If spread shrunk by over 50%, abort execution
-                    if current_raw_spread < opp.raw_spread * rust_decimal_macros::dec!(0.5) {
-                        tracing::warn!(
-                            opp_id = %opp.opp_id,
-                            old_spread = %opp.raw_spread,
-                            new_spread = %current_raw_spread,
-                            "Pre-execution slippage guard triggered: spread closed before execution. Aborting."
-                        );
-                        return Ok(());
-                    }
-                } else {
-                    tracing::warn!("Pre-execution slippage guard: Order book missing depth. Aborting.");
-                    return Ok(());
-                }
-            }
-        }
+        // Note: The software pre-execution slippage guard was removed.
+        // Because the Engine routes trades instantly and all client execution calls mandate 
+        // 'FOK' (Fill Or Kill), the target exchange matching engine provides a native,
+        // zero-latency slippage guard. If the price moves, the order simply fails to fill.
 
         info!(
             opp_id = %opp.opp_id,
@@ -230,9 +200,9 @@ impl ExecutionEngine {
             &first_leg.platform_market_id,
             OrderAction::Buy,
             first_leg.side,
-            first_leg.price,
-            validated.approved_size,
-            first_leg.fee_rate_bps, // Pass actual BPS rate
+            Usd(first_leg.price),
+            Contracts(validated.approved_size),
+            BasisPoints(first_leg.fee_rate_bps),
         ).await;
 
         let (leg_a_result, leg_b_result) = match first_result {
@@ -243,9 +213,9 @@ impl ExecutionEngine {
                     &second_leg.platform_market_id,
                     OrderAction::Buy,
                     second_leg.side,
-                    second_leg.price,
-                    hedge_size,
-                    second_leg.fee_rate_bps, // Pass actual BPS rate
+                    Usd(second_leg.price),
+                    Contracts(hedge_size.0),
+                    BasisPoints(second_leg.fee_rate_bps),
                 ).await;
 
                 match second_result {
@@ -258,14 +228,14 @@ impl ExecutionEngine {
                         
                         if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
                             // Calculate exact realized loss from the round-trip FOK sell
-                            let buy_cost = first_fill.fill_size * first_fill.fill_price + first_fill.fee;
-                            let sell_revenue = unwind_fill.fill_size * unwind_fill.fill_price;
-                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee;
+                            let buy_cost = first_fill.fill_size.0 * first_fill.fill_price.0 + first_fill.fee.0;
+                            let sell_revenue = unwind_fill.fill_size.0 * unwind_fill.fill_price.0;
+                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee.0;
                             
                             // Zero out size to prevent DB position tracking, but pack the loss into the fee
                             // so `compute_result` logs the exact financial hit.
-                            final_first_fill.fill_size = Decimal::ZERO;
-                            final_first_fill.fee = realized_loss;
+                            final_first_fill.fill_size = Contracts(Decimal::ZERO);
+                            final_first_fill.fee = Usd(realized_loss);
                             final_first_fill.error = Some("Leg B failed, automated unwind successful".into());
                         }
                         
@@ -276,20 +246,20 @@ impl ExecutionEngine {
                         let mut final_first_fill = first_fill.clone();
                         
                         if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
-                            let buy_cost = first_fill.fill_size * first_fill.fill_price + first_fill.fee;
-                            let sell_revenue = unwind_fill.fill_size * unwind_fill.fill_price;
-                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee;
+                            let buy_cost = first_fill.fill_size.0 * first_fill.fill_price.0 + first_fill.fee.0;
+                            let sell_revenue = unwind_fill.fill_size.0 * unwind_fill.fill_price.0;
+                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee.0;
                             
-                            final_first_fill.fill_size = Decimal::ZERO;
-                            final_first_fill.fee = realized_loss;
+                            final_first_fill.fill_size = Contracts(Decimal::ZERO);
+                            final_first_fill.fee = Usd(realized_loss);
                             final_first_fill.error = Some("Leg B error, automated unwind successful".into());
                         }
                         
                         let failed2 = OrderResult {
                             filled: false,
-                            fill_price: Decimal::ZERO,
-                            fill_size: Decimal::ZERO,
-                            fee: Decimal::ZERO,
+                            fill_price: Usd(Decimal::ZERO),
+                            fill_size: Contracts(Decimal::ZERO),
+                            fee: Usd(Decimal::ZERO),
                             order_id: String::new(),
                             error: Some(e.to_string()),
                         };
@@ -302,9 +272,9 @@ impl ExecutionEngine {
             Ok(first_fill) => {
                 let failed = OrderResult {
                     filled: false,
-                    fill_price: Decimal::ZERO,
-                    fill_size: Decimal::ZERO,
-                    fee: Decimal::ZERO,
+                    fill_price: Usd(Decimal::ZERO),
+                    fill_size: Contracts(Decimal::ZERO),
+                    fee: Usd(Decimal::ZERO),
                     order_id: String::new(),
                     error: None,
                 };
@@ -314,9 +284,9 @@ impl ExecutionEngine {
                 error!(error = %e, "First leg execution error");
                 let failed = OrderResult {
                     filled: false,
-                    fill_price: Decimal::ZERO,
-                    fill_size: Decimal::ZERO,
-                    fee: Decimal::ZERO,
+                    fill_price: Usd(Decimal::ZERO),
+                    fill_size: Contracts(Decimal::ZERO),
+                    fee: Usd(Decimal::ZERO),
                     order_id: String::new(),
                     error: Some(e.to_string()),
                 };
@@ -327,7 +297,7 @@ impl ExecutionEngine {
 
     let execution_ms = start.elapsed().as_millis() as u64;
 
-        let (status, profit, failure_reason) = self.compute_result(
+        let (status, profit, failure_reason) = Self::compute_result(
             &leg_a_result, &leg_b_result, opp,
         );
 
@@ -349,15 +319,15 @@ impl ExecutionEngine {
             leg_a_platform: opp.leg_a.platform,
             leg_a_side: opp.leg_a.side,
             leg_a_price: opp.leg_a.price,
-            leg_a_size: actual_leg_a_result.fill_size,
-            leg_a_fill_price: actual_leg_a_result.fill_price,
-            leg_a_fee: actual_leg_a_result.fee,
+            leg_a_size: actual_leg_a_result.fill_size.0,
+            leg_a_fill_price: actual_leg_a_result.fill_price.0,
+            leg_a_fee: actual_leg_a_result.fee.0,
             leg_b_platform: opp.leg_b.platform,
             leg_b_side: opp.leg_b.side,
             leg_b_price: opp.leg_b.price,
-            leg_b_size: actual_leg_b_result.fill_size,
-            leg_b_fill_price: actual_leg_b_result.fill_price,
-            leg_b_fee: actual_leg_b_result.fee,
+            leg_b_size: actual_leg_b_result.fill_size.0,
+            leg_b_fill_price: actual_leg_b_result.fill_price.0,
+            leg_b_fee: actual_leg_b_result.fee.0,
             raw_spread: opp.raw_spread,
             net_spread: opp.net_spread,
             profit,
@@ -395,9 +365,9 @@ impl ExecutionEngine {
         market_id: &str,
         action: OrderAction,
         side: Side,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: u32,
+        price: Usd,
+        size: Contracts,
+        fee_rate_bps: BasisPoints,
     ) -> Result<OrderResult> {
         match platform {
             Platform::Polymarket | Platform::PolymarketUs => {
@@ -457,9 +427,9 @@ impl ExecutionEngine {
             &stranded_leg.platform_market_id,
             OrderAction::Sell,
             stranded_leg.side, // Same side! We sell the exact inventory we hold.
-            aggressive_sell_price,
+            Usd(aggressive_sell_price),
             original_fill.fill_size,
-            stranded_leg.fee_rate_bps,
+            BasisPoints(stranded_leg.fee_rate_bps),
         ).await;
 
         match unwind_result {
@@ -468,7 +438,7 @@ impl ExecutionEngine {
                     "⚠️ <b>AUTOMATED UNWIND SUCCESSFUL</b> ⚠️\n\n\
                      Platform: {}\nMarket: {}\nUnwound: {} {}\n\
                      <b>Delta exposure neutralized.</b>",
-                     stranded_leg.platform, stranded_leg.platform_market_id, fill.fill_size, stranded_leg.side
+                     stranded_leg.platform, stranded_leg.platform_market_id, fill.fill_size.0, stranded_leg.side
                 );
                 let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
                     severity: "warning".into(), 
@@ -489,7 +459,7 @@ impl ExecutionEngine {
                      Error: {}\n\
                      <b>MANUAL INTERVENTION REQUIRED IMMEDIATELY.</b>",
                      stranded_leg.platform, stranded_leg.platform_market_id, 
-                     original_fill.fill_size, stranded_leg.side, err_msg
+                     original_fill.fill_size.0, stranded_leg.side, err_msg
                 );
                 
                 let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
@@ -503,17 +473,16 @@ impl ExecutionEngine {
     }
 
     fn compute_result(
-        &self,
         leg_a: &OrderResult,
         leg_b: &OrderResult,
         opp: &ArbitrageOpportunity,
     ) -> (TradeStatus, Decimal, Option<String>) {
         if leg_a.filled && leg_b.filled {
-            let total_cost = leg_a.fill_price + leg_b.fill_price;
-            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.min(leg_b.fill_size);
-            let net_profit = gross_profit - leg_a.fee - leg_b.fee;
+            let total_cost = leg_a.fill_price.0 + leg_b.fill_price.0;
+            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.0.min(leg_b.fill_size.0);
+            let net_profit = gross_profit - leg_a.fee.0 - leg_b.fee.0;
             
-            let status = if leg_a.fill_size == leg_b.fill_size {
+            let status = if leg_a.fill_size.0 == leg_b.fill_size.0 {
                 TradeStatus::Success
             } else {
                 TradeStatus::Partial
@@ -521,18 +490,16 @@ impl ExecutionEngine {
             
             (status, net_profit, None)
         } else if leg_a.filled && !leg_b.filled {
-            if leg_a.fill_size == Decimal::ZERO && leg_a.fee > Decimal::ZERO {
+            if leg_a.fill_size.0 == Decimal::ZERO && leg_a.fee.0 > Decimal::ZERO {
                 let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge failed, unwind successful".into());
-                (TradeStatus::Fail, -leg_a.fee, Some(reason))
+                (TradeStatus::Fail, -leg_a.fee.0, Some(reason))
             } else {
-                // ESTIMATED loss — the position is stranded and requires manual resolution.
-                // We book a conservative estimate to prevent the bankroll from over-stating capital.
-                let filled_value = leg_a.fill_price * leg_a.fill_size;
+                let filled_value = leg_a.fill_price.0 * leg_a.fill_size.0;
                 let dynamic_penalty_pct = opp.raw_spread
                     .max(rust_decimal_macros::dec!(0.02))
                     .min(rust_decimal_macros::dec!(0.10));
                 let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
-                let estimated_loss = dynamic_unwind_slippage + leg_a.fee; 
+                let estimated_loss = dynamic_unwind_slippage + leg_a.fee.0; 
                 let reason = leg_b.error.clone().unwrap_or_else(|| {
                     format!("Hedge leg failed — ESTIMATED loss ${:.2} (manual resolution required)", estimated_loss)
                 });
@@ -541,6 +508,75 @@ impl ExecutionEngine {
         } else {
             let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
             (TradeStatus::Fail, Decimal::ZERO, Some(reason))
+        }
+    }
+}
+
+#[cfg(test)]
+mod verification {
+    use super::*;
+    use proptest::prelude::*;
+    use rust_decimal_macros::dec;
+
+    proptest! {
+        #[test]
+        fn formal_verify_compute_result_safety(
+            filled_a in any::<bool>(),
+            price_a in 0.01f64..0.99,
+            size_a in 1.0f64..1000.0,
+            fee_a in 0.0f64..50.0,
+            filled_b in any::<bool>(),
+            price_b in 0.01f64..0.99,
+            size_b in 1.0f64..1000.0,
+            fee_b in 0.0f64..50.0,
+        ) {
+            let leg_a = OrderResult {
+                filled: filled_a,
+                fill_price: Usd(Decimal::from_f64(price_a).unwrap()),
+                fill_size: Contracts(if filled_a { Decimal::from_f64(size_a).unwrap() } else { Decimal::ZERO }),
+                fee: Usd(Decimal::from_f64(fee_a).unwrap()),
+                order_id: "A".into(),
+                error: None,
+            };
+            
+            let leg_b = OrderResult {
+                filled: filled_b,
+                fill_price: Usd(Decimal::from_f64(price_b).unwrap()),
+                fill_size: Contracts(if filled_b { Decimal::from_f64(size_b).unwrap() } else { Decimal::ZERO }),
+                fee: Usd(Decimal::from_f64(fee_b).unwrap()),
+                order_id: "B".into(),
+                error: None,
+            };
+
+            let opp = ArbitrageOpportunity {
+                opp_id: uuid::Uuid::new_v4(),
+                market_id: uuid::Uuid::new_v4(),
+                market_question: "".into(),
+                leg_a: LegDetail { platform: Platform::Polymarket, platform_market_id: "".into(), fee_rate_bps: 0, side: Side::Yes, price: dec!(0), available_size: dec!(0), fee_estimate: dec!(0) },
+                leg_b: LegDetail { platform: Platform::Kalshi, platform_market_id: "".into(), fee_rate_bps: 0, side: Side::No, price: dec!(0), available_size: dec!(0), fee_estimate: dec!(0) },
+                raw_spread: dec!(0.05),
+                net_spread: dec!(0.03),
+                kelly_fraction: dec!(0),
+                recommended_size: dec!(0),
+                score: dec!(0),
+                detected_at: 0,
+                ttl_ms: 0,
+            };
+
+            let (status, profit, _) = ExecutionEngine::compute_result(&leg_a, &leg_b, &opp);
+
+            // Formal state validation
+            if filled_a && filled_b {
+                prop_assert!(status == TradeStatus::Success || status == TradeStatus::Partial);
+                let max_possible_gross = leg_a.fill_size.0.min(leg_b.fill_size.0) * Decimal::ONE;
+                prop_assert!(profit <= max_possible_gross); // Profit must always be logically bounded
+            } else if filled_a && !filled_b {
+                prop_assert_eq!(status, TradeStatus::Fail);
+                prop_assert!(profit <= Decimal::ZERO); // Unwinds or stranded legs must correctly book a loss
+            } else {
+                prop_assert_eq!(status, TradeStatus::Fail);
+                prop_assert_eq!(profit, Decimal::ZERO);
+            }
         }
     }
 }

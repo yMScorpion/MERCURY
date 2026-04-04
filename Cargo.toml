@@ -6,6 +6,10 @@ description = "Cross-market prediction arbitrage engine"
 
 [dependencies]
 native-tls = "0.2"
+
+[dev-dependencies]
+proptest = "1.4"
+arrayvec = { version = "0.7", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 ring = "0.17"

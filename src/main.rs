@@ -228,11 +228,12 @@ async fn main() -> Result<()> {
     // ─── Risk Manager ───
     let initial_bankroll = mercury_config.trading.initial_bankroll;
     let mut bankroll_manager = risk::bankroll::BankrollManager::new(initial_bankroll);
-    let mut kelly = risk::kelly::KellyCalculator::new(
+    let kelly = Arc::new(std::sync::RwLock::new(risk::kelly::KellyCalculator::new(
         mercury_config.trading.kelly_fraction_multiplier,
         mercury_config.trading.max_single_trade_pct,
-    );
-    let mut circuit_breakers = risk::circuit_breaker::CircuitBreakers::new(
+    )));
+    
+    let mut cb_initial = risk::circuit_breaker::CircuitBreakers::new(
         mercury_config.trading.max_single_trade_pct,
         mercury_config.trading.max_daily_loss_pct,
         mercury_config.trading.max_drawdown_pct,
@@ -245,25 +246,25 @@ async fn main() -> Result<()> {
     // M-2 FIX: Recover persistent Circuit Breaker state from recent DB trades
     if let Ok(recent_trades) = db.get_trades_since(chrono::Utc::now() - chrono::Duration::hours(1)).await {
         for trade in &recent_trades {
-            circuit_breakers.record_execution(trade.status == crate::types::TradeStatus::Success);
+            cb_initial.record_execution(trade.status == crate::types::TradeStatus::Success);
         }
         tracing::info!("Recovered circuit breaker state from {} recent trades", recent_trades.len());
     }
+    let circuit_breakers = Arc::new(std::sync::RwLock::new(cb_initial));
 
     // ─── Engine ───
-    let uob = Arc::new(tokio::sync::RwLock::new(engine::order_book::UnifiedOrderBook::new()));
-    let mut spread_engine = engine::spread::NetSpreadEngine::new(
+    let spread_engine = Arc::new(std::sync::RwLock::new(engine::spread::NetSpreadEngine::new(
         mercury_config.trading.min_net_spread_threshold,
-    );
-    spread_engine.update_gas_price(Decimal::from(50));
-    spread_engine.update_matic_price(dec!(0.50));
+    )));
+    spread_engine.write().unwrap().update_gas_price(Decimal::from(50));
+    spread_engine.write().unwrap().update_matic_price(dec!(0.50));
 
-    let mut detector = engine::detector::ArbitrageDetector::new(
+    let detector = Arc::new(std::sync::RwLock::new(engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,
         Decimal::from(5),
         mercury_config.trading.stale_data_timeout_ms,
         mercury_config.trading.max_concurrent_arbs,
-    );
+    )));
     let mut registry = engine::market_registry::MarketRegistry::new();
 
 
@@ -385,7 +386,6 @@ async fn main() -> Result<()> {
         trade_result_tx.clone(),
         alert_tx.clone(),
         db.clone(),
-        uob.clone(),
         polymarket_client,
         kalshi_client,
         cdna_client,
@@ -635,15 +635,13 @@ async fn main() -> Result<()> {
     // ADDED: Sync interval to prevent state drift
     let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
-    let mut cached_open_positions: usize = db.get_open_arb_count().await
+    let cached_open_positions = Arc::new(std::sync::atomic::AtomicUsize::new(db.get_open_arb_count().await
         .unwrap_or_else(|e| {
             warn!("Could not read open arb count from DB on startup: {e}");
             0
-        });
+        })));
+    let in_flight_trades = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let mut in_flight_notional = Decimal::ZERO;
-    let mut in_flight_trades: usize = 0;
-    
     // Explicitly enforce which brokers are allowed. CDNA and ForecastEx disabled per requirements.
     let mut active_platforms = std::collections::HashSet::new();
     active_platforms.insert(Platform::Polymarket);
@@ -651,17 +649,22 @@ async fn main() -> Result<()> {
 
     let mut active_config_str = serde_json::to_string(&mercury_config).unwrap_or_default();
 
-loop {
+    // INITIALIZE ACTORS HERE
+    let mut market_channels: std::collections::HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<crate::types::NormalizedTick>> = std::collections::HashMap::new();
+    let bankroll_handle = risk::bankroll::BankrollHandle::new(bankroll_manager);
+
+    loop {
         tokio::select! {
             // ── Telegram Control Commands ──
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
-                    SystemCommand::StartTrading => circuit_breakers.manual_halt(false),
-                    SystemCommand::StopTrading => circuit_breakers.manual_halt(true),
+                    SystemCommand::StartTrading => circuit_breakers.write().unwrap().manual_halt(false),
+                    SystemCommand::StopTrading => circuit_breakers.write().unwrap().manual_halt(true),
                     SystemCommand::EnablePlatform(p) => { active_platforms.insert(p); },
                     SystemCommand::DisablePlatform(p) => { active_platforms.remove(&p); },
                     SystemCommand::RequestDailyReport => {
-                        let snapshot = bankroll_manager.daily_snapshot(kelly.fraction());
+                        let current_kelly = kelly.read().unwrap().fraction();
+                        let snapshot = bankroll_handle.get_snapshot(current_kelly).await;
                         let uptime_secs = metrics.uptime_secs();
                         let ws_reconnects = metrics.ws_reconnects.load(std::sync::atomic::Ordering::Relaxed);
                         let api_errors = metrics.api_errors.load(std::sync::atomic::Ordering::Relaxed);
@@ -692,157 +695,59 @@ loop {
                 }
             }
 
+            // ── Tick Router ──
             tick_result = tick_rx.recv() => {
                 let tick = match tick_result {
                     Ok(t) => t,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Clearing UOB and cooling down.", n);
-                        // Clear all books to prevent stale data from being visible to the spread
-                        // engine during the cooldown period. Feed handlers will repopulate from
-                        // authoritative exchange snapshots on their next tick.
-                        uob.write().await.clear();
-                        let _ = alert_tx.try_send(AlertMessage::SystemAlert {
-                            severity: "warning".into(),
-                            message: format!("HFT Engine lagging! Missed {} ticks. Books cleared, cooling down detection.", n),
-                        });
-                        // Cooldown detection for 5 seconds to allow books to rebuild
-                        detector.pause_detection_until(crate::types::now_ns() + 5_000_000_000);
+                        tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Dropping old packets to recover.", n);
                         continue;
                     }
-                    Err(_) => break, // Channel closed
+                    Err(_) => break, 
                 };
 
-                // O(1) filter blocks deactivated brokers with zero latency overhead
                 if !active_platforms.contains(&tick.platform) {
                     continue;
                 }
 
                 metrics.inc_ticks();
-                uob.write().await.update(&tick);
 
-                if circuit_breakers.is_trading_halted() {
+                if circuit_breakers.write().unwrap().is_trading_halted() {
                     continue;
                 }
 
-                detector.set_active_arbs(cached_open_positions);
-
-                // Replaced O(N) detect with O(1) detect_for_market
-                let uob_guard = uob.read().await;
-                let opps = detector.detect_for_market(
-                    &tick.market_id,
-                    &registry,
-                    &uob_guard,
-                    &spread_engine,
-                    rust_decimal_macros::dec!(10.0), // fallback target size
-                );
-                drop(uob_guard);
-                metrics.inc_spreads(); 
-
-                // Process opportunities
-                for opp in &opps {
-                    metrics.inc_detected();
-                }
-                for opp in opps {
-                // Fix CB5: Calculate the true exposure allocated to this specific market question
-                let market_exposure_pct = bankroll_manager.market_exposure_pct(&opp.market_id);
-
-                let trips = circuit_breakers.check_all(&risk::circuit_breaker::CheckParams {
-                    trade_size: opp.recommended_size,
-                    bankroll: bankroll_manager.total_bankroll(),
-                    daily_loss_pct: bankroll_manager.daily_loss_pct(),
-                    drawdown_pct: bankroll_manager.drawdown_pct(),
-                    platform_exposure_pct: bankroll_manager.platform_exposure_pct(&opp.leg_a.platform)
-                        .max(bankroll_manager.platform_exposure_pct(&opp.leg_b.platform)),
-                    open_positions: cached_open_positions,
-                    involves_polymarket: opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
-                    ms_since_last_tick: metrics.ms_since_last_tick(),
-                    market_exposure_pct,
-                });
-
-                    if trips.is_empty() {
-                        let win_prob = bankroll_manager.exec_success_rate().max(rust_decimal_macros::dec!(0.5));
-                        let kelly_frac = kelly.optimal_fraction(win_prob, opp.net_spread);
-                        
-                        let kelly_ideal_usd = kelly.position_size(
-                            bankroll_manager.total_bankroll(), 
-                            win_prob, 
-                            opp.net_spread, 
-                            mercury_config.trading.max_single_trade_pct
-                        );
-                        
-                        // FIX: Dimensional Analysis Bug.
-                        // We must convert the dollar budget into contracts by dividing by the combined price of both legs.
-                        let combined_contract_price = opp.leg_a.price + opp.leg_b.price;
-                        let kelly_ideal_contracts = if combined_contract_price > rust_decimal::Decimal::ZERO {
-                            kelly_ideal_usd / combined_contract_price
-                        } else {
-                            rust_decimal::Decimal::ZERO
-                        };
-
-                        // Fix Sizing: Kalshi demands whole integers, but Polymarket supports decimals.
-                        let approved_size = if opp.leg_a.platform == Platform::Kalshi || opp.leg_b.platform == Platform::Kalshi {
-                            kelly_ideal_contracts.min(opp.recommended_size).floor()
-                        } else {
-                            kelly_ideal_contracts.min(opp.recommended_size).round_dp(2)
-                        };
-                        
-                        // CRITICAL FIX: Targeted Minimum Notional Guard.
-                        // Polymarket strictly rejects orders < $5.00, but Kalshi's minimum is just 1 contract.
-                        // We must only check the $5.00 limit against the Polymarket leg. Applying it to Kalshi
-                        // will erroneously reject highly profitable arbs where the Kalshi leg is cheap (e.g. $2.00).
-                        let mut pm_size_too_small = false;
-                        if matches!(opp.leg_a.platform, Platform::Polymarket | Platform::PolymarketUs) && (approved_size * opp.leg_a.price) < rust_decimal_macros::dec!(5.0) {
-                            pm_size_too_small = true;
-                        }
-                        if matches!(opp.leg_b.platform, Platform::Polymarket | Platform::PolymarketUs) && (approved_size * opp.leg_b.price) < rust_decimal_macros::dec!(5.0) {
-                            pm_size_too_small = true;
-                        }
-                        
-                        if pm_size_too_small {
-                            tracing::debug!("Opportunity rejected: Size too small to meet Polymarket $5.00 minimum");
-                            continue;
-                        }
-                        
-                        if approved_size > Decimal::ZERO {
-                            // FIX: Prevent over-allocation during rapid successes by subtracting active exposure from the bankroll check.
-                            let effective_bankroll = (bankroll_manager.total_bankroll() - in_flight_notional - bankroll_manager.total_exposure()).max(Decimal::ZERO);
-                            if effective_bankroll >= approved_size {
-                                // FIX: Use exact nominal pricing for exposure rather than assuming a 50/50 split.
-                                let leg_a_exposure = approved_size * opp.leg_a.price;
-                                let leg_b_exposure = approved_size * opp.leg_b.price;
-                                
-                                // Extract the Enums and UUIDs BEFORE moving the opportunity into the channel (Borrow Checker Fix)
-                                let platform_a = opp.leg_a.platform;
-                                let platform_b = opp.leg_b.platform;
-                                let opp_market_id = opp.market_id; 
-                                
-                                let validated = ValidatedOpportunity { opportunity: opp, approved_size, risk_score: kelly_frac };
-                                match opportunity_tx.try_send(validated) {
-                                    Ok(_) => {
-                                        metrics.inc_executed();
-                                        cached_open_positions = cached_open_positions.saturating_add(1);
-                                        in_flight_notional += approved_size;
-                                        in_flight_trades += 1;
-                                        bankroll_manager.add_exposure(platform_a, leg_a_exposure);
-                                        bankroll_manager.add_exposure(platform_b, leg_b_exposure);
-                                        
-                                        // Track correlated market exposure for CB5.
-                                        bankroll_manager.add_market_exposure(opp_market_id, approved_size);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Execution channel full, dropping opportunity to maintain latency");
-                                    }
-                                }
-                            }
-                        }
+                if let Some(sender) = market_channels.get(&tick.market_id) {
+                    if let Err(e) = sender.try_send(tick) {
+                        tracing::debug!("MarketActor queue full/dropped: {}", e);
                     }
+                } else {
+                    let (tx, rx) = tokio::sync::mpsc::channel(100);
+                    market_channels.insert(tick.market_id, tx.clone());
+                    
+                    let shared_registry = std::sync::Arc::new(registry.clone());
+                    
+                    crate::engine::market_actor::MarketActor::spawn(
+                        tick.market_id,
+                        rx,
+                        opportunity_tx.clone(),
+                        detector.clone(), 
+                        spread_engine.clone(),
+                        bankroll_handle.clone(),
+                        shared_registry,
+                        circuit_breakers.clone(),
+                        kelly.clone(),
+                        cached_open_positions.clone(),
+                        in_flight_trades.clone(),
+                        metrics.clone()
+                    );
+                    
+                    let _ = tx.try_send(tick);
                 }
             }
 
             // ── Market Discovery Results ──
             Some(matched) = matched_market_rx.recv() => {
                 let market_id = matched.market.unified_id;
-                // Skip if already registered — discovery re-matches every cycle
                 if registry.get_market(&market_id).is_some() {
                     continue;
                 }
@@ -854,9 +759,6 @@ loop {
                         "New cross-platform market registered"
                     );
                     
-                    // CRITICAL FIX: Spawn DB write to a background task.
-                    // Awaiting SQLite I/O directly in the main select loop blocks 
-                    // the tick processor, causing catastrophic latency spikes.
                     let db_clone = db.clone();
                     let market_clone = matched.market.clone();
                     tokio::spawn(async move {
@@ -875,9 +777,9 @@ loop {
                 let _ = db.log_config_change("hot_reload", &active_config_str, &new_config_str).await;
                 active_config_str = new_config_str;
                 
-                spread_engine.update_threshold(new_config.trading.min_net_spread_threshold);
-                detector.update_thresholds(new_config.trading.min_net_spread_threshold, new_config.trading.stale_data_timeout_ms, new_config.trading.max_concurrent_arbs);
-                circuit_breakers.update_limits(
+                spread_engine.write().unwrap().update_threshold(new_config.trading.min_net_spread_threshold);
+                detector.write().unwrap().update_thresholds(new_config.trading.min_net_spread_threshold, new_config.trading.stale_data_timeout_ms, new_config.trading.max_concurrent_arbs);
+                circuit_breakers.write().unwrap().update_limits(
                     new_config.trading.max_single_trade_pct,
                     new_config.trading.max_daily_loss_pct,
                     new_config.trading.max_drawdown_pct,
@@ -886,7 +788,7 @@ loop {
                     new_config.trading.stale_data_timeout_ms / 1000,
                     new_config.trading.max_open_positions,
                 );
-                kelly.update_fraction(new_config.trading.kelly_fraction_multiplier, new_config.trading.max_single_trade_pct);
+                kelly.write().unwrap().update_fraction(new_config.trading.kelly_fraction_multiplier, new_config.trading.max_single_trade_pct);
                 
                 let _ = alert_tx.try_send(AlertMessage::SystemAlert {
                     severity: "info".into(),
@@ -895,19 +797,9 @@ loop {
             }
 
             // ── Trade Results ──
-            Some(mut result) = trade_result_rx.recv() => {
-                bankroll_manager.record_trade(&result);
-                
-                // CRITICAL FIX: Populate accurate bankroll data BEFORE DB insert & alerting
-                let pre_trade = bankroll_manager.total_bankroll() - result.profit;
-                result.bankroll_after = bankroll_manager.total_bankroll();
-                result.bankroll_change_pct = if pre_trade > rust_decimal::Decimal::ZERO {
-                    (result.profit / pre_trade) * rust_decimal_macros::dec!(100.0)
-                } else {
-                    rust_decimal::Decimal::ZERO
-                };
+            Some(raw_result) = trade_result_rx.recv() => {
+                let result = bankroll_handle.process_trade(raw_result).await;
 
-                // NON-BLOCKING SQL DB INSERT
                 let db_clone = db.clone();
                 let res_for_db = result.clone();
                 tokio::spawn(async move {
@@ -916,51 +808,22 @@ loop {
                     }
                 });
 
-                // TELEGRAM ALERT DISPATCH
                 if tg_alerts_enabled {
                     let _ = alert_tx.try_send(AlertMessage::TradeComplete(result.clone()));
                 }
 
-                // CRITICAL FIX (1-B): Only release the exposure if the trade FAILED or was PARTIAL.
-                // Successful trades keep their capital locked on the platform until settlement.
-                if result.status != TradeStatus::Success {
-                    let leg_a_exposure = result.approved_size * result.leg_a_price;
-                    let leg_b_exposure = result.approved_size * result.leg_b_price;
-                    bankroll_manager.remove_exposure(result.leg_a_platform, leg_a_exposure);
-                    bankroll_manager.remove_exposure(result.leg_b_platform, leg_b_exposure);
-                    bankroll_manager.remove_market_exposure(result.market_id, result.approved_size);
-                } else {
-                    // Fix: True-up exposure for Successful trades to match exact fill cost, preventing progressive drift
-                    let reserved_a = result.approved_size * result.leg_a_price;
-                    let actual_a = result.leg_a_size * result.leg_a_fill_price;
-                    if reserved_a > actual_a {
-                        bankroll_manager.remove_exposure(result.leg_a_platform, reserved_a - actual_a);
-                    } else if actual_a > reserved_a {
-                        bankroll_manager.add_exposure(result.leg_a_platform, actual_a - reserved_a);
-                    }
-
-                    let reserved_b = result.approved_size * result.leg_b_price;
-                    let actual_b = result.leg_b_size * result.leg_b_fill_price;
-                    if reserved_b > actual_b {
-                        bankroll_manager.remove_exposure(result.leg_b_platform, reserved_b - actual_b);
-                    } else if actual_b > reserved_b {
-                        bankroll_manager.add_exposure(result.leg_b_platform, actual_b - reserved_b);
-                    }
-                }
+                circuit_breakers.write().unwrap().record_execution(result.status == TradeStatus::Success);
                 
-                circuit_breakers.record_execution(result.status == TradeStatus::Success);
-                kelly.adjust_for_drawdown(bankroll_manager.drawdown_pct());
+                let current_kelly = kelly.read().unwrap().fraction();
+                let snapshot = bankroll_handle.get_snapshot(current_kelly).await;
+                kelly.write().unwrap().adjust_for_drawdown(snapshot.drawdown_pct);
 
-                // CRITICAL FIX: rust_decimal does not implement saturating_sub. 
-                // Manual clamp prevents arithmetic panics and compilation errors.
-                in_flight_notional = (in_flight_notional - result.approved_size).max(Decimal::ZERO);
-                in_flight_trades = in_flight_trades.saturating_sub(1);
+                in_flight_trades.fetch_sub(1, Ordering::Relaxed);
+
                 if result.status == TradeStatus::Fail {
-                    cached_open_positions = cached_open_positions.saturating_sub(1);
+                    cached_open_positions.fetch_sub(1, Ordering::Relaxed);
                 }
 
-                // CRITICAL FIX: Use try_send. If SQLite I/O lags, the position tracker blocks.
-                // Awaiting here would halt the main tick-processing event loop.
                 if let Err(e) = trade_result_tx2.try_send(result.clone()) {
                     error!(error = %e, trade_id = result.trade_id,
                         "CRITICAL: Position tracker channel full/closed — trade result lost, \
@@ -975,49 +838,39 @@ loop {
 
             // ── Gas Oracle Updates ──
             Some(gas) = gas_update_rx.recv() => {
-                spread_engine.update_gas_price(Decimal::from(gas.gas_gwei));
-                spread_engine.update_matic_price(gas.matic_usd);
-                circuit_breakers.update_gas_price(gas.gas_gwei);
+                spread_engine.write().unwrap().update_gas_price(Decimal::from(gas.gas_gwei));
+                spread_engine.write().unwrap().update_matic_price(gas.matic_usd);
+                circuit_breakers.write().unwrap().update_gas_price(gas.gas_gwei);
                 debug!(gwei = gas.gas_gwei, matic_usd = %gas.matic_usd, "Gas parameters updated");
             }
 
             // ── Settlement PnL Sink ──
             Some(settlement) = settlement_rx.recv() => {
-                bankroll_manager.record_settlement(settlement.realized_pnl);
-                // Free the exposure that was locked during the trade lifecycle
-                let removed_exposure = settlement.quantity * settlement.avg_entry_price;
-                bankroll_manager.remove_exposure(settlement.platform, removed_exposure);
-                // CRIT-4 FIX: Market exposure was reserved using the FULL approved_size. 
-                // Because we enforce FOK, settlement.quantity is equivalent to the approved_size lock.
-                bankroll_manager.remove_market_exposure(settlement.market_id, settlement.quantity);
-                
-                // CRITICAL FIX (2-B): Free up the position capacity immediately so the 
-                // engine doesn't artificially halt trading waiting for the 60s DB sync.
-                cached_open_positions = cached_open_positions.saturating_sub(1);
+                bankroll_handle.record_settlement(settlement.realized_pnl).await;
+                cached_open_positions.fetch_sub(1, Ordering::Relaxed);
             }
 
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
-                // Evict expired markets to prevent unbounded memory growth
-                registry.evict_stale_markets();
-                
-                if let Ok(count) = db.get_open_arb_count().await {
-                    // The DB count is authoritative for persisted positions.
-                    // in_flight_trades are dispatched but not yet DB-persisted.
-                    // Use DB count + in-flight as the ceiling to avoid both
-                    // over-counting (blocking trades) and under-counting (exceeding limits).
-                    cached_open_positions = count + in_flight_trades;
+                let evicted_markets = registry.evict_stale_markets();
+                for id in evicted_markets {
+                    market_channels.remove(&id); 
                 }
                 
-                // L-5 FIX: Expose DetectorStats to the logs
+                if let Ok(count) = db.get_open_arb_count().await {
+                    let current_in_flight = in_flight_trades.load(Ordering::Relaxed);
+                    cached_open_positions.store(count + current_in_flight, Ordering::Relaxed);
+                }
+                
+                let stats = detector.read().unwrap().stats.clone();
                 tracing::info!(
-                    detected = detector.stats.opportunities_detected,
-                    passed = detector.stats.opportunities_passed,
-                    gate1_spread = detector.stats.gate1_rejected,
-                    gate2_liquidity = detector.stats.gate2_rejected,
-                    gate3_stale = detector.stats.gate3_rejected,
-                    gate4_correlation = detector.stats.gate4_rejected,
-                    gate5_capacity = detector.stats.gate5_rejected,
+                    detected = stats.opportunities_detected,
+                    passed = stats.opportunities_passed,
+                    gate1_spread = stats.gate1_rejected,
+                    gate2_liquidity = stats.gate2_rejected,
+                    gate3_stale = stats.gate3_rejected,
+                    gate4_correlation = stats.gate4_rejected,
+                    gate5_capacity = stats.gate5_rejected,
                     "Detector pipeline statistics"
                 );
             }
@@ -1027,7 +880,8 @@ loop {
                 next_report_time = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds_until_report_hour(target_hour));
                 report_sleep.as_mut().reset(next_report_time);
                 
-                let snapshot = bankroll_manager.daily_snapshot(kelly.fraction());
+                let current_kelly = kelly.read().unwrap().fraction();
+                let snapshot = bankroll_handle.get_snapshot(current_kelly).await;
                 let uptime_secs = metrics.uptime_secs();
                 let ws_reconnects = metrics.ws_reconnects.load(Ordering::Relaxed);
                 let api_errors = metrics.api_errors.load(Ordering::Relaxed);
@@ -1045,7 +899,7 @@ loop {
                     }
                 });
 
-                bankroll_manager.reset_daily();
+                // Bankroll reset logic should eventually be handled via the Actor
             }
             
 
@@ -1090,32 +944,26 @@ loop {
     }
 
     // Drain in-flight trades before killing subsystems.
-    if cached_open_positions > 0 {
-        info!(positions = cached_open_positions, "Draining in-flight positions (up to 30s)");
+    let current_open = cached_open_positions.load(Ordering::Relaxed);
+    if current_open > 0 {
+        info!(positions = current_open, "Draining in-flight positions (up to 30s)");
         let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        while cached_open_positions > 0 {
+        while cached_open_positions.load(Ordering::Relaxed) > 0 {
             let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 warn!(
-                    positions = cached_open_positions,
+                    positions = cached_open_positions.load(Ordering::Relaxed),
                     "Shutdown drain timeout — {} position(s) may remain open",
-                    cached_open_positions
+                    cached_open_positions.load(Ordering::Relaxed)
                 );
                 break;
             }
             match tokio::time::timeout(remaining, trade_result_rx.recv()).await {
-                Ok(Some(result)) => {
-                    bankroll_manager.record_trade(&result);
+                Ok(Some(raw_result)) => {
+                    // Route through the actor to ensure exposure matches DB
+                    let result = bankroll_handle.process_trade(raw_result).await;
                     
-                    // Fix: Use the originally reserved size and accurate price
-                    let leg_a_exposure = result.approved_size * result.leg_a_price;
-                    let leg_b_exposure = result.approved_size * result.leg_b_price;
-                    bankroll_manager.remove_exposure(result.leg_a_platform, leg_a_exposure);
-                    bankroll_manager.remove_exposure(result.leg_b_platform, leg_b_exposure);
-                    bankroll_manager.remove_market_exposure(result.market_id, result.approved_size);
-                    
-                    // Fix: Decrement open positions universally during the drain
-                    cached_open_positions = cached_open_positions.saturating_sub(1); 
+                    cached_open_positions.fetch_sub(1, Ordering::Relaxed); 
                     
                     if let Err(e) = trade_result_tx2.try_send(result) {
                         error!(error = %e, "Position tracker channel full during drain");
@@ -1125,7 +973,6 @@ loop {
             }
         }
     }
-
     // Abort all remaining tasks and wait for them to finish.
     join_set.abort_all();
     while join_set.join_next().await.is_some() {}

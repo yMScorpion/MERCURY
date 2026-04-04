@@ -3222,6 +3222,7 @@ dependencies = [
  "alloy",
  "alloy-sol-types",
  "anyhow",
+ "arrayvec",
  "async-trait",
  "chrono",
  "clap",

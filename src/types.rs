@@ -5,6 +5,21 @@ use std::collections::HashMap;
 use std::fmt;
 use uuid::Uuid;
 
+// ─── Financial Type Safety (Newtypes) ───
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct BasisPoints(pub u32);
+
+impl From<u16> for BasisPoints {
+    fn from(v: u16) -> Self { Self(v as u32) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct Contracts(pub Decimal);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct Usd(pub Decimal);
+
 // ─── Platform ───
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,7 +112,9 @@ pub enum PlatformHealth {
 
 // ─── Price Level ───
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use arrayvec::ArrayVec;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PriceLevel {
     pub price: Decimal,
     pub size: Decimal,
@@ -117,7 +134,9 @@ pub struct NormalizedTick {
     pub mid_price: Decimal,
     pub last_trade_price: Decimal,
     pub last_trade_size: Decimal,
-    pub book_depth: std::sync::Arc<Vec<PriceLevel>>,
+    // HFT FIX: Stack-allocated depth (Max 10 bids + 10 asks = 20)
+    // Eliminates thousands of heap allocations per second during tick storms
+    pub book_depth: ArrayVec<PriceLevel, 20>, 
     pub fee_rate_bps: u16,
     pub sequence: u64,
 }

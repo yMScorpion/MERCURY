@@ -1,8 +1,9 @@
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use uuid::Uuid;
+use arrayvec::ArrayVec;
 
-use crate::types::*;
+use crate::types::{NormalizedTick, Platform, PriceLevel};
 
 /// Per-platform order book for a single market
 #[derive(Debug, Clone)]
@@ -46,11 +47,11 @@ impl PlatformBook {
         }
     }
 
-    pub fn ask_depth(&self) -> Vec<PriceLevel> {
+    pub fn ask_depth(&self) -> ArrayVec<PriceLevel, 20> {
         self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
     }
 
-    pub fn bid_depth(&self) -> Vec<PriceLevel> {
+    pub fn bid_depth(&self) -> ArrayVec<PriceLevel, 20> {
         self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
     }
 

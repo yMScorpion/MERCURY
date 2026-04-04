@@ -97,10 +97,12 @@ mod pipeline_tests {
             mid_price: mid,
             last_trade_price: mid,
             last_trade_size: dec!(10),
-            book_depth: Arc::new(vec![
-                PriceLevel { price: ask, size: ask_size },
-                PriceLevel { price: bid, size: bid_size },
-            ]),
+            book_depth: {
+                let mut depth = arrayvec::ArrayVec::new();
+                depth.push(PriceLevel { price: ask, size: ask_size });
+                depth.push(PriceLevel { price: bid, size: bid_size });
+                depth
+            },
             fee_rate_bps: fee_bps,
             sequence: seq,
         }
@@ -231,7 +233,7 @@ mod pipeline_tests {
             mid_price: dec!(0.575),
             last_trade_price: dec!(0.57),
             last_trade_size: dec!(10),
-            book_depth: Arc::new(vec![]),
+            book_depth: arrayvec::ArrayVec::new(),
             fee_rate_bps: 200,
             sequence: 1,
         };

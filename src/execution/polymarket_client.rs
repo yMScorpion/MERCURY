@@ -84,7 +84,10 @@ use crate::execution::executor::OrderAction;
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for PolymarketClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, fee_rate_bps: u32) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
+        let price = price.0;
+        let size = size.0;
+        let fee_rate_bps = fee_rate_bps.0;
         // MED-5 FIX: Rate limit Polymarket submissions
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -244,18 +247,18 @@ impl PlatformOrderClient for PolymarketClient {
 
             Ok(OrderResult {
                 filled,
-                fill_price: actual_price,
-                fill_size,
-                fee: estimated_fee,
+                fill_price: crate::types::Usd(actual_price),
+                fill_size: crate::types::Contracts(fill_size),
+                fee: crate::types::Usd(estimated_fee),
                 order_id: order_id_str,
                 error: if !filled { Some("FOK order returned zero fill size".into()) } else { None },
             })
         } else {
             Ok(OrderResult {
                 filled: false,
-                fill_price: Decimal::ZERO,
-                fill_size: Decimal::ZERO,
-                fee: Decimal::ZERO,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
                 order_id: String::new(),
                 error: body.error_msg.or_else(|| Some(format!("HTTP {}", status_code))),
             })

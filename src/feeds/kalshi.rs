@@ -50,10 +50,10 @@ impl KalshiOrderBook {
         Some((b + a) / rust_decimal::Decimal::from(2))
     }
 
-    fn depth(&self) -> Vec<PriceLevel> {
-        let mut levels = Vec::new();
-        levels.extend(self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
-        levels.extend(self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
+    fn depth(&self) -> arrayvec::ArrayVec<PriceLevel, 20> {
+        let mut levels = arrayvec::ArrayVec::new();
+        for (&p, &s) in self.bids.iter().rev().take(10) { levels.push(PriceLevel { price: p, size: s }); }
+        for (&p, &s) in self.asks.iter().take(10) { levels.push(PriceLevel { price: p, size: s }); }
         levels
     }
 }
@@ -155,7 +155,7 @@ impl KalshiFeed {
             mid_price: mid,
             last_trade_price: Decimal::ZERO,
             last_trade_size: Decimal::ZERO,
-            book_depth: std::sync::Arc::new(book.depth()),
+            book_depth: book.depth(),
             fee_rate_bps: fee_bps,
             sequence: 0,
         })

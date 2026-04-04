@@ -18,8 +18,38 @@ pub enum RejectionReason {
     RiskBudgetExceeded { reason: String },
 }
 
-/// Detection statistics
-#[derive(Debug, Default)]
+/// Deterministic natural logarithm approximation using Taylor series for `rust_decimal`
+/// Eliminates non-deterministic `f64` math across CPU architectures.
+fn decimal_ln(mut x: Decimal) -> Decimal {
+    if x <= Decimal::ZERO { return Decimal::ZERO; }
+    if x == Decimal::ONE { return Decimal::ZERO; }
+    
+    let mut shifts = 0;
+    let two = rust_decimal_macros::dec!(2.0);
+    
+    // Range reduction to [0.5, 1.5] for faster convergence
+    while x > rust_decimal_macros::dec!(1.5) { x /= two; shifts += 1; }
+    while x < rust_decimal_macros::dec!(0.5) { x *= two; shifts -= 1; }
+
+    let z = (x - Decimal::ONE) / (x + Decimal::ONE);
+    let z_squared = z * z;
+    let mut term = z;
+    let mut sum = z;
+    let mut n = Decimal::ONE;
+
+    for _ in 1..20 {
+        term *= z_squared;
+        n += two;
+        let next_sum = sum + term / n;
+        if next_sum == sum { break; }
+        sum = next_sum;
+    }
+    
+    // ln(2) ≈ 0.6931471805599453
+    (sum * two) + (Decimal::from(shifts) * rust_decimal_macros::dec!(0.6931471805599453))
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct DetectorStats {
     pub opportunities_detected: u64,
     pub gate1_rejected: u64,
@@ -30,6 +60,7 @@ pub struct DetectorStats {
     pub opportunities_passed: u64,
 }
 
+#[derive(Clone)]
 pub struct ArbitrageDetector {
     min_spread: Decimal,
     min_order_size: Decimal,
@@ -133,14 +164,7 @@ impl ArbitrageDetector {
 
                         let liquidity = spread.leg_a_available.min(spread.leg_b_available);
                         let log_liq = if liquidity > Decimal::ZERO {
-                            // HIGH-3 FIX: Accepted f64 imprecision with explicit documentation.
-                            // Rust Decimal lacks a native ln() function. The floating-point conversion here 
-                            // only impacts the relative ranking queue of opportunities (the score), 
-                            // not the actual financial math, risk limits, or threshold gates.
-                            // Add 1.0 to the natural log so a liquidity of 1.0 yields a multiplier of 1.0 (ln(1) = 0 + 1 = 1)
-                            let val = liquidity.to_f64().unwrap_or(1.0).ln() + 1.0;
-                            // Natively cast f64 to Decimal to eliminate string allocation in the hot path
-                            Decimal::try_from(val.max(0.1)).unwrap_or(Decimal::ONE)
+                            (decimal_ln(liquidity) + Decimal::ONE).max(rust_decimal_macros::dec!(0.1))
                         } else {
                             Decimal::ONE
                         };

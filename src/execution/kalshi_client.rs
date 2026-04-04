@@ -82,7 +82,9 @@ use crate::execution::executor::OrderAction;
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for KalshiClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, _fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
+        let price = price.0;
+        let size = size.0;
         // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
 
         // Avoid string parsing panics by directly safely converting rounded decimals
@@ -164,15 +166,15 @@ impl PlatformOrderClient for KalshiClient {
             let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count));
             Ok(OrderResult {
                 filled,
-                fill_price,
-                fill_size: Decimal::from(filled_count),
-                fee: total_fee,
+                fill_price: crate::types::Usd(fill_price),
+                fill_size: crate::types::Contracts(Decimal::from(filled_count)),
+                fee: crate::types::Usd(total_fee),
                 order_id: order.order_id,
                 error: if !filled { Some("Order not filled".into()) } else { None },
             })
         } else {
             let error_msg = body.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".into());
-            Ok(OrderResult { filled: false, fill_price: Decimal::ZERO, fill_size: Decimal::ZERO, fee: Decimal::ZERO, order_id: String::new(), error: Some(error_msg) })
+            Ok(OrderResult { filled: false, fill_price: crate::types::Usd(Decimal::ZERO), fill_size: crate::types::Contracts(Decimal::ZERO), fee: crate::types::Usd(Decimal::ZERO), order_id: String::new(), error: Some(error_msg) })
         }
     }
 

@@ -27,12 +27,10 @@ pub struct SpreadResult {
     pub gas_cost: Decimal,
 }
 
+#[derive(Clone)]
 pub struct NetSpreadEngine {
     min_threshold: Decimal,
     gas_price_gwei: Decimal,
-    /// MATIC/USD spot price (Polymarket runs on Polygon; gas is paid in MATIC, not ETH).
-    /// Default is $0.50 MATIC — do NOT set this to an ETH price (~$2,000+) or gas costs
-    /// will be overestimated 4,000x, suppressing all Polymarket arb opportunities.
     matic_price_usd: Decimal,
 }
 

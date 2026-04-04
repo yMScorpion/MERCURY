@@ -266,3 +266,135 @@ mod tests {
         assert_eq!(bm.peak_bankroll(), dec!(1010.8));
     }
 }
+
+use tokio::sync::{mpsc, oneshot};
+
+#[derive(Debug, Clone)]
+pub struct RiskState {
+    pub bankroll: Decimal,
+    pub daily_loss_pct: Decimal,
+    pub drawdown_pct: Decimal,
+    pub platform_a_exposure_pct: Decimal,
+    pub platform_b_exposure_pct: Decimal,
+    pub market_exposure_pct: Decimal,
+    pub exec_success_rate: Decimal,
+}
+
+pub enum BankrollMsg {
+    ReserveCapital {
+        leg_a_exposure: Decimal,
+        leg_b_exposure: Decimal,
+        platform_a: Platform,
+        platform_b: Platform,
+        market_id: Uuid,
+        reply: oneshot::Sender<bool>,
+    },
+    ProcessTrade(TradeResult, oneshot::Sender<TradeResult>),
+    RecordSettlement(Decimal),
+    GetSnapshot(Decimal, oneshot::Sender<DailySnapshot>),
+    GetRiskState {
+        platform_a: Platform,
+        platform_b: Platform,
+        market_id: Uuid,
+        reply: oneshot::Sender<RiskState>,
+    },
+}
+
+#[derive(Clone)]
+pub struct BankrollHandle {
+    pub tx: mpsc::Sender<BankrollMsg>,
+}
+
+impl BankrollHandle {
+    pub fn new(mut manager: BankrollManager) -> Self {
+        let (tx, mut rx) = mpsc::channel(10_000);
+        
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BankrollMsg::ReserveCapital { leg_a_exposure, leg_b_exposure, platform_a, platform_b, market_id, reply } => {
+                        let total_amount = leg_a_exposure + leg_b_exposure;
+                        let available = (manager.total_bankroll() - manager.total_exposure()).max(Decimal::ZERO);
+                        if available >= total_amount {
+                            manager.add_exposure(platform_a, leg_a_exposure);
+                            manager.add_exposure(platform_b, leg_b_exposure);
+                            manager.add_market_exposure(market_id, total_amount);
+                            let _ = reply.send(true);
+                        } else {
+                            let _ = reply.send(false);
+                        }
+                    }
+                    BankrollMsg::ProcessTrade(mut trade, reply) => {
+                        manager.record_trade(&trade);
+                        
+                        trade.bankroll_after = manager.total_bankroll();
+                        let pre_trade = manager.total_bankroll() - trade.profit;
+                        trade.bankroll_change_pct = if pre_trade > rust_decimal::Decimal::ZERO {
+                            (trade.profit / pre_trade) * rust_decimal_macros::dec!(100.0)
+                        } else {
+                            rust_decimal::Decimal::ZERO
+                        };
+
+                        if trade.status != TradeStatus::Success {
+                            let leg_a_exp = trade.approved_size * trade.leg_a_price;
+                            let leg_b_exp = trade.approved_size * trade.leg_b_price;
+                            manager.remove_exposure(trade.leg_a_platform, leg_a_exp);
+                            manager.remove_exposure(trade.leg_b_platform, leg_b_exp);
+                            manager.remove_market_exposure(trade.market_id, trade.approved_size);
+                        } else {
+                            let reserved_a = trade.approved_size * trade.leg_a_price;
+                            let actual_a = trade.leg_a_size * trade.leg_a_fill_price;
+                            if reserved_a > actual_a { manager.remove_exposure(trade.leg_a_platform, reserved_a - actual_a); }
+                            else if actual_a > reserved_a { manager.add_exposure(trade.leg_a_platform, actual_a - reserved_a); }
+
+                            let reserved_b = trade.approved_size * trade.leg_b_price;
+                            let actual_b = trade.leg_b_size * trade.leg_b_fill_price;
+                            if reserved_b > actual_b { manager.remove_exposure(trade.leg_b_platform, reserved_b - actual_b); }
+                            else if actual_b > reserved_b { manager.add_exposure(trade.leg_b_platform, actual_b - reserved_b); }
+                        }
+                        let _ = reply.send(trade);
+                    }
+                    BankrollMsg::RecordSettlement(pnl) => manager.record_settlement(pnl),
+                    BankrollMsg::GetSnapshot(kelly_frac, reply) => {
+                        let _ = reply.send(manager.daily_snapshot(kelly_frac));
+                    }
+                    BankrollMsg::GetRiskState { platform_a, platform_b, market_id, reply } => {
+                        let state = RiskState {
+                            bankroll: manager.total_bankroll(),
+                            daily_loss_pct: manager.daily_loss_pct(),
+                            drawdown_pct: manager.drawdown_pct(),
+                            platform_a_exposure_pct: manager.platform_exposure_pct(&platform_a),
+                            platform_b_exposure_pct: manager.platform_exposure_pct(&platform_b),
+                            market_exposure_pct: manager.market_exposure_pct(&market_id),
+                            exec_success_rate: manager.exec_success_rate(),
+                        };
+                        let _ = reply.send(state);
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    pub async fn process_trade(&self, trade: TradeResult) -> TradeResult {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(BankrollMsg::ProcessTrade(trade, reply_tx)).await;
+        reply_rx.await.expect("Bankroll actor died")
+    }
+    
+    pub async fn record_settlement(&self, pnl: Decimal) {
+        let _ = self.tx.send(BankrollMsg::RecordSettlement(pnl)).await;
+    }
+
+    pub async fn get_snapshot(&self, kelly_frac: Decimal) -> DailySnapshot {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(BankrollMsg::GetSnapshot(kelly_frac, reply_tx)).await;
+        reply_rx.await.expect("Bankroll actor died")
+    }
+
+    pub async fn get_risk_state(&self, platform_a: Platform, platform_b: Platform, market_id: Uuid) -> RiskState {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(BankrollMsg::GetRiskState { platform_a, platform_b, market_id, reply: reply_tx }).await;
+        reply_rx.await.expect("Bankroll actor died")
+    }
+}

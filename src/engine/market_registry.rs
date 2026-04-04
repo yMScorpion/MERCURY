@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::types::*;
 
 /// Cross-platform market matching registry
+#[derive(Clone)]
 pub struct MarketRegistry {
     markets: HashMap<Uuid, Market>,
     arb_pairs: HashMap<Uuid, Vec<ArbPair>>,
@@ -27,7 +28,7 @@ impl MarketRegistry {
 
     /// Remove markets that have expired or been resolved. Call periodically
     /// to prevent unbounded memory growth during long-running sessions.
-    pub fn evict_stale_markets(&mut self) {
+    pub fn evict_stale_markets(&mut self) -> Vec<Uuid> {
         let now = chrono::Utc::now();
         let stale_ids: Vec<Uuid> = self.markets.iter()
             .filter(|(_, m)| {
@@ -36,10 +37,11 @@ impl MarketRegistry {
             })
             .map(|(id, _)| *id)
             .collect();
-        for id in stale_ids {
-            self.markets.remove(&id);
-            self.arb_pairs.remove(&id);
+        for id in &stale_ids {
+            self.markets.remove(id);
+            self.arb_pairs.remove(id);
         }
+        stale_ids // Return IDs so the tick router can drop the actor channels
     }
 
     /// Register a market. Idempotent: re-registering the same market_id updates

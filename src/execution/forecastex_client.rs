@@ -21,7 +21,9 @@ use crate::execution::executor::OrderAction;
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for ForecastExClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, _fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
+        let price = price.0;
+        let size = size.0;
         info!(market_id, action = ?action, side = %side, price = %price, size = %size, "ForecastEx order rejected — FIX execution not yet implemented");
         warn!(
             fix_host = %self.fix_host,
