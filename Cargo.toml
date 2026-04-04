@@ -8,18 +8,17 @@ description = "Cross-market prediction arbitrage engine"
 native-tls = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+ring = "0.17"
 reqwest = { version = "0.12", features = ["json", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-rusqlite = { version = "0.31", features = ["bundled", "serde_json", "backup"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.24"
-ethers = { version = "2", features = ["legacy"] }
+tokio-native-tls = "0.3"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "chrono", "uuid", "rust_decimal"] }
+alloy = { version = "0.8.2", features = ["full", "eip712"] }
+alloy-sol-types = "0.8.26"
 jsonwebtoken = "9"
 rsa = { version = "0.9", features = ["pem"] }
-ring = "0.17"
-aes-gcm = "0.10"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 rust_decimal_macros = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -28,18 +27,13 @@ notify = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
-thiserror = "1"
 async-trait = "0.1"
 futures-util = "0.3"
-url = "2"
 hex = "0.4"
-base64 = "0.22"
-rand = "0.8"
 sha2 = "0.10"
-argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
-secrecy = "0.8"
 tokio-util = "0.7"
+lru = "0.12"
 clap = { version = "4", features = ["derive"] }
 tracing-appender = "0.2.4"
 

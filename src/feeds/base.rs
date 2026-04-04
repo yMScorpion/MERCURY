@@ -30,6 +30,7 @@ pub async fn run_with_reconnect(
     mut handler: Box<dyn FeedHandler>,
     tick_tx: broadcast::Sender<NormalizedTick>,
     alert_tx: tokio::sync::mpsc::Sender<crate::types::AlertMessage>,
+    metrics: std::sync::Arc<crate::monitoring::metrics::Metrics>,
     token: CancellationToken,
 ) {
     let platform = handler.platform();
@@ -84,6 +85,8 @@ pub async fn run_with_reconnect(
         }
 
         warn!(%platform, backoff_secs, "Reconnecting after backoff");
+        // L-7 FIX: Report reconnect metrics
+        metrics.inc_reconnects();
         backoff_secs = (backoff_secs * 2).min(max_backoff);
     }
 }

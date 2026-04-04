@@ -2,9 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::client::IntoClientRequest, tungstenite::Message, Connector};
@@ -27,42 +25,35 @@ pub struct KalshiFeed {
 }
 
 struct KalshiOrderBook {
-    bids: BTreeMap<Decimal, Decimal>,
-    asks: BTreeMap<Decimal, Decimal>,
+    bids: std::collections::BTreeMap<Decimal, Decimal>,
+    asks: std::collections::BTreeMap<Decimal, Decimal>,
     last_seq: u64,
     is_initialized: bool,
 }
 
 impl KalshiOrderBook {
     fn new() -> Self {
-        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), last_seq: 0, is_initialized: false }
+        Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new(), last_seq: 0, is_initialized: false }
     }
 
-    /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
     fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
+        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
     }
 
-    /// Returns best ask only if non-empty — never returns phantom (1.0, 0) fallback.
     fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(p, s)| (*p, *s))
+        self.asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
-    /// Returns mid-price only when both sides have real liquidity.
     fn mid_price(&self) -> Option<Decimal> {
         let (b, _) = self.best_bid()?;
         let (a, _) = self.best_ask()?;
-        Some((b + a) / Decimal::from(2))
+        Some((b + a) / rust_decimal::Decimal::from(2))
     }
 
     fn depth(&self) -> Vec<PriceLevel> {
         let mut levels = Vec::new();
-        for (p, s) in self.bids.iter().rev().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
-        for (p, s) in self.asks.iter().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
+        levels.extend(self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
+        levels.extend(self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
         levels
     }
 }
@@ -140,7 +131,10 @@ impl KalshiFeed {
         let ask = book.best_ask()?;
         let mid = book.mid_price()?;
 
-        let fee_per_contract = dec!(0.07) * mid * (Decimal::ONE - mid);
+        // CRIT-5 FIX: Route feed calculations through the centralized normalizer function
+        // to guarantee identical math between the execution engine and the feed estimator.
+        let fee_per_contract = crate::feeds::normalizer::kalshi_fee(mid, Decimal::ONE);
+        
         let fee_bps = if mid > Decimal::ZERO {
             let bps = (fee_per_contract / mid) * Decimal::from(10000);
             // CRITICAL FIX: Decimal to u16 conversion fails if there is any fractional remainder.
@@ -161,7 +155,7 @@ impl KalshiFeed {
             mid_price: mid,
             last_trade_price: Decimal::ZERO,
             last_trade_size: Decimal::ZERO,
-            book_depth: book.depth(),
+            book_depth: std::sync::Arc::new(book.depth()),
             fee_rate_bps: fee_bps,
             sequence: 0,
         })
@@ -201,19 +195,29 @@ impl FeedHandler for KalshiFeed {
                     .context("Failed to build Kalshi auth header")?,
             );
             {
-                let tls = native_tls::TlsConnector::builder()
-                    .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-                    .build()
-                    .context("Failed to build Kalshi TLS connector")?;
+                let mut tls_builder = native_tls::TlsConnector::builder();
+                tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+                // M-8 FIX: Explicit TLS Cert Pinning
+                if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+                    if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
+                        tls_builder.add_root_certificate(cert);
+                    }
+                }
+                let tls = tls_builder.build().context("Failed to build Kalshi TLS connector")?;
                 connect_async_tls_with_config(request, None, false, Some(Connector::NativeTls(tls)))
                     .await.context("Failed to connect to Kalshi WebSocket")?
             }
         } else {
             {
-                let tls = native_tls::TlsConnector::builder()
-                    .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-                    .build()
-                    .context("Failed to build Kalshi TLS connector")?;
+                let mut tls_builder = native_tls::TlsConnector::builder();
+                tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+                // M-8 FIX: Explicit TLS Cert Pinning
+                if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+                    if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
+                        tls_builder.add_root_certificate(cert);
+                    }
+                }
+                let tls = tls_builder.build().context("Failed to build Kalshi TLS connector")?;
                 connect_async_tls_with_config(self.config.ws_url.as_str(), None, false, Some(Connector::NativeTls(tls)))
                     .await.context("Failed to connect to Kalshi WebSocket")?
             }
@@ -340,6 +344,7 @@ impl KalshiFeed {
     ) {
         let ticker = &data.market_ticker;
         if let Some(book) = self.books.get_mut(ticker) {
+            book.is_initialized = true; // CRITICAL FIX: Mark book safe for incoming deltas
             book.bids.clear();
             book.asks.clear();
 

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -93,7 +94,11 @@ impl GasOracle {
             }
 
             match self.fetch_matic_usd().await {
-                Ok(price) => {
+                Ok(raw_price) => {
+                    // CRITICAL FIX (3-D): Hard floor/ceiling to prevent severe oracle glitches
+                    // from multiplying gas estimates by 1000x and breaking the spread math.
+                    let price = raw_price.clamp(dec!(0.20), dec!(5.00));
+                    
                     let change_pct = if last_matic > Decimal::ZERO {
                         ((price - last_matic) / last_matic * Decimal::from(100)).abs()
                     } else {
@@ -131,13 +136,16 @@ impl GasOracle {
 
             let update = GasUpdate { gas_gwei: last_gwei, matic_usd: last_matic };
             // Use try_send (non-blocking) so the oracle never blocks the main loop
-            // shutdown path. Dropped updates are safe — the main loop retains the
-            // last-known values and the next poll will deliver a fresh update.
-            if self.update_tx.try_send(update).is_err() {
-                // Receiver dropped (clean shutdown) or channel full (main loop lagging).
-                // In either case, silently exit — the oracle will be aborted shortly.
-                debug!("Gas oracle channel closed or full — exiting");
-                return;
+            if let Err(e) = self.update_tx.try_send(update) {
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        warn!("Gas oracle channel full — skipping update");
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        debug!("Gas oracle channel closed — exiting cleanly");
+                        return;
+                    }
+                }
             }
         }
     }
@@ -191,7 +199,23 @@ impl GasOracle {
                 }
             }
         }
-        Err(anyhow::anyhow!("All CoinGecko IDs failed for MATIC/POL price"))
+        // MED-6: Binance fallback for stability
+        match self.try_binance_price("MATICUSDT").await {
+            Ok(price) => return Ok(price),
+            Err(e) => tracing::debug!(error = %e, "Binance fallback failed"),
+        }
+        Err(anyhow::anyhow!("All price oracles failed for MATIC/POL price"))
+    }
+
+    async fn try_binance_price(&self, symbol: &str) -> Result<Decimal> {
+        let http_resp = self.http.get("https://api.binance.com/api/v3/ticker/price")
+            .query(&[("symbol", symbol)]).send().await?;
+        if !http_resp.status().is_success() {
+            return Err(anyhow::anyhow!("Binance HTTP {}", http_resp.status()));
+        }
+        let resp: serde_json::Value = http_resp.json().await?;
+        let price_str = resp.get("price").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing price"))?;
+        std::str::FromStr::from_str(price_str).map_err(|e| anyhow::anyhow!("Parse error: {}", e))
     }
 
     async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
@@ -217,7 +241,10 @@ impl GasOracle {
             .and_then(|v| v.as_f64())
             .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
 
-        Decimal::from_f64_retain(usd)
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko value is not finite: {}", usd))
+        if !usd.is_finite() {
+            return Err(anyhow::anyhow!("CoinGecko value is not finite: {}", usd));
+        }
+        Decimal::from_f64(usd)
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert f64 to Decimal: {}", usd))
     }
 }

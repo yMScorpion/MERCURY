@@ -62,7 +62,8 @@ impl BackupTask {
             })
             .collect();
 
-        entries.sort_by_key(|e| e.file_name());
+        // L-9 FIX: Sort by actual file creation/modification time, not lexicographically
+        entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH));
 
         if entries.len() > keep {
             for entry in &entries[..entries.len() - keep] {

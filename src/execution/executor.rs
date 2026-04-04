@@ -49,11 +49,13 @@ pub struct ExecutionEngine {
     trade_result_tx: mpsc::Sender<TradeResult>,
     alert_tx: mpsc::Sender<AlertMessage>,
     db: Arc<dyn Database>,
+    uob: Arc<tokio::sync::RwLock<crate::engine::order_book::UnifiedOrderBook>>,
     polymarket_client: Option<PolymarketClient>,
     kalshi_client: Option<KalshiClient>,
     cdna_client: Option<CdnaClient>,
     forecastex_client: Option<ForecastExClient>,
     trade_counter: i64,
+    executed_opps: lru::LruCache<uuid::Uuid, ()>,
 }
 
 impl ExecutionEngine {
@@ -62,6 +64,7 @@ impl ExecutionEngine {
         trade_result_tx: mpsc::Sender<TradeResult>,
         alert_tx: mpsc::Sender<AlertMessage>,
         db: Arc<dyn Database>,
+        uob: Arc<tokio::sync::RwLock<crate::engine::order_book::UnifiedOrderBook>>,
         polymarket_client: Option<PolymarketClient>,
         kalshi_client: Option<KalshiClient>,
         cdna_client: Option<CdnaClient>,
@@ -73,11 +76,13 @@ impl ExecutionEngine {
             trade_result_tx,
             alert_tx,
             db,
+            uob,
             polymarket_client,
             kalshi_client,
             cdna_client,
             forecastex_client,
             trade_counter: initial_trade_count,
+            executed_opps: lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
         }
     }
 
@@ -95,12 +100,31 @@ impl ExecutionEngine {
         let opp = &validated.opportunity;
         let start = Instant::now();
         
+        let halves: Vec<&str> = opp.market_question.split(" / ").collect();
+        if halves.len() == 2 {
+            let nums_a: Vec<f64> = halves[0].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
+            let nums_b: Vec<f64> = halves[1].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
+            if nums_a != nums_b && (!nums_a.is_empty() || !nums_b.is_empty()) {
+                tracing::error!(question = %opp.market_question, "Mismatched numerical targets in execution. Aborting trade.");
+                return Ok(());
+            }
+        }
+        
+        // HIGH-4: Idempotency Guard
+        if self.executed_opps.put(opp.opp_id, ()).is_some() {
+            tracing::warn!(opp_id = %opp.opp_id, "Duplicate opportunity execution prevented");
+            return Ok(());
+        }
+
         // CRITICAL FIX: The TTL Guard
         // Drop the opportunity immediately if it sat in the async queue longer than its Time-To-Live.
         // Executing stale arbs guarantees negative PnL.
         let current_time_ns = crate::types::now_ns();
         let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
         
+        let current_trade_id = self.trade_counter;
+        self.trade_counter += 1;
+
         if current_time_ns > expiration_ns {
             let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
             tracing::warn!(
@@ -108,10 +132,70 @@ impl ExecutionEngine {
                 delay_ms, 
                 "Opportunity TTL expired in execution queue — dropping to prevent slippage"
             );
+            
+            let trade_result = TradeResult {
+                trade_id: current_trade_id,
+                opp_id: opp.opp_id,
+                market_id: opp.market_id,
+                market_question: opp.market_question.clone(),
+                leg_a_platform: opp.leg_a.platform,
+                leg_a_side: opp.leg_a.side,
+                leg_a_price: opp.leg_a.price,
+                leg_a_size: Decimal::ZERO,
+                leg_a_fill_price: Decimal::ZERO,
+                leg_a_fee: Decimal::ZERO,
+                leg_b_platform: opp.leg_b.platform,
+                leg_b_side: opp.leg_b.side,
+                leg_b_price: opp.leg_b.price,
+                leg_b_size: Decimal::ZERO,
+                leg_b_fill_price: Decimal::ZERO,
+                leg_b_fee: Decimal::ZERO,
+                raw_spread: opp.raw_spread,
+                net_spread: opp.net_spread,
+                profit: Decimal::ZERO,
+                status: TradeStatus::Fail,
+                failure_reason: Some("Opportunity TTL expired in execution queue".into()),
+                execution_ms: 0,
+                executed_at: chrono::Utc::now(),
+                bankroll_after: Decimal::ZERO,
+                bankroll_change_pct: Decimal::ZERO,
+                approved_size: validated.approved_size,
+            };
+            let _ = self.trade_result_tx.try_send(trade_result);
             return Ok(());
         }
-        
-        self.trade_counter += 1;
+
+        // H-1 FIX: Pre-execution price slippage guard
+        {
+            let uob_guard = self.uob.read().await;
+            let book_a = uob_guard.get_book(&opp.market_id, &opp.leg_a.platform);
+            let book_b = uob_guard.get_book(&opp.market_id, &opp.leg_b.platform);
+            
+            if let (Some(ba), Some(bb)) = (book_a, book_b) {
+                let (current_price_a, current_price_b) = match (opp.leg_a.side, opp.leg_b.side) {
+                    (Side::Yes, Side::No) => (ba.best_ask().map(|x| x.0), bb.best_bid().map(|x| Decimal::ONE - x.0)),
+                    (Side::No, Side::Yes) => (ba.best_bid().map(|x| Decimal::ONE - x.0), bb.best_ask().map(|x| x.0)),
+                    _ => (None, None),
+                };
+
+                if let (Some(pa), Some(pb)) = (current_price_a, current_price_b) {
+                    let current_raw_spread = Decimal::ONE - pa - pb;
+                    // If spread shrunk by over 50%, abort execution
+                    if current_raw_spread < opp.raw_spread * rust_decimal_macros::dec!(0.5) {
+                        tracing::warn!(
+                            opp_id = %opp.opp_id,
+                            old_spread = %opp.raw_spread,
+                            new_spread = %current_raw_spread,
+                            "Pre-execution slippage guard triggered: spread closed before execution. Aborting."
+                        );
+                        return Ok(());
+                    }
+                } else {
+                    tracing::warn!("Pre-execution slippage guard: Order book missing depth. Aborting.");
+                    return Ok(());
+                }
+            }
+        }
 
         info!(
             opp_id = %opp.opp_id,
@@ -223,38 +307,39 @@ impl ExecutionEngine {
             }
         };
 
-        let execution_ms = start.elapsed().as_millis() as u64;
+    let execution_ms = start.elapsed().as_millis() as u64;
 
         let (status, profit, failure_reason) = self.compute_result(
             &leg_a_result, &leg_b_result, opp,
         );
 
-        let pre_trade_bankroll = self.bankroll;
-        self.bankroll += profit;
-        let bankroll_change_pct = if pre_trade_bankroll > Decimal::ZERO {
-            profit / pre_trade_bankroll * Decimal::from(100)
+        // CRITICAL FIX (4-B): The execution engine sorts legs by liquidity to reduce slippage risk.
+        // We must map the execution results back to the original Opportunity's Leg A and Leg B
+        // to prevent database/audit-trail cross-contamination.
+        let (actual_leg_a_result, actual_leg_b_result) = if first_leg.platform == opp.leg_a.platform {
+            (&leg_a_result, &leg_b_result)
         } else {
-            Decimal::ZERO
+            (&leg_b_result, &leg_a_result)
         };
 
         let trade_result = TradeResult {
-            trade_id: self.trade_counter,
+            trade_id: current_trade_id,
             opp_id: opp.opp_id,
             market_id: opp.market_id,
             market_question: opp.market_question.clone(),
             approved_size: validated.approved_size,
-            leg_a_platform: first_leg.platform,
-            leg_a_side: first_leg.side,
-            leg_a_price: first_leg.price,
-            leg_a_size: leg_a_result.fill_size,
-            leg_a_fill_price: leg_a_result.fill_price,
-            leg_a_fee: leg_a_result.fee,
-            leg_b_platform: second_leg.platform,
-            leg_b_side: second_leg.side,
-            leg_b_price: second_leg.price,
-            leg_b_size: leg_b_result.fill_size,
-            leg_b_fill_price: leg_b_result.fill_price,
-            leg_b_fee: leg_b_result.fee,
+            leg_a_platform: opp.leg_a.platform,
+            leg_a_side: opp.leg_a.side,
+            leg_a_price: opp.leg_a.price,
+            leg_a_size: actual_leg_a_result.fill_size,
+            leg_a_fill_price: actual_leg_a_result.fill_price,
+            leg_a_fee: actual_leg_a_result.fee,
+            leg_b_platform: opp.leg_b.platform,
+            leg_b_side: opp.leg_b.side,
+            leg_b_price: opp.leg_b.price,
+            leg_b_size: actual_leg_b_result.fill_size,
+            leg_b_fill_price: actual_leg_b_result.fill_price,
+            leg_b_fee: actual_leg_b_result.fee,
             raw_spread: opp.raw_spread,
             net_spread: opp.net_spread,
             profit,
@@ -267,22 +352,10 @@ impl ExecutionEngine {
         };
 
         // Pass the result directly back to the orchestrator.
-        // The executor MUST NOT dispatch to Telegram or SQLite, as this bypasses 
-        // the authoritative state machine and causes severe tracking drift.
+        // The executor MUST NOT dispatch to Telegram or SQLite. 
         if let Err(e) = self.trade_result_tx.try_send(trade_result) {
             tracing::error!(error = %e, "Trade result channel full — dropping notification");
         }
-        if let Err(e) = self.alert_tx.try_send(AlertMessage::TradeComplete(trade_result.clone())) {
-            tracing::warn!(error = %e, "Alert channel full — dropping Telegram trade notification");
-        }
-
-        // NON-BLOCKING SQL DB INSERT
-        let db_clone = self.db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = db_clone.insert_trade(&trade_result).await {
-                tracing::error!(error = %e, "Failed to persist trade result to database");
-            }
-        });
 
         Ok(())
     }
@@ -430,22 +503,19 @@ impl ExecutionEngine {
             
             (status, net_profit, None)
         } else if leg_a.filled && !leg_b.filled {
-            let filled_value = leg_a.fill_price * leg_a.fill_size;
-            
-            // DYNAMIC UNWIND COST: 
-            // The cost to unwind is roughly proportional to the raw spread of the asset.
-            // If the spread is wide (e.g., 8%), unwinding will hurt more.
-            // We use the raw_spread as a proxy for the asset's illiquidity, capped between 2% and 10% for safety.
-            let dynamic_penalty_pct = _opp.raw_spread
-                .max(rust_decimal_macros::dec!(0.02))
-                .min(rust_decimal_macros::dec!(0.10));
-                
-            let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
-            
-            let estimated_loss = dynamic_unwind_slippage + leg_a.fee; 
-            let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
-            
-            (TradeStatus::Fail, -estimated_loss, Some(reason))
+            if leg_a.fill_size == Decimal::ZERO && leg_a.fee > Decimal::ZERO {
+                let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge failed, unwind successful".into());
+                (TradeStatus::Fail, -leg_a.fee, Some(reason))
+            } else {
+                let filled_value = leg_a.fill_price * leg_a.fill_size;
+                let dynamic_penalty_pct = _opp.raw_spread
+                    .max(rust_decimal_macros::dec!(0.02))
+                    .min(rust_decimal_macros::dec!(0.10));
+                let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
+                let estimated_loss = dynamic_unwind_slippage + leg_a.fee; 
+                let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
+                (TradeStatus::Fail, -estimated_loss, Some(reason))
+            }
         } else {
             let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
             (TradeStatus::Fail, Decimal::ZERO, Some(reason))

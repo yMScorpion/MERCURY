@@ -15,11 +15,20 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::types::*;
+use crate::execution::executor::{PlatformOrderClient, OrderAction};
+use crate::execution::polymarket_client::PolymarketClient;
+use crate::execution::kalshi_client::KalshiClient;
+use crate::execution::cdna_client::CdnaClient;
+use crate::execution::forecastex_client::ForecastExClient;
 
 pub struct UnwindWatchdog {
     db: Arc<dyn Database>,
     alert_tx: mpsc::Sender<AlertMessage>,
     check_interval: Duration,
+    polymarket: Option<PolymarketClient>,
+    kalshi: Option<KalshiClient>,
+    cdna: Option<CdnaClient>,
+    forecastex: Option<ForecastExClient>,
 }
 
 impl UnwindWatchdog {
@@ -27,11 +36,19 @@ impl UnwindWatchdog {
         db: Arc<dyn Database>,
         alert_tx: mpsc::Sender<AlertMessage>,
         check_interval_secs: u64,
+        polymarket: Option<PolymarketClient>,
+        kalshi: Option<KalshiClient>,
+        cdna: Option<CdnaClient>,
+        forecastex: Option<ForecastExClient>,
     ) -> Self {
         Self {
             db,
             alert_tx,
             check_interval: Duration::from_secs(check_interval_secs),
+            polymarket,
+            kalshi,
+            cdna,
+            forecastex,
         }
     }
 
@@ -85,17 +102,61 @@ impl UnwindWatchdog {
                         age.num_minutes()
                     );
 
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                    let _ = self.alert_tx.send(AlertMessage::SystemAlert {
                         severity: "critical".into(),
                         message: format!(
                             "🚨 ORPHANED POSITION IMBALANCE: {} contracts unhedged \
-                             open for {} minutes. MANUAL CLOSE REQUIRED. \
+                             open for {} minutes. Attempting automated liquidation. \
                              Market ID: {}",
                             unhedged_diff,
                             age.num_minutes(),
                             market_id,
                         ),
-                    });
+                    }).await;
+
+                    // L-3 FIX: Automated liquidation attempt
+                    if let Ok(Some(market)) = self.db.get_market(market_id).await {
+                        let (target_platform, target_side) = if total_yes > total_no {
+                            (legs.iter().find(|p| p.side == Side::Yes).map(|p| p.platform), Side::Yes)
+                        } else {
+                            (legs.iter().find(|p| p.side == Side::No).map(|p| p.platform), Side::No)
+                        };
+
+                        if let Some(plat) = target_platform {
+                            if let Some(info) = market.platforms.get(&plat) {
+                                let result = match plat {
+                                    Platform::Polymarket | Platform::PolymarketUs => {
+                                        if let Some(c) = &self.polymarket {
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                        } else { None }
+                                    },
+                                    Platform::Kalshi => {
+                                        if let Some(c) = &self.kalshi {
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                        } else { None }
+                                    },
+                                    Platform::Cdna => {
+                                        if let Some(c) = &self.cdna {
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, rust_decimal_macros::dec!(0.01), unhedged_diff, info.fee_rate_bps as u32).await)
+                                        } else { None }
+                                    },
+                                    Platform::ForecastEx => None,
+                                };
+
+                                if let Some(Ok(res)) = result {
+                                    if res.filled {
+                                        let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                                            severity: "warning".into(),
+                                            message: format!("✅ Automated liquidation successful. Filled {} contracts on {}.", res.fill_size, plat),
+                                        }).await;
+                                        for pos in legs {
+                                            let _ = self.db.close_position(pos.id).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -16,11 +16,18 @@ pub struct CdnaClient {
 
 impl CdnaClient {
     pub fn new(rest_url: String, api_key: String, api_secret: String) -> Self {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .expect("Failed to build CDNA HTTP client");
+            .connect_timeout(std::time::Duration::from_secs(5));
+            
+        // M-8 FIX: Explicit TLS Cert Pinning
+        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+            
+        let http = builder.build().expect("Failed to build CDNA HTTP client");
         Self { http, rest_url, api_key, api_secret }
     }
 

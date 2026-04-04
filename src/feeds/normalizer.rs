@@ -1,5 +1,4 @@
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use uuid::Uuid;
 
 use crate::types::*;
@@ -69,4 +68,55 @@ pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<D
 
     let vwap = total_cost / target_size;
     Some((vwap - best_price).abs())
+}
+
+pub fn kalshi_fee(price: Decimal, quantity: Decimal) -> Decimal {
+    let max_fee = rust_decimal_macros::dec!(0.07);
+    let implied_fee = price * rust_decimal_macros::dec!(0.10);
+    max_fee.min(implied_fee) * quantity
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_polymarket_fee() {
+        // Price > 0.5 (e.g. 0.6), quantity = 100, fee = 200 bps (0.02)
+        // Fee = 0.02 * 100 * max(0.6, 0.4) = 2 * 0.6 = 1.2
+        let fee = polymarket_fee(dec!(0.6), dec!(100), 200);
+        assert_eq!(fee, dec!(1.20));
+
+        // Price < 0.5 (e.g. 0.2), quantity = 50, fee = 100 bps (0.01)
+        // Fee = 0.01 * 50 * max(0.2, 0.8) = 0.5 * 0.8 = 0.4
+        let fee2 = polymarket_fee(dec!(0.2), dec!(50), 100);
+        assert_eq!(fee2, dec!(0.40));
+    }
+
+    #[test]
+    fn test_estimate_slippage() {
+        let depth = vec![
+            PriceLevel { price: dec!(0.50), size: dec!(10) },
+            PriceLevel { price: dec!(0.52), size: dec!(20) },
+        ];
+
+        // Target size fully within first level
+        let slip1 = estimate_slippage(dec!(5), &depth);
+        assert_eq!(slip1, Some(dec!(0)));
+
+        // Target size spans both levels:
+        // 10 @ 0.50 = 5.0
+        // 5 @ 0.52 = 2.6
+        // Total cost = 7.6 for 15 contracts -> VWAP = 0.50666...
+        // Best price = 0.50
+        // Slippage = 0.006666...
+        let slip2 = estimate_slippage(dec!(15), &depth).unwrap();
+        assert!(slip2 > dec!(0.006));
+        assert!(slip2 < dec!(0.007));
+
+        // Insufficient depth
+        let slip3 = estimate_slippage(dec!(50), &depth);
+        assert_eq!(slip3, None);
+    }
 }

@@ -6,7 +6,7 @@ use crate::types::*;
 /// Cross-platform market matching registry
 pub struct MarketRegistry {
     markets: HashMap<Uuid, Market>,
-    arb_pairs: Vec<ArbPair>,
+    arb_pairs: HashMap<Uuid, Vec<ArbPair>>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,7 +21,7 @@ impl MarketRegistry {
     pub fn new() -> Self {
         Self {
             markets: HashMap::new(),
-            arb_pairs: Vec::new(),
+            arb_pairs: HashMap::new(), // CRITICAL FIX: Match struct definition
         }
     }
 
@@ -32,15 +32,13 @@ impl MarketRegistry {
         let platforms: Vec<Platform> = market.platforms.keys().cloned().collect();
         let confidence = market.confidence;
 
-        // Remove stale arb pairs for this market before re-adding.
-        self.arb_pairs.retain(|p| p.market_id != market_id);
-
         self.markets.insert(market_id, market);
 
+        let mut pairs = Vec::new();
         if confidence >= 0.95 {
             for i in 0..platforms.len() {
                 for j in (i + 1)..platforms.len() {
-                    self.arb_pairs.push(ArbPair {
+                    pairs.push(ArbPair {
                         market_id,
                         platform_a: platforms[i],
                         platform_b: platforms[j],
@@ -49,10 +47,16 @@ impl MarketRegistry {
                 }
             }
         }
+        
+        if !pairs.is_empty() {
+            self.arb_pairs.insert(market_id, pairs);
+        } else {
+            self.arb_pairs.remove(&market_id);
+        }
     }
 
-    pub fn get_arb_pairs(&self) -> &[ArbPair] {
-        &self.arb_pairs
+    pub fn get_arb_pairs_for_market(&self, market_id: &Uuid) -> Option<&Vec<ArbPair>> {
+        self.arb_pairs.get(market_id)
     }
 
     pub fn get_market(&self, id: &Uuid) -> Option<&Market> {

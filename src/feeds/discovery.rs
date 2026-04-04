@@ -39,10 +39,11 @@ pub struct MarketDiscovery {
     platforms_config: PlatformsConfig,
     http: reqwest::Client,
     poll_interval: Duration,
+    kalshi_auth: Option<crate::crypto::jwt::KalshiAuth>,
 }
 
 impl MarketDiscovery {
-    pub fn new(platforms_config: PlatformsConfig, poll_interval_secs: u64) -> Self {
+    pub fn new(platforms_config: PlatformsConfig, poll_interval_secs: u64, kalshi_auth: Option<crate::crypto::jwt::KalshiAuth>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
@@ -53,6 +54,7 @@ impl MarketDiscovery {
             platforms_config,
             http,
             poll_interval: Duration::from_secs(poll_interval_secs),
+            kalshi_auth,
         }
     }
 
@@ -76,8 +78,8 @@ impl MarketDiscovery {
                 Ok(matched) => {
                     info!(count = matched.len(), "Discovery cycle complete");
                     for m in matched {
-                        if matched_tx.try_send(m).is_err() {
-                            warn!("Matched market channel full — skipping");
+                        if let Err(e) = matched_tx.send(m).await {
+                            warn!(error = %e, "Matched market channel closed — skipping");
                         }
                     }
                 }
@@ -112,13 +114,24 @@ impl MarketDiscovery {
         }
 
         let mut matched = Vec::new();
+        let mut seen_pairs = std::collections::HashSet::new();
         let poly_markets: Vec<_> = all_discovered.iter().filter(|m| m.platform == Platform::Polymarket).collect();
         let kalshi_markets: Vec<_> = all_discovered.iter().filter(|m| m.platform == Platform::Kalshi).collect();
 
-        // O(N^2) Fuzzy Matcher: Compares every Kalshi market against every Polymarket market
+        // H-3 FIX: Group Kalshi markets by expiration hour to reduce O(N^2) complexity to O(N * K)
+        let mut kalshi_by_hour: HashMap<i64, Vec<&DiscoveredMarket>> = HashMap::new();
+        for km in &kalshi_markets {
+            let hour = km.expiration.timestamp() / 3600;
+            kalshi_by_hour.entry(hour).or_default().push(km);
+        }
+
         for pm in &poly_markets {
-            for km in &kalshi_markets {
-                // 1. Dual-Tier Expiration Check
+            let pm_hour = pm.expiration.timestamp() / 3600;
+            // Only compare with Kalshi markets expiring in the same, previous, or next hour
+            for hour_offset in -1..=1 {
+                if let Some(kms) = kalshi_by_hour.get(&(pm_hour + hour_offset)) {
+                    for km in kms {
+                        // 1. Dual-Tier Expiration Check
                 let exp_diff_secs = (pm.expiration - km.expiration).num_seconds().abs();
                 let is_15m_market = pm.question_normalized.contains("15 min") || km.question_normalized.contains("15 min");
 
@@ -138,8 +151,8 @@ impl MarketDiscovery {
                 let union = tokens_a.union(&tokens_b).count();
                 let sim = if union == 0 { 0.0 } else { intersection as f64 / union as f64 };
 
-                // 30% overlap is the mathematical sweet spot for matching financial shorthand
-                if sim >= 0.3 {
+                // 70% overlap for safer automated cross-platform matching
+                if sim >= 0.7 {
                     // CRITICAL FIX: Extract numerical targets to prevent mismatched strikes (e.g. $60k vs $70k)
                     let nums_pm: Vec<f64> = pm.question_normalized.split_whitespace()
                         .filter_map(|w| w.replace("$", "").replace(",", "").parse::<f64>().ok())
@@ -154,8 +167,9 @@ impl MarketDiscovery {
                             km_question = %km.question,
                             pm_nums = ?nums_pm,
                             km_nums = ?nums_km,
-                            "DIFFERENT NUMERICAL TARGETS in fuzzy match — verify manually before activating"
+                            "DIFFERENT NUMERICAL TARGETS in fuzzy match — discarding match"
                         );
+                        continue;
                     }
 
                     let unified_id = compute_unified_market_id(
@@ -163,6 +177,10 @@ impl MarketDiscovery {
                         "cross_platform",
                         &pm.expiration.to_rfc3339(),
                     );
+
+                    if !seen_pairs.insert(unified_id) {
+                        continue;
+                    }
 
                     let mut platform_infos = HashMap::new();
                     platform_infos.insert(pm.platform, PlatformMarketInfo {
@@ -187,16 +205,25 @@ impl MarketDiscovery {
                             resolution_source: "cross_platform".into(),
                             expiration: pm.expiration,
                             platforms: platform_infos,
-                            category: MarketCategory::Crypto,
+                            // LOW-3 / MED-2 FIX: Better category extraction
+                            category: {
+                                let q = pm.question_normalized.as_str();
+                                if q.contains("trump") || q.contains("election") || q.contains("biden") || q.contains("harris") { MarketCategory::Politics }
+                                else if q.contains("bitcoin") || q.contains("btc") || q.contains("eth") || q.contains("crypto") { MarketCategory::Crypto }
+                                else if q.contains("nba") || q.contains("nfl") || q.contains("super bowl") { MarketCategory::Sports }
+                                else { MarketCategory::Other }
+                            },
                             confidence: if sim > 0.7 { 0.98 } else { 0.95 },
-                            // CRITICAL FIX: Fuzzy-matched markets MUST be suspended by default. 
-                            // Textual overlap cannot differentiate between distinct price targets (e.g., $60k vs $70k).
-                            // A human MUST review and flip this to 'Active' in the DB to prevent catastrophic loss.
+                            // HIGH-1: All discovered markets start as Suspended to mandate human review, 
+                            // preventing fuzzy matcher blindspots from executing mismatched strikes.
                             status: MarketStatus::Suspended,
                             created_at: chrono::Utc::now(),
                             updated_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
                         }
                     });
+                }
+                    }
                 }
             }
         }
@@ -309,11 +336,15 @@ fn normalize_question(q: &str) -> String {
 
     async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {
         let url = format!("{}/markets", self.platforms_config.kalshi.rest_url);
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .query(&[("status", "open"), ("limit", "1000")])
-            .send()
+        let mut req = self.http.get(&url).query(&[("status", "open"), ("limit", "1000")]);
+        
+        if let Some(auth) = &self.kalshi_auth {
+            if let Ok(token) = auth.generate_token() {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            }
+        }
+        
+        let resp: serde_json::Value = req.send()
             .await
             .context("Kalshi markets fetch failed")?
             .json()

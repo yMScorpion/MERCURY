@@ -1,32 +1,43 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 
 /// Current schema version.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// Rollback migrations for safety
+pub async fn rollback_migrations(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DROP TABLE IF EXISTS config_history").execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE IF EXISTS audit_log").execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE IF EXISTS daily_snapshots").execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE IF EXISTS platform_balances").execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE IF EXISTS positions").execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE IF EXISTS trades").execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE IF EXISTS markets").execute(&mut *tx).await?;
+    sqlx::query("DROP TABLE IF EXISTS schema_version").execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Run all migrations up to CURRENT_VERSION.
-pub fn run_migrations(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER NOT NULL
-        );",
-    )?;
+        );"
+    ).execute(pool).await?;
 
-    let version: u32 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |row| row.get(0),
-        )
+    let version: u32 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+        .fetch_optional(pool)
+        .await?
         .unwrap_or(0);
 
     if version < 1 {
-        // Wrap DDL + version row in an explicit transaction so a partial
-        // failure leaves the schema in a clean state for the next startup.
-        conn.execute_batch(&format!(
-            "BEGIN;\n{}\nINSERT INTO schema_version (version) VALUES (1);\nCOMMIT;",
-            MIGRATION_V1
-        ))?;
+        let mut tx = pool.begin().await?;
+        // sqlx allows multiple statements in one query execution
+        sqlx::query(MIGRATION_V1).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (1)").execute(&mut *tx).await?;
+        tx.commit().await?;
     }
 
     Ok(())
@@ -79,6 +90,7 @@ CREATE TABLE IF NOT EXISTS trades (
     bankroll_change_pct TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_opp_id ON trades(opp_id);
 CREATE INDEX IF NOT EXISTS idx_trades_executed ON trades(executed_at);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -9,7 +9,7 @@ use super::metrics::Metrics;
 /// Simple HTTP health check endpoint.
 /// Returns 200 when feeds are live, 503 when data is stale.
 pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_ms: u64) {
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("127.0.0.1:{}", port); // CRIT-2: Bind to localhost to prevent external info leaks
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -22,12 +22,25 @@ pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_m
     loop {
         match listener.accept().await {
             Ok((mut stream, _)) => {
-                // Read (and discard) the HTTP request so the socket doesn't hang
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf).await;
+                // L-1 FIX: Robust HTTP header parsing using BufReader instead of fixed buffer
+                let mut req_line = String::new();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    let mut reader = tokio::io::BufReader::new(&mut stream);
+                    let _ = reader.read_line(&mut req_line).await;
+                    let mut header_line = String::new();
+                    while let Ok(n) = reader.read_line(&mut header_line).await {
+                        if n <= 2 { break; } // \r\n or \n
+                        header_line.clear();
+                    }
+                }).await;
+
+                if !req_line.starts_with("GET ") {
+                    let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+                    continue;
+                }
 
                 let ms_since_tick = metrics.ms_since_last_tick();
-                let is_healthy = ms_since_tick < stale_timeout_ms || ms_since_tick == u64::MAX && metrics.uptime_secs() < 60;
+                let is_healthy = ms_since_tick < stale_timeout_ms || (ms_since_tick == u64::MAX && metrics.uptime_secs() < 60);
 
                 let status_text = if is_healthy { "ok" } else { "degraded" };
                 let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };

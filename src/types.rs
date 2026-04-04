@@ -115,7 +115,7 @@ pub struct NormalizedTick {
     pub mid_price: Decimal,
     pub last_trade_price: Decimal,
     pub last_trade_size: Decimal,
-    pub book_depth: Vec<PriceLevel>,
+    pub book_depth: std::sync::Arc<Vec<PriceLevel>>,
     pub fee_rate_bps: u16,
     pub sequence: u64,
 }
@@ -257,6 +257,17 @@ pub struct TradeResult {
     pub approved_size: Decimal,
 }
 
+// ─── Settlement Result ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementResult {
+    pub realized_pnl: Decimal,
+    pub platform: Platform,
+    pub market_id: Uuid,
+    pub quantity: Decimal,
+    pub avg_entry_price: Decimal,
+}
+
 // ─── Position ───
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +365,7 @@ pub struct PlatformDayStats {
 
 // ─── Timestamp helper ───
 
+/// Returns nanoseconds since epoch. Cast to u64 wraps in 2554, which is acceptable.
 pub fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -369,18 +381,35 @@ pub enum SystemCommand {
     StopTrading,
     EnablePlatform(Platform),
     DisablePlatform(Platform),
+    RequestDailyReport,
+    ActivateMarket(Uuid),
 }
 
 #[derive(serde::Deserialize)]
 pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
+    pub callback_query: Option<TelegramCallbackQuery>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramCallbackQuery {
+    pub id: String,
+    pub from: TelegramUser,
+    pub message: Option<TelegramMessage>,
+    pub data: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 pub struct TelegramMessage {
     pub text: Option<String>,
     pub chat: TelegramChat,
+    pub from: Option<TelegramUser>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TelegramUser {
+    pub id: i64,
 }
 
 #[derive(serde::Deserialize)]

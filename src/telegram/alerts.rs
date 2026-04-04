@@ -38,9 +38,9 @@ impl AlertService {
 
 fn format_trade_alert(trade: &TradeResult) -> String {
     let icon = match trade.status {
-        TradeStatus::Success => "\u{2705}",
-        TradeStatus::Fail => "\u{274c}",
-        TradeStatus::Partial => "\u{26a0}\u{fe0f}",
+        TradeStatus::Success => "✅",
+        TradeStatus::Fail => "❌",
+        TradeStatus::Partial => "⚠️",
     };
 
     let label = match trade.status {
@@ -49,14 +49,14 @@ fn format_trade_alert(trade: &TradeResult) -> String {
         TradeStatus::Partial => "PARTIAL",
     };
 
-    let profit_icon = if trade.profit >= Decimal::ZERO { "\u{1f4b0}" } else { "\u{1f4b8}" };
+    let profit_icon = if trade.profit >= Decimal::ZERO { "💰" } else { "💸" };
     let profit_sign = if trade.profit >= Decimal::ZERO { "+" } else { "" };
     let pct_sign = if trade.bankroll_change_pct >= Decimal::ZERO { "+" } else { "" };
 
     let question = TelegramBot::escape_html(&trade.market_question);
 
     let mut msg = format!(
-        "{icon} <b>ARBITRAGE #{id} \u{2014} {label}</b>\n\
+        "{icon} <b>ARBITRAGE #{id} — {label}</b>\n\
          \n\
          <b>Market:</b> \"{question}\"\n\
          Leg A: BUY {side_a} @ ${price_a} on {plat_a} ({size_a} contracts)\n\
@@ -82,8 +82,8 @@ fn format_trade_alert(trade: &TradeResult) -> String {
 
     msg.push_str(&format!(
         "\n\n{profit_icon} <b>Profit: {profit_sign}${profit}</b>\n\
-         \u{1f4ca} Bankroll: ${bankroll} ({pct_sign}{pct}%)\n\
-         \u{23f1}\u{fe0f} Execution: {exec_ms}ms",
+         📊 Bankroll: ${bankroll} ({pct_sign}{pct}%)\n\
+         ⏱️ Execution: {exec_ms}ms",
         profit = trade.profit.round_dp(2),
         bankroll = trade.bankroll_after.round_dp(2),
         pct = trade.bankroll_change_pct.round_dp(4),
@@ -91,7 +91,7 @@ fn format_trade_alert(trade: &TradeResult) -> String {
     ));
 
     if let Some(reason) = &trade.failure_reason {
-        msg.push_str(&format!("\n\u{1f50d} Reason: {}", TelegramBot::escape_html(reason)));
+        msg.push_str(&format!("\n🔍 Reason: {}", TelegramBot::escape_html(reason)));
     }
 
     msg
@@ -104,7 +104,7 @@ fn format_circuit_breaker(
     resume_at: Option<&chrono::DateTime<chrono::Utc>>,
 ) -> String {
     let mut msg = format!(
-        "\u{1f6a8} <b>CIRCUIT BREAKER TRIGGERED</b>\n\
+        "🚨 <b>CIRCUIT BREAKER TRIGGERED</b>\n\
          \n\
          <b>Type:</b> {}\n\
          <b>Details:</b> {}\n\
@@ -123,10 +123,10 @@ fn format_circuit_breaker(
 
 fn format_system_alert(severity: &str, message: &str) -> String {
     let icon = match severity.to_lowercase().as_str() {
-        "critical" | "p1" => "\u{1f534}",
-        "warning" | "p2" => "\u{1f7e1}",
-        "info" | "p3" => "\u{1f535}",
-        _ => "\u{26aa}",
+        "critical" | "p1" => "🔴",
+        "warning" | "p2" => "🟡",
+        "info" | "p3" => "🔵",
+        _ => "⚪",
     };
 
     format!(

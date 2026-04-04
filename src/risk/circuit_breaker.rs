@@ -33,6 +33,7 @@ pub struct CircuitBreakers {
     current_gas_gwei: u64,
     /// CB7 state: running count of consecutive failures (reset on success)
     consecutive_failures: usize,
+    engine_start_time: DateTime<Utc>,
 }
 
 impl CircuitBreakers {
@@ -62,7 +63,27 @@ impl CircuitBreakers {
             exec_successes: VecDeque::new(),
             current_gas_gwei: 50,
             consecutive_failures: 0,
+            engine_start_time: Utc::now(),
         }
+    }
+
+    pub fn update_limits(
+        &mut self,
+        max_single_trade_pct: Decimal,
+        max_daily_loss_pct: Decimal,
+        max_drawdown_pct: Decimal,
+        max_platform_exposure_pct: Decimal,
+        gas_price_max_gwei: u64,
+        stale_feed_timeout_secs: u64,
+        max_open_positions: usize,
+    ) {
+        self.max_single_trade_pct = max_single_trade_pct;
+        self.max_daily_loss_pct = max_daily_loss_pct;
+        self.max_drawdown_pct = max_drawdown_pct;
+        self.max_platform_exposure_pct = max_platform_exposure_pct;
+        self.gas_price_max_gwei = gas_price_max_gwei;
+        self.stale_feed_timeout_ms = stale_feed_timeout_secs * 1000;
+        self.max_open_positions = max_open_positions;
     }
 
     pub fn is_trading_halted(&mut self) -> bool {
@@ -93,10 +114,11 @@ impl CircuitBreakers {
             self.consecutive_failures += 1;
         }
         let cutoff = now - Duration::hours(1);
-        while self.exec_failures.front().map(|t| *t < cutoff).unwrap_or(false) {
+        // HIGH-2: Add a hard cap of 500 to prevent unbounded growth during failure storms
+        while self.exec_failures.front().map(|t| *t < cutoff).unwrap_or(false) || self.exec_failures.len() > 500 {
             self.exec_failures.pop_front();
         }
-        while self.exec_successes.front().map(|t| *t < cutoff).unwrap_or(false) {
+        while self.exec_successes.front().map(|t| *t < cutoff).unwrap_or(false) || self.exec_successes.len() > 500 {
             self.exec_successes.pop_front();
         }
     }
@@ -216,6 +238,8 @@ impl CircuitBreakers {
         // CB7: Consecutive Failure Streak
         if self.consecutive_failures >= self.max_consecutive_failures {
             let resume = Utc::now() + Duration::minutes(10);
+            self.trading_halted = true;
+            self.halt_resume_at = Some(resume);
             trips.push(BreakerTrip {
                 breaker_type: "CB7: Consecutive Failures".into(),
                 details: format!("{} consecutive failed trades (limit {})",
@@ -236,15 +260,18 @@ impl CircuitBreakers {
             });
         }
 
-        // CB9: Stale Feed Data
-        if ms_since_last_tick > self.stale_feed_timeout_ms && ms_since_last_tick != u64::MAX {
-            trips.push(BreakerTrip {
-                breaker_type: "CB9: Stale Feed".into(),
-                details: format!("No tick received for {}ms (limit {}ms)",
-                    ms_since_last_tick, self.stale_feed_timeout_ms),
-                action: "Halt trading — market data may be stale".into(),
-                resume_at: None,
-            });
+        // CB9: Stale Feed Data (CRITICAL FIX 3-E)
+        let uptime_ms = (Utc::now() - self.engine_start_time).num_milliseconds() as u64;
+        if uptime_ms > self.stale_feed_timeout_ms {
+            if ms_since_last_tick > self.stale_feed_timeout_ms && ms_since_last_tick != u64::MAX {
+                trips.push(BreakerTrip {
+                    breaker_type: "CB9: Stale Feed".into(),
+                    details: format!("No tick received for {}ms (limit {}ms)",
+                        ms_since_last_tick, self.stale_feed_timeout_ms),
+                    action: "Halt trading — market data may be stale".into(),
+                    resume_at: None,
+                });
+            }
         }
 
         // CB10: Max Open Positions
@@ -283,3 +310,65 @@ impl CircuitBreakers {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_circuit_breaker_trade_size() {
+        let mut cb = CircuitBreakers::new(
+            dec!(0.05), // 5% max single trade
+            dec!(0.10),
+            dec!(0.20),
+            dec!(0.50),
+            100,
+            5,
+            10,
+        );
+
+        // Trade size 600 out of 10000 bankroll is 6%, which exceeds 5% limit
+        let trips = cb.check_all(
+            dec!(600),
+            dec!(10000),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            0,
+            false,
+            100,
+            dec!(0),
+        );
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].breaker_type, "CB1: Max Single Trade Size");
+    }
+
+    #[test]
+    fn test_circuit_breaker_platform_exposure() {
+        let mut cb = CircuitBreakers::new(
+            dec!(0.05),
+            dec!(0.10),
+            dec!(0.20),
+            dec!(0.30), // 30% max platform exposure
+            100,
+            5,
+            10,
+        );
+
+        // Platform exposure is 35% (0.35)
+        let trips = cb.check_all(
+                dec!(100),
+                dec!(10000),
+                dec!(0),
+                dec!(0),
+                dec!(0.35),
+                0,
+                false,
+                100,
+                dec!(0),
+            );
+            assert_eq!(trips.len(), 1);
+            assert_eq!(trips[0].breaker_type, "CB4: Max Platform Exposure");
+        }
+    }

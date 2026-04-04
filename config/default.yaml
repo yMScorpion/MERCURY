@@ -32,7 +32,7 @@ platforms:
     fix_port: 0
 
 database:
-  path: "mercury.db"
+  path: "/opt/mercury/data/mercury.db"
   pool_size: 4
   busy_timeout_ms: 5000
 

@@ -37,6 +37,7 @@ pub struct ArbitrageDetector {
     max_concurrent: usize,
     active_arbs: usize,
     pub stats: DetectorStats,
+    paused_until_ns: u64,
 }
 
 impl ArbitrageDetector {
@@ -53,7 +54,18 @@ impl ArbitrageDetector {
             max_concurrent,
             active_arbs: 0,
             stats: DetectorStats::default(),
+            paused_until_ns: 0,
         }
+    }
+
+    pub fn pause_detection_until(&mut self, ns: u64) {
+        self.paused_until_ns = ns;
+    }
+
+    pub fn update_thresholds(&mut self, min_spread: Decimal, stale_timeout_ms: u64, max_concurrent: usize) {
+        self.min_spread = min_spread;
+        self.stale_timeout_ms = stale_timeout_ms;
+        self.max_concurrent = max_concurrent;
     }
 
     pub fn set_active_arbs(&mut self, count: usize) {
@@ -71,7 +83,18 @@ impl ArbitrageDetector {
     ) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::new();
 
-    for pair in registry.get_arb_pairs().iter().filter(|p| p.market_id == *market_id) {
+        // HIGH-1 FIX: Do not evaluate spreads if the engine is in a cooldown period
+        // (e.g., recovering from a broadcast::Lagged event repopulating the order books).
+        if crate::types::now_ns() < self.paused_until_ns {
+            return opportunities;
+        }
+
+        let pairs = match registry.get_arb_pairs_for_market(market_id) {
+            Some(p) => p,
+            None => return opportunities,
+        };
+
+        for pair in pairs {
             // CRITICAL FIX: The Time-to-Maturity Trap
             // Do not evaluate spreads if the market resolves in less than 60 seconds.
             // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 
@@ -108,12 +131,12 @@ impl ArbitrageDetector {
                         let (plat_id_a, fee_bps_a) = if let Some(i) = info_a { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
                         let (plat_id_b, fee_bps_b) = if let Some(i) = info_b { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
 
-                        let market_question = registry.get_market(&pair.market_id)
-                            .map(|m| m.question.clone())
-                            .unwrap_or_default();
-
                         let liquidity = spread.leg_a_available.min(spread.leg_b_available);
                         let log_liq = if liquidity > Decimal::ZERO {
+                            // HIGH-3 FIX: Accepted f64 imprecision with explicit documentation.
+                            // Rust Decimal lacks a native ln() function. The floating-point conversion here 
+                            // only impacts the relative ranking queue of opportunities (the score), 
+                            // not the actual financial math, risk limits, or threshold gates.
                             // Add 1.0 to the natural log so a liquidity of 1.0 yields a multiplier of 1.0 (ln(1) = 0 + 1 = 1)
                             let val = liquidity.to_f64().unwrap_or(1.0).ln() + 1.0;
                             // Natively cast f64 to Decimal to eliminate string allocation in the hot path
@@ -127,7 +150,7 @@ impl ArbitrageDetector {
                         opportunities.push(ArbitrageOpportunity {
                             opp_id: Uuid::new_v4(),
                             market_id: spread.market_id,
-                            market_question,
+                            market_question: String::new(), // M-9 FIX: Defer allocation until after truncation
                             leg_a: LegDetail {
                                 platform: spread.leg_a_platform,
                                 side: spread.leg_a_side,
@@ -149,12 +172,12 @@ impl ArbitrageDetector {
                             raw_spread: spread.raw_spread,
                             net_spread: spread.net_spread,
                             kelly_fraction: Decimal::ZERO, 
-                            // CRITICAL FIX: Pass the actual available orderbook depth to the main loop 
-                            // so the execution engine doesn't attempt to size larger than available liquidity.
                             recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
                             score,
                             detected_at: now_ns(),
-                            ttl_ms: 5000,
+                            // FIX: Reduce Time-to-Live to 200ms. If the execution queue backs up,
+                            // prices will move. Drops stale arbs before they execute at a loss.
+                            ttl_ms: 200,
                         });
                     }
                     Err(reason) => {
@@ -167,6 +190,13 @@ impl ArbitrageDetector {
         opportunities.sort_by(|a, b| b.score.cmp(&a.score));
         let slots = self.max_concurrent.saturating_sub(self.active_arbs);
         opportunities.truncate(slots);
+
+        // M-9 FIX: Allocate strings only for the opportunities that actually made the cut
+        for opp in &mut opportunities {
+            if let Some(market) = registry.get_market(&opp.market_id) {
+                opp.market_question = market.question.clone();
+            }
+        }
 
         opportunities
     }

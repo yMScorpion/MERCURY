@@ -45,6 +45,10 @@ impl NetSpreadEngine {
         }
     }
 
+    pub fn update_threshold(&mut self, min_threshold: Decimal) {
+        self.min_threshold = min_threshold;
+    }
+
     pub fn update_gas_price(&mut self, gwei: Decimal) {
         self.gas_price_gwei = gwei;
     }
@@ -63,14 +67,11 @@ impl NetSpreadEngine {
         let mut results = Vec::new();
 
         // Direction 1: Buy YES on A, Buy NO on B
-        if let (Some((ask_a, _)), Some((bid_b, _))) = (book_a.best_ask(), book_b.best_bid()) {
+        if let (Some((ask_a, ask_a_size)), Some((bid_b, bid_b_size))) = (book_a.best_ask(), book_b.best_bid()) {
             let ask_b_no = Decimal::ONE - bid_b;
             let raw_spread = Decimal::ONE - ask_a - ask_b_no;
 
             if raw_spread > Decimal::ZERO {
-                // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
-                // This allows the VWAP estimator to correctly "walk the book" and consume 
-                // deeper liquidity if the total spread remains profitable.
                 let depth_a = book_a.ask_depth();
                 let depth_b = book_b.bid_depth();
                 let total_a: Decimal = depth_a.iter().map(|l| l.size).sum();
@@ -79,22 +80,19 @@ impl NetSpreadEngine {
                 let actual_target = total_a.min(total_b).min(target_size);
 
                 let fee_a = self.compute_fee(book_a.platform, ask_a, actual_target, book_a.fee_rate_bps);
-
                 let fee_b = self.compute_fee(book_b.platform, ask_b_no, actual_target, book_b.fee_rate_bps);
+                
                 match (
-                    normalizer::estimate_slippage(actual_target, &book_a.ask_depth()),
-                    normalizer::estimate_slippage(actual_target, &book_b.bid_depth()),
+                    normalizer::estimate_slippage(actual_target, &depth_a),
+                    normalizer::estimate_slippage(actual_target, &depth_b),
                 ) {
-                (Some(slippage_a), Some(slippage_b)) => {
+                    (Some(slippage_a), Some(slippage_b)) => {
                         let gas = self.gas_cost_if_onchain(book_a.platform, book_b.platform);
                         
-                        // CRITICAL FIX: Mathematical Unit Mismatch.
-                        // `raw_spread` and `slippage` are per-contract limits (e.g., 0.02).
-                        // `fee_a`, `fee_b`, and `gas` are absolute dollar totals for the entire trade (e.g., $1.20).
-                        // We MUST normalize them into per-contract percentages by dividing by `target_size`.
-                        let per_contract_fee_a = fee_a / target_size;
-                        let per_contract_fee_b = fee_b / target_size;
-                        let per_contract_gas = gas / target_size;
+                        // FIX: Normalize against actual_target to prevent artificial spread inflation
+                        let per_contract_fee_a = fee_a / actual_target;
+                        let per_contract_fee_b = fee_b / actual_target;
+                        let per_contract_gas = gas / actual_target;
 
                         let net_spread = raw_spread - per_contract_fee_a - per_contract_fee_b - slippage_a - slippage_b - per_contract_gas;
 
@@ -131,7 +129,7 @@ impl NetSpreadEngine {
         }
 
         // Direction 2: Buy NO on A, Buy YES on B
-        if let (Some((bid_a, _)), Some((ask_b, _))) = (book_a.best_bid(), book_b.best_ask()) {
+        if let (Some((bid_a, bid_a_size)), Some((ask_b, ask_b_size))) = (book_a.best_bid(), book_b.best_ask()) {
             let ask_a_no = Decimal::ONE - bid_a;
             let raw_spread = Decimal::ONE - ask_a_no - ask_b;
 
@@ -235,9 +233,21 @@ impl NetSpreadEngine {
             return Decimal::ZERO;
         }
 
-        // CRITICAL FIX: If both legs are on-chain, we pay gas twice (400,000 units).
-        let gas_units = Decimal::from(200_000) * tx_count;
+        // CRITICAL FIX (3-B): Update empirical gas limit. 
+        // 200k was an overestimate; CTF exchange averages 120k-150k.
+        let gas_units = Decimal::from(150_000) * tx_count;
         let gwei_to_matic = dec!(0.000000001); // 1 gwei = 10^-9 MATIC
         self.gas_price_gwei * gas_units * gwei_to_matic * self.matic_price_usd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_gas_cost_offchain() {
+        let engine = NetSpreadEngine::new(dec!(0.01));
+        // Kalshi <-> CDNA trade uses zero gas
+        assert_eq!(engine.gas_cost_if_onchain(Platform::Kalshi, Platform::Cdna), Decimal::ZERO);
     }
 }

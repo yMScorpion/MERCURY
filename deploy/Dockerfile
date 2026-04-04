@@ -1,4 +1,4 @@
-FROM rust:1.82-slim AS builder
+FROM rust:1.82-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
@@ -13,5 +13,5 @@ RUN mkdir -p /opt/mercury/data /opt/mercury/logs /opt/mercury/keys && \
     chown -R mercury:mercury /opt/mercury
 USER mercury
 WORKDIR /opt/mercury
-EXPOSE 8080
+EXPOSE 9090
 CMD ["/opt/mercury/mercury", "--config", "/opt/mercury/config/default.yaml"]

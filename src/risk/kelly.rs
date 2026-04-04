@@ -6,15 +6,28 @@ pub struct KellyCalculator {
     fraction: Decimal,
     min_fraction: Decimal,
     max_fraction: Decimal,
+    config_max_fraction: Decimal,
+    pub arb_loss_fraction: Decimal, // LOW-10
+    hard_cap: Decimal,
 }
 
 impl KellyCalculator {
-    pub fn new(fraction: Decimal) -> Self {
+    pub fn new(fraction: Decimal, hard_cap: Decimal) -> Self {
         Self {
             fraction,
             min_fraction: dec!(0.05),
-            max_fraction: dec!(0.50),
+            max_fraction: fraction,
+            config_max_fraction: fraction,
+            arb_loss_fraction: dec!(0.005),
+            hard_cap,
         }
+    }
+
+    pub fn update_fraction(&mut self, fraction: Decimal, hard_cap: Decimal) {
+        // MED-9: Do not reset current fraction immediately if in drawdown
+        self.config_max_fraction = fraction;
+        self.max_fraction = fraction;
+        self.hard_cap = hard_cap;
     }
 
     pub fn set_fraction(&mut self, fraction: Decimal) {
@@ -35,12 +48,12 @@ impl KellyCalculator {
         // failed leg (~0.5% of notional), not the full notional.  Using net_spread
         // as `b` in the standard formula (which assumes full-notional loss) produces
         // near-zero fractions for any realistic spread and kills all trading.
-        let arb_loss_fraction = dec!(0.005); // 0.5 % max loss on execution failure
+        let arb_loss_fraction = self.arb_loss_fraction; // LOW-10
         let full_kelly = (p * net_spread - q * arb_loss_fraction) / (net_spread + arb_loss_fraction);
         if full_kelly <= Decimal::ZERO {
             return Decimal::ZERO;
         }
-        (full_kelly * self.fraction).max(Decimal::ZERO).min(dec!(0.10))
+        (full_kelly * self.fraction).max(Decimal::ZERO).min(self.hard_cap)
     }
 
     pub fn position_size(
@@ -95,10 +108,27 @@ impl KellyCalculator {
             self.set_fraction(dec!(0.20));
         } else {
             // Drawdown ≤ 5 %: fully recovered — restore to max fraction.
-            // Without this branch the fraction is a one-way ratchet: it reduces on any
-            // drawdown day but never recovers, causing permanent under-trading after
-            // any loss event.
+            self.max_fraction = self.config_max_fraction; // MED-9: Restore config ceiling
             self.set_fraction(self.max_fraction);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_optimal_fraction() {
+        let calc = KellyCalculator::new(dec!(0.10), dec!(0.10));
+        // High win prob, positive spread => > 0
+        let frac = calc.optimal_fraction(dec!(0.90), dec!(0.05));
+        assert!(frac > Decimal::ZERO);
+        assert!(frac <= dec!(0.10));
+
+        // Low win prob, negative spread => 0
+        let frac_bad = calc.optimal_fraction(dec!(0.10), dec!(-0.05));
+        assert_eq!(frac_bad, Decimal::ZERO);
     }
 }

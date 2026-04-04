@@ -17,7 +17,7 @@ pub struct MercuryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradingConfig {
-    pub kelly_fraction_multiplier: f64,
+    pub kelly_fraction_multiplier: Decimal,
     pub min_net_spread_threshold: Decimal,
     pub max_single_trade_pct: Decimal,
     pub max_daily_loss_pct: Decimal,
@@ -111,9 +111,16 @@ impl MercuryConfig {
 
     pub fn validate(&self) -> Result<()> {
         let t = &self.trading;
+        
+        // HIGH-5 FIX: Prevent zero-timeout configurations that would permanently halt trading
+        anyhow::ensure!(t.stale_data_timeout_ms >= 1000,
+            "stale_data_timeout_ms must be at least 1000ms, got {}", t.stale_data_timeout_ms);
+        anyhow::ensure!(t.min_net_spread_threshold > Decimal::ZERO,
+            "min_net_spread_threshold must be positive, got {}", t.min_net_spread_threshold);
+            
         anyhow::ensure!(t.initial_bankroll > Decimal::ZERO,
             "initial_bankroll must be positive, got {}", t.initial_bankroll);
-        anyhow::ensure!(t.kelly_fraction_multiplier > 0.0 && t.kelly_fraction_multiplier <= 1.0,
+        anyhow::ensure!(t.kelly_fraction_multiplier > Decimal::ZERO && t.kelly_fraction_multiplier <= Decimal::ONE,
             "kelly_fraction_multiplier must be in (0, 1], got {}", t.kelly_fraction_multiplier);
         anyhow::ensure!(t.max_daily_loss_pct > Decimal::ZERO && t.max_daily_loss_pct <= Decimal::ONE,
             "max_daily_loss_pct must be in (0, 1] (fraction scale), got {}", t.max_daily_loss_pct);
@@ -182,12 +189,15 @@ impl ConfigManager {
     }
 
     pub fn get(&self) -> MercuryConfig {
-        self.inner.read().unwrap().clone()
+        match self.inner.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     pub fn reload(&self) -> Result<()> {
         let new_config = MercuryConfig::load(&self.path)?;
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         *guard = new_config;
         info!("Configuration reloaded from {}", self.path);
         Ok(())

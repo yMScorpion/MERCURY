@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::types::*;
@@ -9,8 +9,8 @@ use crate::types::*;
 pub struct PlatformBook {
     pub platform: Platform,
     pub market_id: Uuid,
-    pub bids: BTreeMap<Decimal, Decimal>,
-    pub asks: BTreeMap<Decimal, Decimal>,
+    pub bids: std::collections::BTreeMap<Decimal, Decimal>,
+    pub asks: std::collections::BTreeMap<Decimal, Decimal>,
     pub last_update_ns: u64,
     pub fee_rate_bps: u16,
     pub sequence: u64,
@@ -21,8 +21,8 @@ impl PlatformBook {
         Self {
             platform,
             market_id,
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            bids: std::collections::BTreeMap::new(),
+            asks: std::collections::BTreeMap::new(),
             last_update_ns: 0,
             fee_rate_bps: 0,
             sequence: 0,
@@ -30,11 +30,11 @@ impl PlatformBook {
     }
 
     pub fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
+        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
     }
 
     pub fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(p, s)| (*p, *s))
+        self.asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
     pub fn mid_price(&self) -> Decimal {
@@ -47,11 +47,11 @@ impl PlatformBook {
     }
 
     pub fn ask_depth(&self) -> Vec<PriceLevel> {
-        self.asks.iter().take(10).map(|(p, s)| PriceLevel { price: *p, size: *s }).collect()
+        self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
     }
 
     pub fn bid_depth(&self) -> Vec<PriceLevel> {
-        self.bids.iter().rev().take(10).map(|(p, s)| PriceLevel { price: *p, size: *s }).collect()
+        self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }).collect()
     }
 
     pub fn is_stale(&self, timeout_ns: u64) -> bool {
@@ -70,10 +70,28 @@ impl PlatformBook {
             return;
         }
 
-        self.bids.clear();
-        self.asks.clear();
+        // M-1 FIX: Avoid BTreeMap allocation churn by retaining existing nodes instead of clear()
+        self.bids.retain(|k, _| {
+            if *k == tick.bid_price { return true; }
+            tick.book_depth.iter().any(|l| {
+                if &l.price != k { return false; }
+                if l.price <= tick.bid_price { return true; }
+                if l.price < tick.ask_price && (tick.ask_price - l.price >= l.price - tick.bid_price) { return true; }
+                false
+            })
+        });
+        
+        self.asks.retain(|k, _| {
+            if *k == tick.ask_price { return true; }
+            tick.book_depth.iter().any(|l| {
+                if &l.price != k { return false; }
+                if l.price >= tick.ask_price { return true; }
+                if l.price > tick.bid_price && (tick.ask_price - l.price < l.price - tick.bid_price) { return true; }
+                false
+            })
+        });
 
-        for level in &tick.book_depth {
+        for level in tick.book_depth.iter() {
             if level.price <= tick.bid_price {
                 self.bids.insert(level.price, level.size);
             } else if level.price >= tick.ask_price {
@@ -113,6 +131,10 @@ pub struct UnifiedOrderBook {
 impl UnifiedOrderBook {
     pub fn new() -> Self {
         Self { books: HashMap::new() }
+    }
+
+    pub fn clear(&mut self) {
+        self.books.clear();
     }
 
     pub fn update(&mut self, tick: &NormalizedTick) {

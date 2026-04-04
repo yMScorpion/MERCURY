@@ -11,7 +11,7 @@ use serde_json::json;
 pub struct SettlementMonitor {
     db: Arc<dyn Database>,
     alert_tx: mpsc::Sender<AlertMessage>,
-    settlement_tx: mpsc::Sender<Decimal>,
+    settlement_tx: mpsc::Sender<SettlementResult>,
     check_interval: Duration,
     kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
 }
@@ -20,7 +20,7 @@ impl SettlementMonitor {
     pub fn new(
         db: Arc<dyn Database>, 
         alert_tx: mpsc::Sender<AlertMessage>, 
-        settlement_tx: mpsc::Sender<Decimal>,
+        settlement_tx: mpsc::Sender<SettlementResult>,
         check_interval_secs: u64,
         kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
     ) -> Self {
@@ -53,13 +53,23 @@ impl SettlementMonitor {
                         if let Some(info) = market.platforms.get(&position.platform) {
                             if position.platform == Platform::Kalshi {
                                 if let Some(client) = &self.kalshi_client {
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                                     if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
                                         realized_pnl = pnl;
                                     }
                                 }
+                            } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
+                                tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
+                                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                    severity: "critical".into(),
+                                    message: format!("Position #{} on {} resolved. Position closed in DB, but MANUAL PnL CREDIT REQUIRED to bankroll.", position.id, position.platform),
+                                });
+                                // Fix: Close position in DB to prevent infinite settlement loops, but skip automated realization.
+                                if let Err(e) = self.db.close_position(position.id).await {
+                                    tracing::error!(error = %e, "Failed to close position in DB");
+                                }
+                                continue; 
                             }
-                            // Note: Polymarket settlements are processed on-chain via USDC redemption.
-                            // Assuming total loss here until the Web3 provider tracks the specific ERC1155 burn event.
                         }
                         
                         let audit = AuditEntry {
@@ -79,7 +89,13 @@ impl SettlementMonitor {
                             warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
                         }
                         
-                        let _ = self.settlement_tx.try_send(realized_pnl);
+                        let _ = self.settlement_tx.try_send(SettlementResult {
+                            realized_pnl,
+                            platform: position.platform,
+                            market_id: position.market_id,
+                            quantity: position.quantity,
+                            avg_entry_price: position.avg_entry_price,
+                        });
                         self.db.close_position(position.id).await?;
                         
                         let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {

@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
@@ -16,44 +15,39 @@ use crate::types::*;
 
 pub struct CdnaFeed {
     config: CdnaConfig,
-    subscriptions: Vec<(String, Uuid)>,
+    subscriptions: std::collections::HashMap<String, Uuid>,
+    fee_rates: std::collections::HashMap<String, u16>,
     books: std::collections::HashMap<String, CdnaOrderBook>,
     sequence: u64,
     request_id: u64,
 }
 
 struct CdnaOrderBook {
-    bids: BTreeMap<Decimal, Decimal>,
-    asks: BTreeMap<Decimal, Decimal>,
+    bids: std::collections::BTreeMap<Decimal, Decimal>,
+    asks: std::collections::BTreeMap<Decimal, Decimal>,
 }
 
 impl CdnaOrderBook {
-    fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new() } }
+    fn new() -> Self { Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new() } }
 
-    /// Returns best bid only if non-empty — never returns phantom (0, 0) fallback.
     fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
+        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
     }
 
-    /// Returns best ask only if non-empty — never returns phantom (1.0, 0) fallback.
     fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(p, s)| (*p, *s))
+        self.asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
-    /// Returns mid-price only when both sides have real liquidity.
     fn mid_price(&self) -> Option<Decimal> {
         let (b, _) = self.best_bid()?;
         let (a, _) = self.best_ask()?;
-        Some((b + a) / Decimal::from(2))
+        Some((b + a) / rust_decimal::Decimal::from(2))
     }
+    
     fn depth(&self) -> Vec<PriceLevel> {
         let mut levels = Vec::new();
-        for (p, s) in self.bids.iter().rev().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
-        for (p, s) in self.asks.iter().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
+        levels.extend(self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
+        levels.extend(self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
         levels
     }
 }
@@ -71,10 +65,17 @@ struct CdnaSubParams {
 }
 
 impl CdnaFeed {
-    pub fn new(config: CdnaConfig, subscriptions: Vec<(String, Uuid)>) -> Self {
+    pub fn new(config: CdnaConfig, subscriptions: Vec<(String, Uuid, u16)>) -> Self {
+        let mut subs = std::collections::HashMap::new();
+        let mut fees = std::collections::HashMap::new();
+        for (inst, id, fee) in subscriptions {
+            subs.insert(inst.clone(), id);
+            fees.insert(inst, fee);
+        }
         Self {
             config,
-            subscriptions,
+            subscriptions: subs,
+            fee_rates: fees,
             books: std::collections::HashMap::new(),
             sequence: 0,
             request_id: 1,
@@ -82,9 +83,7 @@ impl CdnaFeed {
     }
 
     fn instrument_to_market_id(&self, instrument: &str) -> Option<Uuid> {
-        self.subscriptions.iter()
-            .find(|(i, _)| i == instrument)
-            .map(|(_, id)| *id)
+        self.subscriptions.get(instrument).copied()
     }
 
     fn emit_tick(&self, instrument: &str) -> Option<NormalizedTick> {
@@ -107,8 +106,8 @@ impl CdnaFeed {
             mid_price: mid,
             last_trade_price: Decimal::ZERO,
             last_trade_size: Decimal::ZERO,
-            book_depth: book.depth(),
-            fee_rate_bps: 150,
+            book_depth: std::sync::Arc::new(book.depth()),
+            fee_rate_bps: self.fee_rates.get(instrument).copied().unwrap_or(150),
             sequence: 0,
         })
     }
@@ -131,10 +130,15 @@ impl FeedHandler for CdnaFeed {
         let url = &self.config.ws_url;
         info!(url, "Connecting to CDNA WebSocket");
 
-        let tls_connector = native_tls::TlsConnector::builder()
-            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-            .build()
-            .context("Failed to build CDNA TLS connector")?;
+        let mut tls_builder = native_tls::TlsConnector::builder();
+        tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+        // M-8 FIX: Explicit TLS Cert Pinning
+        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+            if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
+                tls_builder.add_root_certificate(cert);
+            }
+        }
+        let tls_connector = tls_builder.build().context("Failed to build CDNA TLS connector")?;
         let (ws_stream, _) = connect_async_tls_with_config(
             url, None, false, Some(Connector::NativeTls(tls_connector)),
         )
@@ -143,8 +147,8 @@ impl FeedHandler for CdnaFeed {
 
         let (mut write, mut read) = ws_stream.split();
 
-        let channels: Vec<String> = self.subscriptions.iter()
-            .map(|(instrument, _)| format!("book.{}", instrument))
+        let channels: Vec<String> = self.subscriptions.keys()
+            .map(|instrument| format!("book.{}", instrument))
             .collect();
 
         if !channels.is_empty() {
@@ -159,7 +163,7 @@ impl FeedHandler for CdnaFeed {
             info!(count = channels.len(), "Subscribed to CDNA channels");
         }
 
-        for (instrument, _) in &self.subscriptions {
+        for instrument in self.subscriptions.keys() {
             self.books.entry(instrument.clone()).or_insert_with(CdnaOrderBook::new);
         }
 

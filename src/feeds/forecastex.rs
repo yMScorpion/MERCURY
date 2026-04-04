@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -22,42 +21,35 @@ pub struct ForecastExFeed {
     msg_seq_num: u64,
     sender_comp_id: String,
     target_comp_id: String,
+    expected_seq_num: u64,
 }
 
 struct FexOrderBook {
-    bids: BTreeMap<Decimal, Decimal>,
-    asks: BTreeMap<Decimal, Decimal>,
+    bids: std::collections::BTreeMap<Decimal, Decimal>,
+    asks: std::collections::BTreeMap<Decimal, Decimal>,
 }
 
 impl FexOrderBook {
-    fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new() } }
+    fn new() -> Self { Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new() } }
 
-    /// Returns the best bid (price, size) only if the bid side is non-empty.
-    /// Never returns a phantom (0, 0) fallback — callers must handle None.
     fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(p, s)| (*p, *s))
+        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
     }
 
-    /// Returns the best ask (price, size) only if the ask side is non-empty.
-    /// Never returns a phantom (1.0, 0) fallback — callers must handle None.
     fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(p, s)| (*p, *s))
+        self.asks.iter().next().map(|(&p, &s)| (p, s))
     }
 
-    /// Returns mid-price only when both sides have real liquidity.
     fn mid_price(&self) -> Option<Decimal> {
         let (b, _) = self.best_bid()?;
         let (a, _) = self.best_ask()?;
-        Some((b + a) / Decimal::from(2))
+        Some((b + a) / rust_decimal::Decimal::from(2))
     }
+    
     fn depth(&self) -> Vec<PriceLevel> {
         let mut levels = Vec::new();
-        for (p, s) in self.bids.iter().rev().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
-        for (p, s) in self.asks.iter().take(10) {
-            levels.push(PriceLevel { price: *p, size: *s });
-        }
+        levels.extend(self.bids.iter().rev().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
+        levels.extend(self.asks.iter().take(10).map(|(&p, &s)| PriceLevel { price: p, size: s }));
         levels
     }
 }
@@ -74,6 +66,7 @@ impl ForecastExFeed {
             msg_seq_num: 1,
             sender_comp_id: std::env::var("FEX_SENDER_COMP_ID").unwrap_or_else(|_| "MERCURY".into()),
             target_comp_id: std::env::var("FEX_TARGET_COMP_ID").unwrap_or_else(|_| "FORECASTEX".into()),
+            expected_seq_num: 0,
         }
     }
 
@@ -104,7 +97,7 @@ impl ForecastExFeed {
             mid_price: mid,
             last_trade_price: Decimal::ZERO,
             last_trade_size: Decimal::ZERO,
-            book_depth: book.depth(),
+            book_depth: std::sync::Arc::new(book.depth()),
             fee_rate_bps: 0,
             sequence: 0,
         })
@@ -130,6 +123,23 @@ impl ForecastExFeed {
 
     fn parse_fix_fields(msg: &str) -> std::collections::HashMap<u32, String> {
         let mut fields = std::collections::HashMap::new();
+        
+        // MED-4: Validate Checksum (Tag 10)
+        if let Some(csum_idx) = msg.find("10=") {
+            let body_to_checksum = &msg[..csum_idx];
+            let expected_checksum: u32 = body_to_checksum.bytes().map(|b| b as u32).sum::<u32>() % 256;
+            
+            let end_idx = msg[csum_idx..].find(SOH).unwrap_or(msg.len() - csum_idx);
+            let provided_checksum_str = &msg[csum_idx + 3 .. csum_idx + end_idx];
+            
+            if let Ok(provided_checksum) = provided_checksum_str.parse::<u32>() {
+                if expected_checksum != provided_checksum {
+                    tracing::warn!("FIX Checksum mismatch: expected {}, got {}", expected_checksum, provided_checksum);
+                    return fields; // Reject corrupt message
+                }
+            }
+        }
+
         for part in msg.split(SOH) {
             if let Some(eq_pos) = part.find('=') {
                 if let Ok(tag) = part[..eq_pos].parse::<u32>() {
@@ -166,8 +176,19 @@ impl FeedHandler for ForecastExFeed {
         let stream = TcpStream::connect(&addr)
             .await
             .context("Failed to connect to ForecastEx FIX gateway")?;
+            
+        let mut tls_builder = native_tls::TlsConnector::builder();
+        // M-8 FIX: Explicit TLS Cert Pinning
+        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+            if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
+                tls_builder.add_root_certificate(cert);
+            }
+        }
+        let tls_connector = tls_builder.build().context("Failed to build TLS")?;
+        let tokio_tls = tokio_native_tls::TlsConnector::from(tls_connector);
+        let tls_stream = tokio_tls.connect(&self.config.fix_host, stream).await.context("TLS handshake failed")?;
 
-        let (reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = tokio::io::split(tls_stream);
         let mut buf_reader = BufReader::new(reader);
 
         // Send Logon (35=A)
@@ -204,41 +225,63 @@ impl FeedHandler for ForecastExFeed {
         }
         info!(count = self.subscriptions.len(), "FIX market data requests sent");
 
+        let mut msg_buf = Vec::new();
         let mut line_buf = String::new();
         loop {
-            line_buf.clear();
+            msg_buf.clear();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(45),
-                buf_reader.read_line(&mut line_buf),
+                buf_reader.read_until(SOH as u8, &mut msg_buf),
             ).await {
                 Ok(Ok(0)) => {
                     info!("FIX connection closed");
                     return Ok(());
                 }
                 Ok(Ok(_)) => {
-                    let fields = Self::parse_fix_fields(&line_buf);
-                    let msg_type = fields.get(&35).map(|s| s.as_str()).unwrap_or("");
+                    let field = String::from_utf8_lossy(&msg_buf);
+                    line_buf.push_str(&field);
 
-                    match msg_type {
-                        "W" | "X" => {
-                            self.handle_market_data(&fields, &line_buf, &tick_tx);
+                    if line_buf.contains("\x0110=") && line_buf.ends_with('\x01') {
+                        let fields = Self::parse_fix_fields(&line_buf);
+                        let msg_type = fields.get(&35).map(|s| s.as_str()).unwrap_or("");
+
+                        // HIGH-2 FIX: Session-Level Sequence Validation
+                        let seq_str = fields.get(&34).map(|s| s.as_str()).unwrap_or("0");
+                        let seq_num = seq_str.parse::<u64>().unwrap_or(0);
+                        if seq_num > 0 {
+                            if seq_num < self.expected_seq_num {
+                                tracing::warn!("FIX Sequence error: expected {}, got {}", self.expected_seq_num, seq_num);
+                            } else if seq_num > self.expected_seq_num && self.expected_seq_num > 0 {
+                                tracing::warn!("FIX Sequence gap: expected {}, got {}. Requesting Resend.", self.expected_seq_num, seq_num);
+                                let expected_str = self.expected_seq_num.to_string();
+                                let resend = self.build_fix_message("2", &[(7, &expected_str), (16, "0")]);
+                                let _ = writer.write_all(resend.as_bytes()).await;
+                            }
+                            self.expected_seq_num = seq_num + 1;
                         }
-                        "0" => {
-                            let hb = self.build_fix_message("0", &[]);
-                            let _ = writer.write_all(hb.as_bytes()).await;
+
+                        match msg_type {
+                            "W" | "X" => {
+                                self.handle_market_data(&fields, &line_buf, &tick_tx);
+                            }
+                            "0" => {
+                                let hb = self.build_fix_message("0", &[]);
+                                let _ = writer.write_all(hb.as_bytes()).await;
+                            }
+                            "1" => {
+                                let test_req_id = fields.get(&112).map(|s| s.as_str()).unwrap_or("0");
+                                let hb = self.build_fix_message("0", &[(112, test_req_id)]);
+                                let _ = writer.write_all(hb.as_bytes()).await;
+                            }
+                            "5" => {
+                                info!("FIX Logout received");
+                                return Ok(());
+                            }
+                            _ => {
+                                debug!(msg_type, "FIX message received");
+                            }
                         }
-                        "1" => {
-                            let test_req_id = fields.get(&112).map(|s| s.as_str()).unwrap_or("0");
-                            let hb = self.build_fix_message("0", &[(112, test_req_id)]);
-                            let _ = writer.write_all(hb.as_bytes()).await;
-                        }
-                        "5" => {
-                            info!("FIX Logout received");
-                            return Ok(());
-                        }
-                        _ => {
-                            debug!(msg_type, "FIX message received");
-                        }
+                        line_buf.clear();
                     }
                 }
                 Ok(Err(e)) => {

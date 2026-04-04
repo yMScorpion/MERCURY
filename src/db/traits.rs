@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::types::*;
@@ -11,6 +12,8 @@ pub trait Database: Send + Sync + 'static {
     async fn upsert_market(&self, market: &Market) -> Result<()>;
     async fn get_market(&self, id: &Uuid) -> Result<Option<Market>>;
     async fn get_active_markets(&self) -> Result<Vec<Market>>;
+    async fn get_suspended_markets(&self) -> Result<Vec<Market>>;
+    async fn update_market_status(&self, id: &Uuid, status: MarketStatus) -> Result<()>;
 
     // Trades
     async fn insert_trade(&self, result: &TradeResult) -> Result<i64>;
@@ -19,6 +22,8 @@ pub trait Database: Send + Sync + 'static {
     async fn get_trade_count(&self) -> Result<i64>;
     /// Count distinct in-flight arbitrage pairs (not individual position records).
     async fn get_open_arb_count(&self) -> Result<usize>;
+    /// Sum cumulative profit of all successful trades to recover state post-crash
+    async fn get_cumulative_profit(&self) -> Result<Decimal>;
 
     // Positions
     async fn upsert_position(&self, position: &Position) -> Result<()>;
@@ -47,6 +52,7 @@ pub trait Database: Send + Sync + 'static {
 
     // Utility
     async fn prune_audit_log(&self, keep_days: u32) -> Result<()>;
+    async fn checkpoint_wal(&self) -> Result<()>;
     async fn db_size_bytes(&self) -> Result<u64>;
     /// Create an atomic backup of the database to the given file path.
     async fn backup_to_file(&self, dest_path: &str) -> Result<()>;

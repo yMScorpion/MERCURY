@@ -14,7 +14,7 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mercury
-EnvironmentFile=-/opt/mercury/.env
+# C-4 FIX: Removed EnvironmentFile to prevent leaking secrets into process memory. Parsed natively by Rust instead.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
