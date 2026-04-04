@@ -34,7 +34,9 @@ impl BackupTask {
             interval.tick().await;
 
             let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-            let dest = format!("{}/mercury_backup_{}.db", self.backup_dir, timestamp);
+            // Ensure backup_dir doesn't contain traversal or injection chars
+            let safe_dir = self.backup_dir.replace("..", "").replace('\'', "");
+            let dest = format!("{}/mercury_backup_{}.db", safe_dir, timestamp);
 
             match self.db.backup_to_file(&dest).await {
                 Ok(()) => {

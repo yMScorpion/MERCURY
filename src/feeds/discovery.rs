@@ -219,7 +219,6 @@ impl MarketDiscovery {
                             status: MarketStatus::Suspended,
                             created_at: chrono::Utc::now(),
                             updated_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
                         }
                     });
                 }

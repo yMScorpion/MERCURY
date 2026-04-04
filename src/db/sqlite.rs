@@ -649,11 +649,15 @@ impl Database for SqliteDb {
 
     async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
         anyhow::ensure!(!dest_path.contains(".."), "Backup path contains directory traversal");
-        // SECURITY: Single-quote rejection MUST remain first — it is the SQL injection barrier.
-        // VACUUM INTO does not support bind parameters, so this is our only defense.
         anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote — potential SQL injection");
         anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
         anyhow::ensure!(dest_path.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.'), "Backup path contains invalid characters");
+        
+        // Restrict backups strictly to the data directory tree
+        anyhow::ensure!(
+            dest_path.starts_with("/opt/mercury/data/") || dest_path.starts_with("data/"),
+            "Backup path must be under /opt/mercury/data/ or data/, got: {}", dest_path
+        );
         
         let query = format!("VACUUM INTO '{}'", dest_path);
         sqlx::query(&query).execute(&self.pool).await?;

@@ -64,13 +64,13 @@ impl Reconciler {
             let age = chrono::Utc::now() - pos.opened_at;
             if age.num_days() > 30 {
                 warn!(position_id = pos.id, market_id = %pos.market_id, age_days = age.num_days(), "Stale position detected");
-                let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                     severity: "critical".into(),
                     message: format!(
                         "🚨 STALE POSITION: Position #{} on {} has been open for {} days. Manual resolution required. Market ID: {}",
                         pos.id, pos.platform, age.num_days(), pos.market_id
                     ),
-                }).await;
+                });
             }
         }
 
@@ -80,10 +80,10 @@ impl Reconciler {
                 let db_bal = balances.iter().find(|b| b.platform == Platform::Kalshi).map(|b| b.total).unwrap_or(Decimal::ZERO);
                 if (live - db_bal).abs() > self.threshold {
                     warn!(live = %live, db = %db_bal, "Kalshi balance mismatch");
-                    let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                         severity: "warning".into(),
                         message: format!("Kalshi Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    }).await;
+                    });
                 }
             }
         }
@@ -93,10 +93,10 @@ impl Reconciler {
                 let db_bal = balances.iter().find(|b| b.platform == Platform::Polymarket).map(|b| b.total).unwrap_or(Decimal::ZERO);
                 if (live - db_bal).abs() > self.threshold {
                     warn!(live = %live, db = %db_bal, "Polymarket balance mismatch");
-                    let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                         severity: "warning".into(),
                         message: format!("Polymarket Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    }).await;
+                    });
                 }
             }
         }

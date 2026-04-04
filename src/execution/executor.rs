@@ -488,7 +488,7 @@ impl ExecutionEngine {
         &self,
         leg_a: &OrderResult,
         leg_b: &OrderResult,
-        _opp: &ArbitrageOpportunity,
+        opp: &ArbitrageOpportunity,
     ) -> (TradeStatus, Decimal, Option<String>) {
         if leg_a.filled && leg_b.filled {
             let total_cost = leg_a.fill_price + leg_b.fill_price;
@@ -507,13 +507,17 @@ impl ExecutionEngine {
                 let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge failed, unwind successful".into());
                 (TradeStatus::Fail, -leg_a.fee, Some(reason))
             } else {
+                // ESTIMATED loss — the position is stranded and requires manual resolution.
+                // We book a conservative estimate to prevent the bankroll from over-stating capital.
                 let filled_value = leg_a.fill_price * leg_a.fill_size;
-                let dynamic_penalty_pct = _opp.raw_spread
+                let dynamic_penalty_pct = opp.raw_spread
                     .max(rust_decimal_macros::dec!(0.02))
                     .min(rust_decimal_macros::dec!(0.10));
                 let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
                 let estimated_loss = dynamic_unwind_slippage + leg_a.fee; 
-                let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
+                let reason = leg_b.error.clone().unwrap_or_else(|| {
+                    format!("Hedge leg failed — ESTIMATED loss ${:.2} (manual resolution required)", estimated_loss)
+                });
                 (TradeStatus::Fail, -estimated_loss, Some(reason))
             }
         } else {

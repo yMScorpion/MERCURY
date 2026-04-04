@@ -70,34 +70,19 @@ impl PlatformBook {
             return;
         }
 
-        // M-1 FIX: Avoid BTreeMap allocation churn by retaining existing nodes instead of clear()
-        self.bids.retain(|k, _| {
-            if *k == tick.bid_price { return true; }
-            tick.book_depth.iter().any(|l| {
-                if &l.price != k { return false; }
-                if l.price <= tick.bid_price { return true; }
-                if l.price < tick.ask_price && (tick.ask_price - l.price >= l.price - tick.bid_price) { return true; }
-                false
-            })
-        });
-        
-        self.asks.retain(|k, _| {
-            if *k == tick.ask_price { return true; }
-            tick.book_depth.iter().any(|l| {
-                if &l.price != k { return false; }
-                if l.price >= tick.ask_price { return true; }
-                if l.price > tick.bid_price && (tick.ask_price - l.price < l.price - tick.bid_price) { return true; }
-                false
-            })
-        });
-
+        // Apply depth levels as incremental updates. Zero-size = remove.
         for level in tick.book_depth.iter() {
+            if level.size == Decimal::ZERO {
+                self.bids.remove(&level.price);
+                self.asks.remove(&level.price);
+                continue;
+            }
             if level.price <= tick.bid_price {
                 self.bids.insert(level.price, level.size);
             } else if level.price >= tick.ask_price {
                 self.asks.insert(level.price, level.size);
             } else {
-                // Mid-spread level: classify by which side it's closer to
+                // Mid-spread level: classify by proximity
                 if tick.ask_price - level.price < level.price - tick.bid_price {
                     self.asks.insert(level.price, level.size);
                 } else {
@@ -106,15 +91,18 @@ impl PlatformBook {
             }
         }
 
+        // Apply BBO and enforce uncrossed book invariant
         if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
-            // CRITICAL: Prevent crossed books by wiping asks that are lower than the new bid
-            self.asks.retain(|&p, _| p > tick.bid_price);
             self.bids.insert(tick.bid_price, tick.bid_size);
+            // Split off asks <= bid_price to prevent crossed book
+            let invalid_asks: Vec<Decimal> = self.asks.range(..=tick.bid_price).map(|(&p, _)| p).collect();
+            for p in invalid_asks { self.asks.remove(&p); }
         }
         if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
-            // CRITICAL: Prevent crossed books by wiping bids that are higher than the new ask
-            self.bids.retain(|&p, _| p < tick.ask_price);
             self.asks.insert(tick.ask_price, tick.ask_size);
+            // Split off bids >= ask_price to prevent crossed book
+            let invalid_bids: Vec<Decimal> = self.bids.range(tick.ask_price..).map(|(&p, _)| p).collect();
+            for p in invalid_bids { self.bids.remove(&p); }
         }
 
         self.last_update_ns = tick.timestamp_ns;

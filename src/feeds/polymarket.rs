@@ -276,6 +276,10 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                             }
                         }
                         if !new_subs.is_empty() {
+                            // Initialize local order books for new assets before subscribing
+                            for asset_id in &new_subs {
+                                self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
+                            }
                             let sub_msg = SubscribeMessage { msg_type: "subscribe".into(), assets_ids: new_subs.clone() };
                             if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
                                 let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text.into())).await;

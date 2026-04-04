@@ -156,37 +156,6 @@ keys/
 }
 ```
 
-## File: deploy/mercury.service
-```
-[Unit]
-Description=MERCURY Arbitrage Engine
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=mercury
-Group=mercury
-WorkingDirectory=/opt/mercury
-ExecStart=/opt/mercury/mercury --config /opt/mercury/config/default.yaml
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mercury
-# C-4 FIX: Removed EnvironmentFile to prevent leaking secrets into process memory. Parsed natively by Rust instead.
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/opt/mercury/data /opt/mercury/logs
-PrivateTmp=yes
-LimitNOFILE=65536
-MemoryMax=3G
-
-[Install]
-WantedBy=multi-user.target
-```
-
 ## File: deploy/setup.sh
 ```bash
 #!/bin/bash
@@ -255,6 +224,197 @@ pub mod cdna_client;
 pub mod forecastex_client;
 ```
 
+## File: src/risk/mod.rs
+```rust
+pub mod kelly;
+pub mod bankroll;
+pub mod circuit_breaker;
+```
+
+## File: src/telegram/mod.rs
+```rust
+pub mod bot;
+pub mod alerts;
+pub mod reports;
+```
+
+## File: deploy/mercury.service
+```
+[Unit]
+Description=MERCURY Arbitrage Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mercury
+Group=mercury
+WorkingDirectory=/opt/mercury
+ExecStart=/opt/mercury/mercury --config /opt/mercury/config/default.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mercury
+# C-4 FIX: Removed EnvironmentFile to prevent leaking secrets into process memory. Parsed natively by Rust instead.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/mercury/data /opt/mercury/logs
+PrivateTmp=yes
+LimitNOFILE=65536
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## File: src/crypto/mod.rs
+```rust
+pub mod eip712;
+pub mod jwt;
+```
+
+## File: src/feeds/mod.rs
+```rust
+pub mod base;
+pub mod polymarket;
+pub mod kalshi;
+pub mod cdna;
+pub mod forecastex;
+pub mod normalizer;
+pub mod discovery;
+```
+
+## File: src/inventory/mod.rs
+```rust
+pub mod positions;
+pub mod reconciler;
+pub mod settlement;
+pub mod unwind_watchdog;
+```
+
+## File: src/inventory/positions.rs
+```rust
+use anyhow::Result;
+use chrono::Utc;
+use rust_decimal::Decimal;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+
+use crate::db::Database;
+use crate::types::*;
+
+pub struct PositionTracker {
+    db: Arc<dyn Database>,
+    rx: mpsc::Receiver<TradeResult>,
+}
+
+impl PositionTracker {
+    pub fn new(db: Arc<dyn Database>, rx: mpsc::Receiver<TradeResult>) -> Self {
+        Self { db, rx }
+    }
+
+    pub async fn run(mut self) {
+        info!("Position tracker started");
+        while let Some(trade) = self.rx.recv().await {
+            if let Err(e) = self.process_trade(&trade).await {
+                error!(error = %e, "Failed to process trade for position tracking");
+            }
+        }
+        info!("Position tracker stopped");
+    }
+
+    async fn process_trade(&self, trade: &TradeResult) -> Result<()> {
+        if trade.status == TradeStatus::Fail && trade.leg_a_size == Decimal::ZERO {
+            return Ok(());
+        }
+
+        let now = Utc::now();
+
+        // When both legs filled, write them in a single atomic transaction so the
+        // DB never reflects a partial position pair.
+        match (trade.leg_a_size > Decimal::ZERO, trade.leg_b_size > Decimal::ZERO) {
+            (true, true) => {
+                let pos_a = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_a_platform,
+                    side: trade.leg_a_side,
+                    quantity: trade.leg_a_size,
+                    avg_entry_price: trade.leg_a_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                let pos_b = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_b_platform,
+                    side: trade.leg_b_side,
+                    quantity: trade.leg_b_size,
+                    avg_entry_price: trade.leg_b_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                self.db.upsert_position_pair(&pos_a, &pos_b).await?;
+            }
+            (true, false) => {
+                let pos_a = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_a_platform,
+                    side: trade.leg_a_side,
+                    quantity: trade.leg_a_size,
+                    avg_entry_price: trade.leg_a_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                self.db.upsert_position(&pos_a).await?;
+            }
+            (false, true) => {
+                let pos_b = Position {
+                    id: 0,
+                    market_id: trade.market_id,
+                    platform: trade.leg_b_platform,
+                    side: trade.leg_b_side,
+                    quantity: trade.leg_b_size,
+                    avg_entry_price: trade.leg_b_fill_price,
+                    unrealized_pnl: Decimal::ZERO,
+                    opened_at: now,
+                    updated_at: now,
+                };
+                self.db.upsert_position(&pos_b).await?;
+            }
+            (false, false) => {}
+        }
+
+        let leg_a_cost = trade.leg_a_fill_price * trade.leg_a_size + trade.leg_a_fee;
+        let leg_b_cost = trade.leg_b_fill_price * trade.leg_b_size + trade.leg_b_fee;
+
+        let audit = AuditEntry {
+            timestamp_ns: now_ns(),
+            module: "inventory".into(),
+            event_type: "trade_booked".into(),
+            data: serde_json::json!({
+                "trade_id": trade.trade_id,
+                "leg_a_debit": leg_a_cost.to_string(),
+                "leg_b_debit": leg_b_cost.to_string(),
+                "total_debit": (leg_a_cost + leg_b_cost).to_string(),
+                "profit": trade.profit.to_string(),
+            }),
+        };
+        self.db.append_audit(&audit).await?;
+
+        info!(trade_id = trade.trade_id, leg_a_cost = %leg_a_cost, leg_b_cost = %leg_b_cost, "Position booked");
+        Ok(())
+    }
+}
+```
+
 ## File: src/monitoring/backup.rs
 ```rust
 use anyhow::Result;
@@ -293,7 +453,9 @@ impl BackupTask {
             interval.tick().await;
 
             let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-            let dest = format!("{}/mercury_backup_{}.db", self.backup_dir, timestamp);
+            // Ensure backup_dir doesn't contain traversal or injection chars
+            let safe_dir = self.backup_dir.replace("..", "").replace('\'', "");
+            let dest = format!("{}/mercury_backup_{}.db", safe_dir, timestamp);
 
             match self.db.backup_to_file(&dest).await {
                 Ok(()) => {
@@ -335,11 +497,67 @@ impl BackupTask {
 }
 ```
 
-## File: src/risk/mod.rs
+## File: src/monitoring/metrics.rs
 ```rust
-pub mod kelly;
-pub mod bankroll;
-pub mod circuit_breaker;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+#[derive(Debug)]
+pub struct Metrics {
+    pub ticks_received: AtomicU64,
+    pub spreads_evaluated: AtomicU64,
+    pub opportunities_detected: AtomicU64,
+    pub opportunities_executed: AtomicU64,
+    pub trades_success: AtomicU64,
+    pub trades_failed: AtomicU64,
+    pub ws_reconnects: AtomicU32,
+    pub api_errors: AtomicU32,
+    pub start_time: Instant,
+    /// Nanosecond timestamp of the most recent tick received on any feed.
+    /// Used by the health endpoint to determine liveness.
+    pub last_tick_ns: AtomicU64,
+}
+
+impl Metrics {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ticks_received: AtomicU64::new(0),
+            spreads_evaluated: AtomicU64::new(0),
+            opportunities_detected: AtomicU64::new(0),
+            opportunities_executed: AtomicU64::new(0),
+            trades_success: AtomicU64::new(0),
+            trades_failed: AtomicU64::new(0),
+            ws_reconnects: AtomicU32::new(0),
+            api_errors: AtomicU32::new(0),
+            start_time: Instant::now(),
+            last_tick_ns: AtomicU64::new(0),
+        })
+    }
+
+    pub fn uptime_secs(&self) -> u64 { self.start_time.elapsed().as_secs() }
+    pub fn inc_ticks(&self) {
+        self.ticks_received.fetch_add(1, Ordering::Relaxed);
+        self.last_tick_ns.store(crate::types::now_ns(), Ordering::Relaxed);
+    }
+    pub fn inc_spreads(&self) { self.spreads_evaluated.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_detected(&self) { self.opportunities_detected.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_executed(&self) { self.opportunities_executed.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_success(&self) { self.trades_success.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_failed(&self) { self.trades_failed.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_reconnects(&self) { self.ws_reconnects.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_api_errors(&self) { self.api_errors.fetch_add(1, Ordering::Relaxed); }
+
+    /// Returns milliseconds since the last tick was received, or u64::MAX if none received yet.
+    pub fn ms_since_last_tick(&self) -> u64 {
+        let last = self.last_tick_ns.load(Ordering::Relaxed);
+        if last == 0 {
+            return u64::MAX;
+        }
+        let now = crate::types::now_ns();
+        now.saturating_sub(last) / 1_000_000
+    }
+}
 ```
 
 ## File: src/telegram/alerts.rs
@@ -482,13 +700,6 @@ fn format_system_alert(severity: &str, message: &str) -> String {
         TelegramBot::escape_html(message),
     )
 }
-```
-
-## File: src/telegram/mod.rs
-```rust
-pub mod bot;
-pub mod alerts;
-pub mod reports;
 ```
 
 ## File: deploy/Dockerfile
@@ -640,10 +851,86 @@ impl PolymarketSigner {
 }
 ```
 
-## File: src/crypto/mod.rs
+## File: src/crypto/jwt.rs
 ```rust
-pub mod eip712;
-pub mod jwt;
+use anyhow::{Context, Result};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
+use tracing::info;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KalshiClaims {
+    sub: String,
+    iat: u64,
+    exp: u64,
+}
+
+/// Kalshi API JWT authenticator
+pub struct KalshiAuth {
+    api_key_id: String,
+    encoding_key: EncodingKey,
+    /// Cached token: (token_string, expiry_timestamp_secs)
+    token_cache: Mutex<Option<(String, u64)>>,
+}
+
+impl KalshiAuth {
+    /// Create from RSA private key PEM and API key ID
+    pub fn new(api_key_id: String, rsa_private_key_pem: &[u8]) -> Result<Self> {
+        let encoding_key = EncodingKey::from_rsa_pem(rsa_private_key_pem)
+            .context("Failed to parse RSA private key PEM for Kalshi")?;
+        info!(api_key_id = %api_key_id, "Kalshi JWT auth initialized");
+        Ok(Self {
+            api_key_id,
+            encoding_key,
+            token_cache: Mutex::new(None),
+        })
+    }
+
+    /// Return current Unix timestamp in seconds, falling back to 0 on clock error.
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+    }
+
+    /// Generate a fresh JWT token (valid for 10 minutes)
+    pub fn generate_token(&self) -> Result<String> {
+        let now = Self::now_secs();
+        let claims = KalshiClaims {
+            sub: self.api_key_id.clone(),
+            iat: now,
+            exp: now + 600,
+        };
+        let header = Header::new(Algorithm::RS256);
+        let token = encode(&header, &claims, &self.encoding_key)
+            .context("Failed to encode JWT")?;
+        Ok(token)
+    }
+
+    /// Generate Authorization header value, using a cached token when still valid.
+    pub async fn auth_header(&self) -> Result<String> {
+        let now = Self::now_secs();
+        {
+            let cache = self.token_cache.lock().await;
+            if let Some((ref cached_token, expiry)) = *cache {
+                if expiry > now + 30 {
+                    return Ok(format!("Bearer {}", cached_token));
+                }
+            }
+        }
+
+        let token = self.generate_token()?;
+        let expiry = now + 600;
+        {
+            let mut cache = self.token_cache.lock().await;
+            *cache = Some((token.clone(), expiry));
+        }
+        Ok(format!("Bearer {}", token))
+    }
+}
 ```
 
 ## File: src/engine/market_registry.rs
@@ -715,146 +1002,6 @@ impl MarketRegistry {
 
     pub fn get_platform_info(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformMarketInfo> {
         self.markets.get(market_id)?.platforms.get(platform)
-    }
-}
-```
-
-## File: src/feeds/mod.rs
-```rust
-pub mod base;
-pub mod polymarket;
-pub mod kalshi;
-pub mod cdna;
-pub mod forecastex;
-pub mod normalizer;
-pub mod discovery;
-```
-
-## File: src/inventory/mod.rs
-```rust
-pub mod positions;
-pub mod reconciler;
-pub mod settlement;
-pub mod unwind_watchdog;
-```
-
-## File: src/inventory/positions.rs
-```rust
-use anyhow::Result;
-use chrono::Utc;
-use rust_decimal::Decimal;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tracing::{error, info};
-
-use crate::db::Database;
-use crate::types::*;
-
-pub struct PositionTracker {
-    db: Arc<dyn Database>,
-    rx: mpsc::Receiver<TradeResult>,
-}
-
-impl PositionTracker {
-    pub fn new(db: Arc<dyn Database>, rx: mpsc::Receiver<TradeResult>) -> Self {
-        Self { db, rx }
-    }
-
-    pub async fn run(mut self) {
-        info!("Position tracker started");
-        while let Some(trade) = self.rx.recv().await {
-            if let Err(e) = self.process_trade(&trade).await {
-                error!(error = %e, "Failed to process trade for position tracking");
-            }
-        }
-        info!("Position tracker stopped");
-    }
-
-    async fn process_trade(&self, trade: &TradeResult) -> Result<()> {
-        if trade.status == TradeStatus::Fail && trade.leg_a_size == Decimal::ZERO {
-            return Ok(());
-        }
-
-        let now = Utc::now();
-
-        // When both legs filled, write them in a single atomic transaction so the
-        // DB never reflects a partial position pair.
-        match (trade.leg_a_size > Decimal::ZERO, trade.leg_b_size > Decimal::ZERO) {
-            (true, true) => {
-                let pos_a = Position {
-                    id: 0,
-                    market_id: trade.market_id,
-                    platform: trade.leg_a_platform,
-                    side: trade.leg_a_side,
-                    quantity: trade.leg_a_size,
-                    avg_entry_price: trade.leg_a_fill_price,
-                    unrealized_pnl: Decimal::ZERO,
-                    opened_at: now,
-                    updated_at: now,
-                };
-                let pos_b = Position {
-                    id: 0,
-                    market_id: trade.market_id,
-                    platform: trade.leg_b_platform,
-                    side: trade.leg_b_side,
-                    quantity: trade.leg_b_size,
-                    avg_entry_price: trade.leg_b_fill_price,
-                    unrealized_pnl: Decimal::ZERO,
-                    opened_at: now,
-                    updated_at: now,
-                };
-                self.db.upsert_position_pair(&pos_a, &pos_b).await?;
-            }
-            (true, false) => {
-                let pos_a = Position {
-                    id: 0,
-                    market_id: trade.market_id,
-                    platform: trade.leg_a_platform,
-                    side: trade.leg_a_side,
-                    quantity: trade.leg_a_size,
-                    avg_entry_price: trade.leg_a_fill_price,
-                    unrealized_pnl: Decimal::ZERO,
-                    opened_at: now,
-                    updated_at: now,
-                };
-                self.db.upsert_position(&pos_a).await?;
-            }
-            (false, true) => {
-                let pos_b = Position {
-                    id: 0,
-                    market_id: trade.market_id,
-                    platform: trade.leg_b_platform,
-                    side: trade.leg_b_side,
-                    quantity: trade.leg_b_size,
-                    avg_entry_price: trade.leg_b_fill_price,
-                    unrealized_pnl: Decimal::ZERO,
-                    opened_at: now,
-                    updated_at: now,
-                };
-                self.db.upsert_position(&pos_b).await?;
-            }
-            (false, false) => {}
-        }
-
-        let leg_a_cost = trade.leg_a_fill_price * trade.leg_a_size + trade.leg_a_fee;
-        let leg_b_cost = trade.leg_b_fill_price * trade.leg_b_size + trade.leg_b_fee;
-
-        let audit = AuditEntry {
-            timestamp_ns: now_ns(),
-            module: "inventory".into(),
-            event_type: "trade_booked".into(),
-            data: serde_json::json!({
-                "trade_id": trade.trade_id,
-                "leg_a_debit": leg_a_cost.to_string(),
-                "leg_b_debit": leg_b_cost.to_string(),
-                "total_debit": (leg_a_cost + leg_b_cost).to_string(),
-                "profit": trade.profit.to_string(),
-            }),
-        };
-        self.db.append_audit(&audit).await?;
-
-        info!(trade_id = trade.trade_id, leg_a_cost = %leg_a_cost, leg_b_cost = %leg_b_cost, "Position booked");
-        Ok(())
     }
 }
 ```
@@ -1104,67 +1251,12 @@ pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_m
 }
 ```
 
-## File: src/monitoring/metrics.rs
+## File: src/monitoring/mod.rs
 ```rust
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
-
-#[derive(Debug)]
-pub struct Metrics {
-    pub ticks_received: AtomicU64,
-    pub spreads_evaluated: AtomicU64,
-    pub opportunities_detected: AtomicU64,
-    pub opportunities_executed: AtomicU64,
-    pub trades_success: AtomicU64,
-    pub trades_failed: AtomicU64,
-    pub ws_reconnects: AtomicU32,
-    pub api_errors: AtomicU32,
-    pub start_time: Instant,
-    /// Nanosecond timestamp of the most recent tick received on any feed.
-    /// Used by the health endpoint to determine liveness.
-    pub last_tick_ns: AtomicU64,
-}
-
-impl Metrics {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            ticks_received: AtomicU64::new(0),
-            spreads_evaluated: AtomicU64::new(0),
-            opportunities_detected: AtomicU64::new(0),
-            opportunities_executed: AtomicU64::new(0),
-            trades_success: AtomicU64::new(0),
-            trades_failed: AtomicU64::new(0),
-            ws_reconnects: AtomicU32::new(0),
-            api_errors: AtomicU32::new(0),
-            start_time: Instant::now(),
-            last_tick_ns: AtomicU64::new(0),
-        })
-    }
-
-    pub fn uptime_secs(&self) -> u64 { self.start_time.elapsed().as_secs() }
-    pub fn inc_ticks(&self) {
-        self.ticks_received.fetch_add(1, Ordering::Relaxed);
-        self.last_tick_ns.store(crate::types::now_ns(), Ordering::Relaxed);
-    }
-    pub fn inc_spreads(&self) { self.spreads_evaluated.fetch_add(1, Ordering::Relaxed); }
-    pub fn inc_detected(&self) { self.opportunities_detected.fetch_add(1, Ordering::Relaxed); }
-    pub fn inc_executed(&self) { self.opportunities_executed.fetch_add(1, Ordering::Relaxed); }
-    pub fn inc_success(&self) { self.trades_success.fetch_add(1, Ordering::Relaxed); }
-    pub fn inc_failed(&self) { self.trades_failed.fetch_add(1, Ordering::Relaxed); }
-    pub fn inc_reconnects(&self) { self.ws_reconnects.fetch_add(1, Ordering::Relaxed); }
-    pub fn inc_api_errors(&self) { self.api_errors.fetch_add(1, Ordering::Relaxed); }
-
-    /// Returns milliseconds since the last tick was received, or u64::MAX if none received yet.
-    pub fn ms_since_last_tick(&self) -> u64 {
-        let last = self.last_tick_ns.load(Ordering::Relaxed);
-        if last == 0 {
-            return u64::MAX;
-        }
-        let now = crate::types::now_ns();
-        now.saturating_sub(last) / 1_000_000
-    }
-}
+pub mod metrics;
+pub mod health;
+pub mod gas_oracle;
+pub mod backup;
 ```
 
 ## File: src/telegram/reports.rs
@@ -1515,88 +1607,6 @@ health:
   port: 9090
 ```
 
-## File: src/crypto/jwt.rs
-```rust
-use anyhow::{Context, Result};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
-use tracing::info;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct KalshiClaims {
-    sub: String,
-    iat: u64,
-    exp: u64,
-}
-
-/// Kalshi API JWT authenticator
-pub struct KalshiAuth {
-    api_key_id: String,
-    encoding_key: EncodingKey,
-    /// Cached token: (token_string, expiry_timestamp_secs)
-    token_cache: Mutex<Option<(String, u64)>>,
-}
-
-impl KalshiAuth {
-    /// Create from RSA private key PEM and API key ID
-    pub fn new(api_key_id: String, rsa_private_key_pem: &[u8]) -> Result<Self> {
-        let encoding_key = EncodingKey::from_rsa_pem(rsa_private_key_pem)
-            .context("Failed to parse RSA private key PEM for Kalshi")?;
-        info!(api_key_id = %api_key_id, "Kalshi JWT auth initialized");
-        Ok(Self {
-            api_key_id,
-            encoding_key,
-            token_cache: Mutex::new(None),
-        })
-    }
-
-    /// Return current Unix timestamp in seconds, falling back to 0 on clock error.
-    fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs()
-    }
-
-    /// Generate a fresh JWT token (valid for 10 minutes)
-    pub fn generate_token(&self) -> Result<String> {
-        let now = Self::now_secs();
-        let claims = KalshiClaims {
-            sub: self.api_key_id.clone(),
-            iat: now,
-            exp: now + 600,
-        };
-        let header = Header::new(Algorithm::RS256);
-        let token = encode(&header, &claims, &self.encoding_key)
-            .context("Failed to encode JWT")?;
-        Ok(token)
-    }
-
-    /// Generate Authorization header value, using a cached token when still valid.
-    pub async fn auth_header(&self) -> Result<String> {
-        let now = Self::now_secs();
-        {
-            let cache = self.token_cache.lock().await;
-            if let Some((ref cached_token, expiry)) = *cache {
-                if expiry > now + 30 {
-                    return Ok(format!("Bearer {}", cached_token));
-                }
-            }
-        }
-
-        let token = self.generate_token()?;
-        let expiry = now + 600;
-        {
-            let mut cache = self.token_cache.lock().await;
-            *cache = Some((token.clone(), expiry));
-        }
-        Ok(format!("Bearer {}", token))
-    }
-}
-```
-
 ## File: src/db/migrations.rs
 ```rust
 use anyhow::Result;
@@ -1758,6 +1768,51 @@ CREATE TABLE IF NOT EXISTS config_history (
 );
 CREATE INDEX IF NOT EXISTS idx_config_hist_ts ON config_history(changed_at);
 "#;
+```
+
+## File: src/execution/forecastex_client.rs
+```rust
+use anyhow::Result;
+use rust_decimal::Decimal;
+use tracing::{info, warn};
+
+use super::executor::{OrderResult, PlatformOrderClient};
+use crate::types::Side;
+
+#[derive(Clone)]
+pub struct ForecastExClient {
+    fix_host: String,
+    fix_port: u16,
+}
+
+impl ForecastExClient {
+    pub fn new(fix_host: String, fix_port: u16) -> Self {
+        Self { fix_host, fix_port }
+    }
+}
+
+use crate::execution::executor::OrderAction;
+
+#[async_trait::async_trait]
+impl PlatformOrderClient for ForecastExClient {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
+        info!(market_id, action = ?action, side = %side, price = %price, size = %size, "ForecastEx order rejected — FIX execution not yet implemented");
+        warn!(
+            fix_host = %self.fix_host,
+            fix_port = self.fix_port,
+            "ForecastEx FIX execution not implemented — rejecting order to prevent unhedged leg-A positions"
+        );
+        // Return Err so the executor aborts the arb opportunity BEFORE executing any
+        // counterpart leg. An Ok(filled: false) response only blocks leg-B but still
+        // allows leg-A to run, which would require an unwind trade on a real platform.
+        anyhow::bail!("ForecastEx FIX execution not yet implemented")
+    }
+
+    async fn cancel_order(&self, _order_id: &str) -> Result<()> {
+        warn!("ForecastEx cancel not yet implemented");
+        Ok(())
+    }
+}
 ```
 
 ## File: src/feeds/base.rs
@@ -1930,7 +1985,7 @@ impl Reconciler {
                         "🚨 STALE POSITION: Position #{} on {} has been open for {} days. Manual resolution required. Market ID: {}",
                         pos.id, pos.platform, age.num_days(), pos.market_id
                     ),
-                }).await;
+                });
             }
         }
 
@@ -1943,7 +1998,7 @@ impl Reconciler {
                     let _ = self.alert_tx.send(AlertMessage::SystemAlert {
                         severity: "warning".into(),
                         message: format!("Kalshi Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    }).await;
+                    });
                 }
             }
         }
@@ -1956,7 +2011,7 @@ impl Reconciler {
                     let _ = self.alert_tx.send(AlertMessage::SystemAlert {
                         severity: "warning".into(),
                         message: format!("Polymarket Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    }).await;
+                    });
                 }
             }
         }
@@ -2231,14 +2286,6 @@ impl GasOracle {
             .ok_or_else(|| anyhow::anyhow!("Failed to convert f64 to Decimal: {}", usd))
     }
 }
-```
-
-## File: src/monitoring/mod.rs
-```rust
-pub mod metrics;
-pub mod health;
-pub mod gas_oracle;
-pub mod backup;
 ```
 
 ## File: src/risk/kelly.rs
@@ -2597,51 +2644,6 @@ impl PlatformOrderClient for CdnaClient {
 }
 ```
 
-## File: src/execution/forecastex_client.rs
-```rust
-use anyhow::Result;
-use rust_decimal::Decimal;
-use tracing::{info, warn};
-
-use super::executor::{OrderResult, PlatformOrderClient};
-use crate::types::Side;
-
-#[derive(Clone)]
-pub struct ForecastExClient {
-    fix_host: String,
-    fix_port: u16,
-}
-
-impl ForecastExClient {
-    pub fn new(fix_host: String, fix_port: u16) -> Self {
-        Self { fix_host, fix_port }
-    }
-}
-
-use crate::execution::executor::OrderAction;
-
-#[async_trait::async_trait]
-impl PlatformOrderClient for ForecastExClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: Decimal, size: Decimal, _fee_rate_bps: u32) -> Result<OrderResult> {
-        info!(market_id, action = ?action, side = %side, price = %price, size = %size, "ForecastEx order rejected — FIX execution not yet implemented");
-        warn!(
-            fix_host = %self.fix_host,
-            fix_port = self.fix_port,
-            "ForecastEx FIX execution not implemented — rejecting order to prevent unhedged leg-A positions"
-        );
-        // Return Err so the executor aborts the arb opportunity BEFORE executing any
-        // counterpart leg. An Ok(filled: false) response only blocks leg-B but still
-        // allows leg-A to run, which would require an unwind trade on a real platform.
-        anyhow::bail!("ForecastEx FIX execution not yet implemented")
-    }
-
-    async fn cancel_order(&self, _order_id: &str) -> Result<()> {
-        warn!("ForecastEx cancel not yet implemented");
-        Ok(())
-    }
-}
-```
-
 ## File: src/feeds/discovery.rs
 ```rust
 //! Market discovery: polls platform REST APIs, matches equivalent markets
@@ -2865,7 +2867,6 @@ impl MarketDiscovery {
                             status: MarketStatus::Suspended,
                             created_at: chrono::Utc::now(),
                             updated_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
                         }
                     });
                 }
@@ -4542,6 +4543,8 @@ impl MercuryConfig {
             "max_open_positions must be at least 1, got {}", t.max_open_positions);
         anyhow::ensure!(t.max_concurrent_arbs >= 1,
             "max_concurrent_arbs must be at least 1, got {}", t.max_concurrent_arbs);
+        anyhow::ensure!(t.rebalance_threshold_pct > Decimal::ZERO && t.rebalance_threshold_pct <= Decimal::ONE,
+            "rebalance_threshold_pct must be in (0, 1], got {}", t.rebalance_threshold_pct);
             
         // Validate platform URLs
         let p = &self.platforms;
@@ -4748,34 +4751,19 @@ impl PlatformBook {
             return;
         }
 
-        // M-1 FIX: Avoid BTreeMap allocation churn by retaining existing nodes instead of clear()
-        self.bids.retain(|k, _| {
-            if *k == tick.bid_price { return true; }
-            tick.book_depth.iter().any(|l| {
-                if &l.price != k { return false; }
-                if l.price <= tick.bid_price { return true; }
-                if l.price < tick.ask_price && (tick.ask_price - l.price >= l.price - tick.bid_price) { return true; }
-                false
-            })
-        });
-        
-        self.asks.retain(|k, _| {
-            if *k == tick.ask_price { return true; }
-            tick.book_depth.iter().any(|l| {
-                if &l.price != k { return false; }
-                if l.price >= tick.ask_price { return true; }
-                if l.price > tick.bid_price && (tick.ask_price - l.price < l.price - tick.bid_price) { return true; }
-                false
-            })
-        });
-
+        // Apply depth levels as incremental updates. Zero-size = remove.
         for level in tick.book_depth.iter() {
+            if level.size == Decimal::ZERO {
+                self.bids.remove(&level.price);
+                self.asks.remove(&level.price);
+                continue;
+            }
             if level.price <= tick.bid_price {
                 self.bids.insert(level.price, level.size);
             } else if level.price >= tick.ask_price {
                 self.asks.insert(level.price, level.size);
             } else {
-                // Mid-spread level: classify by which side it's closer to
+                // Mid-spread level: classify by proximity
                 if tick.ask_price - level.price < level.price - tick.bid_price {
                     self.asks.insert(level.price, level.size);
                 } else {
@@ -4784,15 +4772,18 @@ impl PlatformBook {
             }
         }
 
+        // Apply BBO and enforce uncrossed book invariant
         if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
-            // CRITICAL: Prevent crossed books by wiping asks that are lower than the new bid
-            self.asks.retain(|&p, _| p > tick.bid_price);
             self.bids.insert(tick.bid_price, tick.bid_size);
+            // Split off asks <= bid_price to prevent crossed book
+            let invalid_asks: Vec<Decimal> = self.asks.range(..=tick.bid_price).map(|(&p, _)| p).collect();
+            for p in invalid_asks { self.asks.remove(&p); }
         }
         if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
-            // CRITICAL: Prevent crossed books by wiping bids that are higher than the new ask
-            self.bids.retain(|&p, _| p < tick.ask_price);
             self.asks.insert(tick.ask_price, tick.ask_size);
+            // Split off bids >= ask_price to prevent crossed book
+            let invalid_bids: Vec<Decimal> = self.bids.range(tick.ask_price..).map(|(&p, _)| p).collect();
+            for p in invalid_bids { self.bids.remove(&p); }
         }
 
         self.last_update_ns = tick.timestamp_ns;
@@ -5923,6 +5914,10 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                             }
                         }
                         if !new_subs.is_empty() {
+                            // Initialize local order books for new assets before subscribing
+                            for asset_id in &new_subs {
+                                self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
+                            }
                             let sub_msg = SubscribeMessage { msg_type: "subscribe".into(), assets_ids: new_subs.clone() };
                             if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
                                 let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text.into())).await;
@@ -6620,6 +6615,10 @@ impl FeedHandler for KalshiFeed {
                             }
                         }
                         if !new_subs.is_empty() {
+                            // Initialize order books for new tickers BEFORE subscribing
+                            for ticker in &new_subs {
+                                self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
+                            }
                             let sub = KalshiSubscribe {
                                 id: 2,
                                 cmd: "subscribe".into(),
@@ -7708,11 +7707,15 @@ impl Database for SqliteDb {
 
     async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
         anyhow::ensure!(!dest_path.contains(".."), "Backup path contains directory traversal");
-        // SECURITY: Single-quote rejection MUST remain first — it is the SQL injection barrier.
-        // VACUUM INTO does not support bind parameters, so this is our only defense.
         anyhow::ensure!(!dest_path.contains('\''), "Backup path contains single quote — potential SQL injection");
         anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
         anyhow::ensure!(dest_path.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.'), "Backup path contains invalid characters");
+        
+        // Restrict backups strictly to the data directory tree
+        anyhow::ensure!(
+            dest_path.starts_with("/opt/mercury/data/") || dest_path.starts_with("data/"),
+            "Backup path must be under /opt/mercury/data/ or data/, got: {}", dest_path
+        );
         
         let query = format!("VACUUM INTO '{}'", dest_path);
         sqlx::query(&query).execute(&self.pool).await?;
@@ -8262,7 +8265,7 @@ impl ExecutionEngine {
         &self,
         leg_a: &OrderResult,
         leg_b: &OrderResult,
-        _opp: &ArbitrageOpportunity,
+        opp: &ArbitrageOpportunity,
     ) -> (TradeStatus, Decimal, Option<String>) {
         if leg_a.filled && leg_b.filled {
             let total_cost = leg_a.fill_price + leg_b.fill_price;
@@ -8281,13 +8284,17 @@ impl ExecutionEngine {
                 let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge failed, unwind successful".into());
                 (TradeStatus::Fail, -leg_a.fee, Some(reason))
             } else {
+                // ESTIMATED loss — the position is stranded and requires manual resolution.
+                // We book a conservative estimate to prevent the bankroll from over-stating capital.
                 let filled_value = leg_a.fill_price * leg_a.fill_size;
-                let dynamic_penalty_pct = _opp.raw_spread
+                let dynamic_penalty_pct = opp.raw_spread
                     .max(rust_decimal_macros::dec!(0.02))
                     .min(rust_decimal_macros::dec!(0.10));
                 let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
                 let estimated_loss = dynamic_unwind_slippage + leg_a.fee; 
-                let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge leg failed to fill".into());
+                let reason = leg_b.error.clone().unwrap_or_else(|| {
+                    format!("Hedge leg failed — ESTIMATED loss ${:.2} (manual resolution required)", estimated_loss)
+                });
                 (TradeStatus::Fail, -estimated_loss, Some(reason))
             }
         } else {
@@ -9123,7 +9130,7 @@ async fn main() -> Result<()> {
     let metrics = monitoring::metrics::Metrics::new();
 
     // ─── Channels ───
-    let (tick_tx, _) = broadcast::channel::<NormalizedTick>(50_000); // MED-1 FIX: Increased to 50k to survive lag spikes
+    let (tick_tx, _) = broadcast::channel::<NormalizedTick>(10_000); // 10k buffer = ~10s at 1000 ticks/s
     let (opportunity_tx, opportunity_rx) = mpsc::channel::<ValidatedOpportunity>(100);
     let (trade_result_tx, trade_result_rx) = mpsc::channel::<TradeResult>(100);
     let (trade_result_tx2, trade_result_rx2) = mpsc::channel::<TradeResult>(1_000);
@@ -9241,7 +9248,7 @@ async fn main() -> Result<()> {
         std::env::remove_var("POLYMARKET_API_PASSPHRASE");
         std::env::remove_var("POLYMARKET_WALLET_KEY");
         let chain_id: u64 = std::env::var("POLYMARKET_CHAIN_ID")
-            .unwrap_or_else(|_| env_vars.get("POLYMARKET_CHAIN_ID").cloned().unwrap_or_else(|| "137".to_string()))
+            .or_else(|_| env_vars.get("POLYMARKET_CHAIN_ID").cloned().ok_or(std::env::VarError::NotPresent))
             .unwrap_or_else(|_| "137".to_string())
             .parse()
             .unwrap_or(137);
@@ -9691,6 +9698,10 @@ loop {
                 metrics.inc_spreads(); 
 
                 // Process opportunities
+                for opp in &opps {
+                    metrics.inc_detected();
+                }
+                
                 for opp in opps {
                 // Fix CB5: Calculate the true exposure allocated to this specific market question
                 let market_exposure_pct = bankroll_manager.market_exposure_pct(&opp.market_id);
@@ -9943,7 +9954,10 @@ loop {
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
                 if let Ok(count) = db.get_open_arb_count().await {
-                    cached_open_positions = count + in_flight_trades;
+                    // DB count includes all persisted open positions.
+                    // in_flight_trades are dispatched but not yet persisted.
+                    // Don't double-count: only add truly in-flight trades.
+                    cached_open_positions = count.max(cached_open_positions.saturating_sub(in_flight_trades)) + in_flight_trades;
                 }
                 
                 // L-5 FIX: Expose DetectorStats to the logs

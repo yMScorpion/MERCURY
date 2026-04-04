@@ -267,7 +267,7 @@ async fn main() -> Result<()> {
     let metrics = monitoring::metrics::Metrics::new();
 
     // ─── Channels ───
-    let (tick_tx, _) = broadcast::channel::<NormalizedTick>(50_000); // MED-1 FIX: Increased to 50k to survive lag spikes
+    let (tick_tx, _) = broadcast::channel::<NormalizedTick>(10_000); // 10k buffer = ~10s at 1000 ticks/s
     let (opportunity_tx, opportunity_rx) = mpsc::channel::<ValidatedOpportunity>(100);
     let (trade_result_tx, trade_result_rx) = mpsc::channel::<TradeResult>(100);
     let (trade_result_tx2, trade_result_rx2) = mpsc::channel::<TradeResult>(1_000);
@@ -385,7 +385,7 @@ async fn main() -> Result<()> {
         std::env::remove_var("POLYMARKET_API_PASSPHRASE");
         std::env::remove_var("POLYMARKET_WALLET_KEY");
         let chain_id: u64 = std::env::var("POLYMARKET_CHAIN_ID")
-            .unwrap_or_else(|_| env_vars.get("POLYMARKET_CHAIN_ID").cloned().unwrap_or_else(|| "137".to_string()))
+            .or_else(|_| env_vars.get("POLYMARKET_CHAIN_ID").cloned().ok_or(std::env::VarError::NotPresent))
             .unwrap_or_else(|_| "137".to_string())
             .parse()
             .unwrap_or(137);
@@ -835,6 +835,9 @@ loop {
                 metrics.inc_spreads(); 
 
                 // Process opportunities
+                for opp in &opps {
+                    metrics.inc_detected();
+                }
                 for opp in opps {
                 // Fix CB5: Calculate the true exposure allocated to this specific market question
                 let market_exposure_pct = bankroll_manager.market_exposure_pct(&opp.market_id);
@@ -1087,7 +1090,10 @@ loop {
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
                 if let Ok(count) = db.get_open_arb_count().await {
-                    cached_open_positions = count + in_flight_trades;
+                    // DB count includes all persisted open positions.
+                    // in_flight_trades are dispatched but not yet persisted.
+                    // Don't double-count: only add truly in-flight (not yet DB-persisted) trades.
+                    cached_open_positions = count.max(cached_open_positions.saturating_sub(in_flight_trades)) + in_flight_trades;
                 }
                 
                 // L-5 FIX: Expose DetectorStats to the logs
@@ -1128,7 +1134,7 @@ loop {
 
                 bankroll_manager.reset_daily();
             }
-            }
+            
 
             // ── Background Task Monitor ──
             Some(task_result) = join_set.join_next(), if !join_set.is_empty() => {

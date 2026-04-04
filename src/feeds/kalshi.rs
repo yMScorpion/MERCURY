@@ -284,6 +284,10 @@ impl FeedHandler for KalshiFeed {
                             }
                         }
                         if !new_subs.is_empty() {
+                            // Initialize order books for new tickers BEFORE subscribing
+                            for ticker in &new_subs {
+                                self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
+                            }
                             let sub = KalshiSubscribe {
                                 id: 2,
                                 cmd: "subscribe".into(),
