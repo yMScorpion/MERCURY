@@ -653,10 +653,12 @@ impl Database for SqliteDb {
         anyhow::ensure!(!dest_path.contains('\0'), "Backup path contains null byte");
         anyhow::ensure!(dest_path.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.'), "Backup path contains invalid characters");
         
-        // Restrict backups strictly to the data directory tree
+        // Restrict backups to known safe prefixes. Accept both production and local dev paths.
         anyhow::ensure!(
-            dest_path.starts_with("/opt/mercury/data/") || dest_path.starts_with("data/"),
-            "Backup path must be under /opt/mercury/data/ or data/, got: {}", dest_path
+            dest_path.starts_with("/opt/mercury/data/") 
+            || dest_path.starts_with("data/") 
+            || dest_path.starts_with("./"),
+            "Backup path must be under /opt/mercury/data/, data/, or ./, got: {}", dest_path
         );
         
         let query = format!("VACUUM INTO '{}'", dest_path);

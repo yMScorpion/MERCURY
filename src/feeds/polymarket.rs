@@ -124,9 +124,10 @@ impl PolymarketFeed {
         let mut fee_rates = std::collections::HashMap::new();
         for (asset_id, market_id, fee_bps) in subscriptions {
             subs_map.insert(asset_id.clone(), market_id);
-            fee_rates.insert(asset_id, fee_bps);
+            // Also key fee_rates by YES token so emit_tick can find them
+            let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
+            fee_rates.insert(ws_key, fee_bps);
         }
-
         Self {
             config,
             db,
@@ -232,7 +233,10 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
         }
 
         for (asset_id, _) in &self.subscriptions {
-            self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
+            // WS events arrive keyed by the YES token (first element of comma pair).
+            // Books must be keyed the same way or lookups will always miss.
+            let ws_key = asset_id.split(',').next().unwrap_or(asset_id).to_string();
+            self.books.entry(ws_key).or_insert_with(LocalOrderBook::new);
         }
 
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -270,8 +274,11 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                                 let asset_id = info.platform_market_id.clone();
                                 if !self.subscriptions.contains_key(&asset_id) {
                                     self.subscriptions.insert(asset_id.clone(), m.unified_id);
-                                    self.fee_rates.insert(asset_id.clone(), info.fee_rate_bps);
-                                    new_subs.push(asset_id.split(',').next().unwrap_or(&asset_id).to_string());
+                                    
+                                    // Extract the YES token so emit_tick can correctly look up the fee rate
+                                    let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
+                                    self.fee_rates.insert(ws_key.clone(), info.fee_rate_bps);
+                                    new_subs.push(ws_key);
                                 }
                             }
                         }

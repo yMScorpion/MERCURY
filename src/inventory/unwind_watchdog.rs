@@ -102,7 +102,7 @@ impl UnwindWatchdog {
                         age.num_minutes()
                     );
 
-                    let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                         severity: "critical".into(),
                         message: format!(
                             "🚨 ORPHANED POSITION IMBALANCE: {} contracts unhedged \
@@ -112,7 +112,7 @@ impl UnwindWatchdog {
                             age.num_minutes(),
                             market_id,
                         ),
-                    }).await;
+                    });
 
                     // L-3 FIX: Automated liquidation attempt
                     if let Ok(Some(market)) = self.db.get_market(market_id).await {
@@ -145,10 +145,10 @@ impl UnwindWatchdog {
 
                                 if let Some(Ok(res)) = result {
                                     if res.filled {
-                                        let _ = self.alert_tx.send(AlertMessage::SystemAlert {
+                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                                             severity: "warning".into(),
                                             message: format!("✅ Automated liquidation successful. Filled {} contracts on {}.", res.fill_size, plat),
-                                        }).await;
+                                        });
                                         for pos in legs {
                                             let _ = self.db.close_position(pos.id).await;
                                         }
