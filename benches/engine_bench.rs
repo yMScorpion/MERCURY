@@ -27,5 +27,23 @@ fn bench_spread_compute(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_spread_compute);
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::SignerSync;
+
+fn bench_eip712_signature(c: &mut Criterion) {
+    let wallet = PrivateKeySigner::random();
+    
+    // Criamos um hash simulado com bytes repetidos, dispensando a dependência de geradores aleatórios
+    let hash = alloy::primitives::B256::repeat_byte(0x42);
+
+    c.bench_function("eip712_sign_order", |b| {
+        b.iter(|| {
+            // Usamos a versão síncrona para medir o tempo puro de CPU da assinatura ECDSA
+            let _ = black_box(wallet.sign_hash_sync(&hash));
+        });
+    });
+}
+
+// Registramos o novo benchmark criptográfico ao lado do seu teste existente
+criterion_group!(benches, bench_spread_compute, bench_eip712_signature);
 criterion_main!(benches);
