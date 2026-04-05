@@ -371,36 +371,41 @@ impl ExecutionEngine {
         size: Contracts,
         fee_rate_bps: BasisPoints,
     ) -> Result<OrderResult> {
-        match platform {
-            Platform::Polymarket | Platform::PolymarketUs => {
-                if let Some(client) = &self.polymarket_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Polymarket client not configured")
+        let fut = async {
+            match platform {
+                Platform::Polymarket | Platform::PolymarketUs => {
+                    if let Some(client) = &self.polymarket_client {
+                        client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                    } else {
+                        anyhow::bail!("Polymarket client not configured")
+                    }
+                }
+                Platform::Kalshi => {
+                    if let Some(client) = &self.kalshi_client {
+                        client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                    } else {
+                        anyhow::bail!("Kalshi client not configured")
+                    }
+                }
+                Platform::Cdna => {
+                    if let Some(client) = &self.cdna_client {
+                        client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                    } else {
+                        anyhow::bail!("CDNA client not configured")
+                    }
+                }
+                Platform::ForecastEx => {
+                    if let Some(client) = &self.forecastex_client {
+                        client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                    } else {
+                        anyhow::bail!("ForecastEx client not configured")
+                    }
                 }
             }
-            Platform::Kalshi => {
-                if let Some(client) = &self.kalshi_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Kalshi client not configured")
-                }
-            }
-            Platform::Cdna => {
-                if let Some(client) = &self.cdna_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("CDNA client not configured")
-                }
-            }
-            Platform::ForecastEx => {
-                if let Some(client) = &self.forecastex_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("ForecastEx client not configured")
-                }
-            }
-        }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(8), fut)
+            .await
+            .map_err(|_| anyhow::anyhow!("execute_leg timeout after 8s (platform={:?})", platform))?
     }
 
 

@@ -130,6 +130,7 @@ impl MarketActor {
                             involves_polymarket: opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
                             ms_since_last_tick: metrics.ms_since_last_tick(),
                             market_exposure_pct: state.market_exposure_pct,
+                            total_exposure_pct: state.total_exposure_pct,
                         };
                         cb_guard.check_all(&params).is_empty()
                     };

@@ -24,6 +24,8 @@ pub struct CheckParams {
     pub involves_polymarket: bool,
     pub ms_since_last_tick: u64,
     pub market_exposure_pct: Decimal,
+    /// CB11: total aggregate exposure across all platforms as fraction of bankroll
+    pub total_exposure_pct: Decimal,
 }
 
 pub struct CircuitBreakers {
@@ -37,6 +39,8 @@ pub struct CircuitBreakers {
     max_open_positions: usize,
     /// CB5: max fraction of bankroll on any single market across all platforms
     max_single_market_exposure_pct: Decimal,
+    /// CB11: max total aggregate exposure across all platforms
+    max_total_exposure_pct: Decimal,
     /// CB7: halt after N consecutive failed trades
     max_consecutive_failures: usize,
 
@@ -70,6 +74,7 @@ impl CircuitBreakers {
             stale_feed_timeout_ms: stale_feed_timeout_secs * 1000,
             max_open_positions,
             max_single_market_exposure_pct: dec!(0.20),
+            max_total_exposure_pct: dec!(0.70),
             max_consecutive_failures: 5,
             trading_halted: false,
             halt_resume_at: None,
@@ -273,6 +278,19 @@ impl CircuitBreakers {
             });
         }
 
+        // CB11: Total Aggregate Exposure Kill Switch
+        if p.total_exposure_pct > self.max_total_exposure_pct {
+            self.trading_halted = true;
+            trips.push(BreakerTrip {
+                breaker_type: "CB11: Total Exposure Kill Switch".into(),
+                details: format!("Total exposure {:.1}% exceeds {:.1}% kill-switch limit",
+                    p.total_exposure_pct * Decimal::from(100),
+                    self.max_total_exposure_pct * Decimal::from(100)),
+                action: "Trading halted until positions close".into(),
+                resume_at: None,
+            });
+        }
+
         if !trips.is_empty() {
             warn!(count = trips.len(), "Circuit breakers tripped");
         }
@@ -328,6 +346,7 @@ mod tests {
             involves_polymarket: false,
             ms_since_last_tick: 100,
             market_exposure_pct: dec!(0),
+            total_exposure_pct: dec!(0),
         });
         assert_eq!(trips.len(), 1);
         assert_eq!(trips[0].breaker_type, "CB1: Max Single Trade Size");
@@ -356,6 +375,7 @@ mod tests {
             involves_polymarket: false,
             ms_since_last_tick: 100,
             market_exposure_pct: dec!(0),
+            total_exposure_pct: dec!(0),
         });
         assert_eq!(trips.len(), 1);
         assert_eq!(trips[0].breaker_type, "CB4: Max Platform Exposure");

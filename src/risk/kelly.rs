@@ -7,7 +7,7 @@ pub struct KellyCalculator {
     min_fraction: Decimal,
     max_fraction: Decimal,
     config_max_fraction: Decimal,
-    pub arb_loss_fraction: Decimal, // LOW-10
+    arb_loss_fraction: Decimal,
     hard_cap: Decimal,
 }
 

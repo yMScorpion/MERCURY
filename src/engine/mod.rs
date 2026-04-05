@@ -1,3 +1,4 @@
+//! Spread detection, order book management, and arbitrage orchestration.
 pub mod detector;
 pub mod market_registry;
 pub mod order_book;

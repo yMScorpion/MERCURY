@@ -200,6 +200,7 @@ mod pipeline_tests {
             involves_polymarket: false,
             ms_since_last_tick: 100,
             market_exposure_pct: dec!(0),
+            total_exposure_pct: dec!(0),
         });
 
         assert!(!trips.is_empty(), "CB2 should trip on daily loss exceeding limit");
@@ -466,6 +467,7 @@ mod pipeline_tests {
             involves_polymarket: false,
             ms_since_last_tick: 100,
             market_exposure_pct: dec!(0),
+            total_exposure_pct: dec!(0),
         });
 
         let has_cb7 = trips.iter().any(|t| t.breaker_type.contains("CB7"));

@@ -734,6 +734,15 @@ impl Database for SqliteDb {
         sqlx::query(&query).execute(&self.pool).await?;
         Ok(())
     }
+
+}
+
+impl SqliteDb {
+    /// Verify the database is reachable and responsive.
+    pub async fn health_check(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

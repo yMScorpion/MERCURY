@@ -278,6 +278,8 @@ pub struct RiskState {
     pub platform_b_exposure_pct: Decimal,
     pub market_exposure_pct: Decimal,
     pub exec_success_rate: Decimal,
+    /// Total aggregate exposure across all platforms as a fraction of bankroll
+    pub total_exposure_pct: Decimal,
 }
 
 pub enum BankrollMsg {
@@ -367,6 +369,7 @@ impl BankrollHandle {
                             platform_b_exposure_pct: manager.platform_exposure_pct(&platform_b),
                             market_exposure_pct: manager.market_exposure_pct(&market_id),
                             exec_success_rate: manager.exec_success_rate(),
+                            total_exposure_pct: manager.total_exposure_pct(),
                         };
                         let _ = reply.send(state);
                     }

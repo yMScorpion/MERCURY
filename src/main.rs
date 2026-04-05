@@ -656,6 +656,20 @@ async fn main() -> Result<()> {
 
     info!("All subsystems initialized. MERCURY engine running. Press Ctrl+C to shutdown.");
 
+    // SIGTERM handler (Unix only) — cancels the same token as Ctrl+C
+    #[cfg(unix)]
+    {
+        let cancel_for_sigterm = cancel_token.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                sigterm.recv().await;
+                info!("SIGTERM received — initiating graceful shutdown");
+                cancel_for_sigterm.cancel();
+            }
+        });
+    }
+
     // ─── Main Event Loop ───
     let mut tick_rx = tick_tx.subscribe();
     let mut trade_result_rx = trade_result_rx;

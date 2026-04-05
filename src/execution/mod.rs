@@ -1,3 +1,4 @@
+//! Trade execution: order routing, platform clients, and result processing.
 pub mod executor;
 pub mod polymarket_client;
 pub mod kalshi_client;
