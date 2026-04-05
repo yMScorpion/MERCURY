@@ -54,6 +54,10 @@ impl SettlementMonitor {
                         if let Some(info) = market.platforms.get(&position.platform) {
                             if position.platform == Platform::Kalshi {
                                 if let Some(client) = &self.kalshi_client {
+                                    // 150ms grace period: Kalshi settlement webhooks are asynchronous.
+                                    // The market resolution event arrives before the settlement record is
+                                    // written to their API. Without this delay, fetch_settlement_payout
+                                    // returns zero contracts and we book a $0 PnL instead of the real win.
                                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                                     if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
                                         realized_pnl = pnl;

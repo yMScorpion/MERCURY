@@ -50,6 +50,10 @@ impl GasOracle {
         update_tx: mpsc::Sender<GasUpdate>,
     ) -> Self {
         let http = reqwest::Client::builder()
+            .tcp_keepalive(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(300))
+            .pool_max_idle_per_host(5)
+            .tcp_nodelay(true)
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .user_agent("mercury-gas-oracle/1.0")

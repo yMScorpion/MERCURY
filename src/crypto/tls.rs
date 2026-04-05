@@ -26,9 +26,16 @@ pub fn build_reqwest_client_with_timeouts(
     connect_timeout: Duration,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .tcp_keepalive(Duration::from_secs(15))
-        .pool_idle_timeout(Duration::from_secs(300))
+        // 60s keepalive: sends TCP keepalive probes to detect dead connections before
+        // the next order attempt. Short enough to catch server-side idle timeouts
+        // (most load balancers close idle connections after 90s–5min).
+        .tcp_keepalive(Duration::from_secs(60))
+        // Keep idle connections warm for 10 minutes. Execution bursts are infrequent
+        // but latency-critical — we never want a cold TCP+TLS handshake on order submission.
+        .pool_idle_timeout(Duration::from_secs(600))
         .pool_max_idle_per_host(10)
+        // Disable Nagle's algorithm: send order bytes immediately without buffering.
+        // Critical for sub-100ms order latency.
         .tcp_nodelay(true)
         .timeout(request_timeout)
         .connect_timeout(connect_timeout);
@@ -41,6 +48,9 @@ pub fn build_reqwest_client_with_timeouts(
 }
 
 /// Build a `reqwest::Client` with default timeouts (10s request, 5s connect).
+///
+/// The connection pool is sized for execution bursts: up to 3 concurrent arbs,
+/// each needing one connection per platform = 6 active + headroom.
 pub fn build_reqwest_client() -> Result<reqwest::Client> {
     build_reqwest_client_with_timeouts(
         Duration::from_secs(10),

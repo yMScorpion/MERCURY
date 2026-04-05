@@ -34,9 +34,21 @@ impl BackupTask {
             interval.tick().await;
 
             let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-            // Ensure backup_dir doesn't contain traversal or injection chars
-            let safe_dir = self.backup_dir.replace("..", "").replace('\'', "");
-            let dest = format!("{}/mercury_backup_{}.db", safe_dir, timestamp);
+            // Canonicalize the backup directory to prevent path traversal. The timestamp
+            // is generated internally so only the directory needs validation.
+            let canon_dir = match std::fs::canonicalize(&self.backup_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(error = %e, dir = %self.backup_dir, "Backup dir canonicalization failed");
+                    continue;
+                }
+            };
+            let canon_str = canon_dir.to_string_lossy();
+            if !canon_str.starts_with("/opt/mercury") {
+                error!(dir = %canon_str, "Backup directory resolves outside /opt/mercury — skipping backup");
+                continue;
+            }
+            let dest = format!("{}/mercury_backup_{}.db", canon_str, timestamp);
 
             match self.db.backup_to_file(&dest).await {
                 Ok(()) => {

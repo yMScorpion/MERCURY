@@ -62,18 +62,10 @@ struct KalshiError {
 
 impl KalshiClient {
     pub fn new(rest_url: String, auth: KalshiAuth) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5));
-            
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-            
-        let http = builder.build().expect("failed to build Kalshi HTTP client");
+        // Use the centralized TLS builder which configures keep-alive, connection pool,
+        // TCP_NODELAY, and cert pinning consistently across all platform clients.
+        let http = crate::crypto::tls::build_reqwest_client()
+            .expect("failed to build Kalshi HTTP client");
         Self { http, rest_url, auth: Arc::new(auth) }
     }
 }
@@ -90,8 +82,19 @@ impl PlatformOrderClient for KalshiClient {
         // Avoid string parsing panics by directly safely converting rounded decimals
         let mut price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
         
-        // CRITICAL FIX: Kalshi explicitly rejects prices of 0 or 100.
-        price_cents = price_cents.clamp(1, 99);
+        // Kalshi rejects prices of 0 or 100 cents. If we reach these extremes the
+        // market is essentially resolved — abort rather than execute at a mutated price
+        // that no longer matches the spread engine's computation.
+        if price_cents <= 0 || price_cents >= 100 {
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
+                order_id: String::new(),
+                error: Some(format!("Price {}¢ is at or beyond Kalshi's 1–99¢ valid range — market likely near resolution", price_cents)),
+            });
+        }
         
         // CRIT-1 / MED-10 FIX: Prevent catastrophic fallback to i64::MAX on extreme size overflows
         let count = size.floor().to_i64().unwrap_or(0).clamp(1, 10_000);

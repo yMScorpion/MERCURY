@@ -45,6 +45,10 @@ pub struct MarketDiscovery {
 impl MarketDiscovery {
     pub fn new(platforms_config: PlatformsConfig, poll_interval_secs: u64, kalshi_auth: Option<crate::crypto::jwt::KalshiAuth>) -> Self {
         let http = reqwest::Client::builder()
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(300))
+            .pool_max_idle_per_host(4)
+            .tcp_nodelay(true)
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
             .user_agent("mercury-discovery/1.0")
