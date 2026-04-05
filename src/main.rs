@@ -304,11 +304,14 @@ async fn main() -> Result<()> {
     let circuit_breakers = Arc::new(std::sync::RwLock::new(cb_initial));
 
     // ─── Engine ───
-    // Assume spread engine's internal mutability has been similarly refactored
     let spread_engine = Arc::new(engine::spread::NetSpreadEngine::new(
         mercury_config.trading.min_net_spread_threshold,
     ));
-    // Provide initialization functions as available
+    
+    // Inject the startup gas threshold. 
+    // Ensure you also wire `gas_update_rx` in your event loop to continuously call 
+    // spread_engine.update_gas_price() as the Oracle pushes updates.
+    spread_engine.update_gas_price(mercury_config.trading.gas_price_max_gwei);
 
     let detector = Arc::new(engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,

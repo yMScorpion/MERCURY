@@ -171,7 +171,7 @@ impl ArbitrageDetector {
     }
 
     pub fn detect_for_market(
-        &mut self,
+        &self,
         market_id: &Uuid,
         registry: &MarketRegistry,
         uob: &UnifiedOrderBook,
@@ -182,7 +182,7 @@ impl ArbitrageDetector {
 
         // HIGH-1 FIX: Do not evaluate spreads if the engine is in a cooldown period
         // (e.g., recovering from a broadcast::Lagged event repopulating the order books).
-        if crate::types::now_ns() < self.paused_until_ns {
+        if crate::types::now_ns() < self.paused_until_ns.load(std::sync::atomic::Ordering::Relaxed) {
             return opportunities;
         }
 
@@ -228,13 +228,13 @@ impl ArbitrageDetector {
                 .unwrap_or(rust_decimal_macros::dec!(1.0));
 
             for spread in spreads {
-                self.stats.opportunities_detected += 1;
+            self.stats.opportunities_detected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                match self.run_gates_with_vol(&spread, book_a, book_b, pair.confidence, vol_multiplier) {
-                    Ok(()) => {
-                        self.stats.opportunities_passed += 1;
+            match self.run_gates_with_vol(&spread, book_a, book_b, pair.confidence, vol_multiplier) {
+                Ok(()) => {
+                    self.stats.opportunities_passed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                        // Fetch the native exchange identifiers and fee rates from the registry
+                    // Fetch the native exchange identifiers and fee rates from the registry
                         let info_a = registry.get_platform_info(&pair.market_id, &pair.platform_a);
                         let info_b = registry.get_platform_info(&pair.market_id, &pair.platform_b);
                         
@@ -305,22 +305,22 @@ impl ArbitrageDetector {
     }
 
         fn run_gates_with_vol(
-        &mut self,
-        spread: &SpreadResult,
-        book_a: &crate::engine::order_book::PlatformBook,
-        book_b: &crate::engine::order_book::PlatformBook,
-        confidence: f64,
-        vol_multiplier: Decimal,
-    ) -> Result<(), RejectionReason> {
-        let effective_min_spread = self.min_spread * vol_multiplier;
-        if spread.net_spread < effective_min_spread {
-            self.stats.gate1_rejected += 1;
-            return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
+            &self,
+            spread: &SpreadResult,
+            book_a: &crate::engine::order_book::PlatformBook,
+            book_b: &crate::engine::order_book::PlatformBook,
+            confidence: f64,
+            vol_multiplier: Decimal,
+        ) -> Result<(), RejectionReason> {
+            let effective_min_spread = self.min_spread * vol_multiplier;
+            if spread.net_spread < effective_min_spread {
+                self.stats.gate1_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
         }
 
         let min_available = spread.leg_a_available.min(spread.leg_b_available);
         if min_available < self.min_order_size {
-            self.stats.gate2_rejected += 1;
+            self.stats.gate2_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(RejectionReason::InsufficientLiquidity {
                 available: min_available,
                 required: self.min_order_size,
@@ -332,7 +332,7 @@ impl ArbitrageDetector {
 
         let age_a = now.saturating_sub(book_a.last_update_ns);
         if age_a > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
+            self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(RejectionReason::StaleData {
                 age_ms: age_a / 1_000_000,
                 max_ms: self.stale_timeout_ms,
