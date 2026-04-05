@@ -238,10 +238,10 @@ impl ArbitrageDetector {
                         let (plat_id_b, fee_bps_b) = if let Some(i) = info_b { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
 
                         let liquidity = spread.leg_a_available.min(spread.leg_b_available);
-                        let log_liq = if liquidity > Decimal::ZERO {
-                            (decimal_ln(liquidity) + Decimal::ONE).max(rust_decimal_macros::dec!(0.1))
+                        let log_liq = if liquidity > rust_decimal_macros::dec!(1.0) {
+                            decimal_ln(liquidity).max(rust_decimal_macros::dec!(0.1))
                         } else {
-                            Decimal::ONE
+                            rust_decimal_macros::dec!(0.1)
                         };
                         let confidence_dec = Decimal::try_from(pair.confidence).unwrap_or(Decimal::ONE);
                         let score = spread.net_spread * log_liq * confidence_dec;

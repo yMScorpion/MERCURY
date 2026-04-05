@@ -56,6 +56,22 @@ impl Metrics {
         self.ticks_received.fetch_add(1, Ordering::Relaxed);
         self.last_tick_ns.store(crate::types::now_ns(), Ordering::Relaxed);
     }
+
+    pub fn inc_ticks_for_platform(&self, platform: crate::types::Platform) {
+        self.ticks_received.fetch_add(1, Ordering::Relaxed);
+        let now = crate::types::now_ns();
+        self.last_tick_ns.store(now, Ordering::Relaxed);
+        if let Ok(map) = self.last_tick_ns_per_platform.read() {
+            if let Some(counter) = map.get(&platform) {
+                counter.store(now, Ordering::Relaxed);
+            }
+        }
+        if let Ok(map) = self.ticks_per_platform.read() {
+            if let Some(counter) = map.get(&platform) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     pub fn inc_spreads(&self) { self.spreads_evaluated.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_detected(&self) { self.opportunities_detected.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_executed(&self) { self.opportunities_executed.fetch_add(1, Ordering::Relaxed); }

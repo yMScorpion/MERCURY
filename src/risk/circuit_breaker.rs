@@ -254,7 +254,9 @@ impl CircuitBreakers {
             });
         }
 
-        // CB9: Stale Feed Data (CRITICAL FIX 3-E)
+        // CB9: Stale Feed Data — triggers if NO platform has sent a tick recently.
+        // Per-platform staleness is handled separately by ArbitrageDetector::set_platform_liveness.
+        // CB9 catches total market data blackout (e.g., network partition).
         let uptime_ms = (Utc::now() - self.engine_start_time).num_milliseconds() as u64;
         if uptime_ms > self.stale_feed_timeout_ms {
             if p.ms_since_last_tick > self.stale_feed_timeout_ms && p.ms_since_last_tick != u64::MAX {

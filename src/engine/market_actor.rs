@@ -99,9 +99,15 @@ impl MarketActor {
                 let metrics = self.metrics.clone();
                 
                 tokio::spawn(async move {
+                    // Pre-flight TTL check before spending bankroll actor capacity
+                    let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
+                    if crate::types::now_ns() > expiration_ns {
+                        open_positions.fetch_sub(0, std::sync::atomic::Ordering::Relaxed); // no-op, just skip
+                        return;
+                    }
+
                     // 1. Fetch live exposure state from the Bankroll Actor
                     let state = bankroll.get_risk_state(opp.leg_a.platform, opp.leg_b.platform, opp.market_id).await;
-                    
                     // 2. Strict Arb-Aware Kelly Sizing
                     let (approved_size, risk_score) = {
                         let k = kelly.read().unwrap();

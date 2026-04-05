@@ -19,6 +19,8 @@ pub struct PolymarketFeed {
     config: PolymarketConfig,
     db: std::sync::Arc<dyn crate::db::Database>,
     subscriptions: std::collections::HashMap<String, Uuid>,
+    /// Maps YES token ID → market UUID for O(1) tick lookup
+    yes_token_to_market: std::collections::HashMap<String, Uuid>,
     books: std::collections::HashMap<String, LocalOrderBook>,
     fee_rates: std::collections::HashMap<String, u16>,
     sequence: u64,
@@ -114,10 +116,18 @@ impl PolymarketFeed {
             let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
             fee_rates.insert(ws_key, fee_bps);
         }
+        // Build O(1) yes-token lookup map
+        let mut yes_token_to_market = std::collections::HashMap::new();
+        for (asset_id, &market_id) in &subs_map {
+            let yes_token = asset_id.split(',').next().unwrap_or(asset_id).to_string();
+            yes_token_to_market.insert(yes_token, market_id);
+        }
+
         Self {
             config,
             db,
             subscriptions: subs_map,
+            yes_token_to_market,
             books: std::collections::HashMap::new(),
             fee_rates,
             sequence: 0,
@@ -125,15 +135,7 @@ impl PolymarketFeed {
     }
 
     fn asset_to_market_id(&self, asset_id: &str) -> Option<Uuid> {
-        self.subscriptions.iter()
-            .find(|(a, _)| {
-                // CRITICAL FIX: Prevent prefix-matching bugs. 
-                // If asset_id is "123", a.starts_with("123") would erroneously match "12345,678".
-                // We strictly extract the YES token (first element) and do an exact match.
-                let first_token = a.split(',').next().unwrap_or(a.as_str());
-                first_token == asset_id
-            })
-            .map(|(_, id)| *id)
+        self.yes_token_to_market.get(asset_id).copied()
     }
 
     fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
@@ -270,14 +272,23 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                                     // Extract the YES token so emit_tick can correctly look up the fee rate
                                     let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
                                     self.fee_rates.insert(ws_key.clone(), info.fee_rate_bps);
+                                    self.yes_token_to_market.insert(ws_key.clone(), m.unified_id);
                                     new_subs.push(ws_key);
                                 }
                             }
                         }
                         if !new_subs.is_empty() {
                             // Initialize local order books for new assets before subscribing
-                            for asset_id in &new_subs {
-                                self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
+                            for ws_key in &new_subs {
+                                self.books.entry(ws_key.clone()).or_insert_with(LocalOrderBook::new);
+                                // Keep O(1) lookup map in sync with any newly added subscriptions
+                                if let Some(&market_id) = self.subscriptions.values()
+                                    .zip(self.subscriptions.keys())
+                                    .find(|(_, k)| k.split(',').next().map(|t| t == ws_key).unwrap_or(false))
+                                    .map(|(v, _)| v)
+                                {
+                                    self.yes_token_to_market.insert(ws_key.clone(), market_id);
+                                }
                             }
                             let sub_msg = SubscribeMessage { msg_type: "subscribe".into(), assets_ids: new_subs.clone() };
                             if let Ok(msg_text) = serde_json::to_string(&sub_msg) {

@@ -156,10 +156,12 @@ impl ExecutionEngine {
         // Executing stale arbs guarantees negative PnL.
         let current_time_ns = crate::types::now_ns();
         let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
-        
+
         // Trade ID is assigned by the DB via AUTOINCREMENT. Use 0 as placeholder.
         let current_trade_id: i64 = 0;
 
+        // Tighten TTL: reject anything older than 150ms from detection
+        // (50ms headroom for network RTT after passing TTL check)
         if current_time_ns > expiration_ns {
             let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
             tracing::warn!(

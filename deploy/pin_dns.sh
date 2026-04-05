@@ -25,6 +25,13 @@ resolve_and_pin() {
 resolve_and_pin "trading-api.kalshi.com"
 resolve_and_pin "clob.polymarket.com"
 resolve_and_pin "ws-subscriptions-clob.polymarket.com"
+# Kalshi WS uses the same host as REST (trading-api.kalshi.com) — already pinned above
+# Additional external dependencies
+resolve_and_pin "api.coingecko.com"
+resolve_and_pin "api.binance.com"
+resolve_and_pin "api.coinbase.com"
+resolve_and_pin "gasstation.polygon.technology"
+resolve_and_pin "rpc.ankr.com"
 
 echo "DNS pins written to $HOSTS_FILE"
 echo "Run 'cat /etc/hosts | grep MERCURY' to verify."

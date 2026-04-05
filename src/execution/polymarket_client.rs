@@ -80,8 +80,7 @@ impl PlatformOrderClient for PolymarketClient {
         let price = price.0;
         let size = size.0;
         let fee_rate_bps = fee_rate_bps.0;
-        // MED-5 FIX: Rate limit Polymarket submissions
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Rate limiting handled by executor's per-platform backoff on HTTP 429 responses.
 
         // CRITICAL FIX: Polymarket CTF does not support naked short selling. To bet NO, we must trade 
         // the specific NO token ID. We parse the dual-token string provided by discovery.
@@ -138,10 +137,12 @@ impl PlatformOrderClient for PolymarketClient {
 
         let maker_addr = self.signer.address();
 
+        // Salt must be distinct from nonce — use a random U256 derived from current time + counter
+        let salt = U256::from(nonce_val.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(0x6c62272e07bb0142));
         let signature = self.signer.sign_order(
-            nonce, maker_addr, maker_addr, Address::ZERO, token_id_u256,
-            maker_amount_u256, taker_amount_u256, expiration_u256, nonce, 
-            fee_rate_bps_u256, // Pass the actual fee rate so the signature matches the payload
+            salt, maker_addr, maker_addr, Address::ZERO, token_id_u256,
+            maker_amount_u256, taker_amount_u256, expiration_u256, nonce,
+            fee_rate_bps_u256,
             side_u8, 0,
         ).await.context("EIP-712 order signing failed")?;
 

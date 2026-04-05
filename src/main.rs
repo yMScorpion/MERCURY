@@ -792,7 +792,10 @@ async fn main() -> Result<()> {
     // INITIALIZE ACTORS HERE
     let mut market_channels: std::collections::HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<NormalizedTick>> = std::collections::HashMap::new();
     let bankroll_handle = risk::bankroll::BankrollHandle::new(bankroll_manager);
-    let registry = std::sync::Arc::new(std::sync::RwLock::new(registry)); // Convert to shared RwLock
+    let registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
+
+    loop {
+    tokio::select! {
             // ── Telegram Control Commands ──
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
@@ -850,7 +853,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                metrics.inc_ticks();
+                metrics.inc_ticks_for_platform(tick.platform);
 
                 if circuit_breakers.write().unwrap().is_trading_halted() {
                     continue;
@@ -1092,8 +1095,8 @@ async fn main() -> Result<()> {
                 info!("MERCURY shutdown complete");
                 break;
             }
-        }
-    }
+        } // end tokio::select!
+    } // end loop
 
     // Drain in-flight trades before killing subsystems.
     let current_open = cached_open_positions.load(Ordering::Relaxed);

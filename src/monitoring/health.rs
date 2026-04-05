@@ -9,7 +9,10 @@ use super::metrics::Metrics;
 /// HTTP server exposing both /health (JSON) and /metrics (Prometheus text format).
 /// Binds to localhost only (CRIT-2 security).
 pub async fn run_health_server(port: u16, metrics: Arc<Metrics>, stale_timeout_ms: u64) {
-    let addr = format!("127.0.0.1:{}", port);
+    // Bind to localhost by default for security. Set HEALTH_BIND_ADDR env var to
+    // override (e.g., "0.0.0.0" for Prometheus scraping from a remote host).
+    let bind_host = std::env::var("HEALTH_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{}:{}", bind_host, port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {

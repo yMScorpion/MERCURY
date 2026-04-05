@@ -50,11 +50,10 @@ impl SqliteDb {
         // Run migrations
         migrations::run_migrations(&pool).await?;
 
-        // 2.4.C FIX: Schema Version Validation
-        if let Ok(version) = sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations").fetch_one(&pool).await {
+        // Schema Version Validation — use our own schema_version table
+        if let Ok(version) = sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetch_one(&pool).await {
             tracing::info!("Database schema version validated: {}", version);
         }
-
         // FIX (LOW-7): Use a DIFFERENT index name than the migration's idx_positions_open
         // so this composite index coexists with the migration's single-column index.
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_positions_open_market ON positions(market_id, opened_at) WHERE closed = 0")

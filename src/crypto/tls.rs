@@ -63,8 +63,8 @@ pub fn build_reqwest_client_with_headers(
     headers: reqwest::header::HeaderMap,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .tcp_keepalive(Duration::from_secs(15))
-        .pool_idle_timeout(Duration::from_secs(300))
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_idle_timeout(Duration::from_secs(600))
         .pool_max_idle_per_host(10)
         .tcp_nodelay(true)
         .timeout(Duration::from_secs(10))

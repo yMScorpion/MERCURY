@@ -342,7 +342,7 @@ impl BankrollHandle {
                             let leg_b_exp = trade.approved_size * trade.leg_b_price;
                             manager.remove_exposure(trade.leg_a_platform, leg_a_exp);
                             manager.remove_exposure(trade.leg_b_platform, leg_b_exp);
-                            manager.remove_market_exposure(trade.market_id, trade.approved_size);
+                            manager.remove_market_exposure(trade.market_id, leg_a_exp + leg_b_exp);
                         } else {
                             let reserved_a = trade.approved_size * trade.leg_a_price;
                             let actual_a = trade.leg_a_size * trade.leg_a_fill_price;

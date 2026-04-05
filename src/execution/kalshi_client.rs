@@ -99,8 +99,9 @@ impl PlatformOrderClient for KalshiClient {
         // CRIT-1 / MED-10 FIX: Prevent catastrophic fallback to i64::MAX on extreme size overflows
         let count = size.floor().to_i64().unwrap_or(0).clamp(1, 10_000);
 
-        // MED-5: Basic rate limiting to prevent 429s on burst arbs
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Rate limiting is handled by CB6 (execution failure rate circuit breaker).
+        // A fixed 50ms sleep per order adds unacceptable latency for arbitrage.
+        // Remove unconditional sleep; the executor's rate_limits HashMap handles 429 backoff.
 
         let (kalshi_side, yes_price, no_price) = match side {
             Side::Yes => ("yes".to_string(), Some(price_cents), None),

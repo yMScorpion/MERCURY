@@ -37,10 +37,16 @@ pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> D
 /// Returns `Some(slippage)` — the absolute VWAP deviation from best quoted price.
 pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<Decimal> {
     // CRITICAL FIX: If target size is zero or less, we must return None.
-    // Returning Some(0) causes a fatal Divide-By-Zero panic in the spread engine 
-    // when it attempts to normalize fees (fee_a / actual_target).
     if depth.is_empty() || target_size <= Decimal::ZERO {
-        return None; 
+        return None;
+    }
+    // Debug assertion: depth must be monotonically ordered (ascending asks or descending bids)
+    #[cfg(debug_assertions)]
+    if depth.len() > 1 {
+        // Allow either ascending (asks) or descending (bids)
+        let is_ascending = depth.windows(2).all(|w| w[0].price <= w[1].price);
+        let is_descending = depth.windows(2).all(|w| w[0].price >= w[1].price);
+        debug_assert!(is_ascending || is_descending, "estimate_slippage: depth must be sorted");
     }
 
     let levels: Vec<&PriceLevel> = depth.iter().filter(|l| l.size > Decimal::ZERO).collect();

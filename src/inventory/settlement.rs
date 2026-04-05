@@ -69,12 +69,25 @@ impl SettlementMonitor {
                                 // The actual PnL (win/loss) must be manually adjusted by the operator.
                                 // Without this, exposure is permanently locked and the bankroll is understated.
                                 realized_pnl = Decimal::ZERO;
+                                tracing::error!(
+                                    position_id = position.id,
+                                    platform = %position.platform,
+                                    quantity = %position.quantity,
+                                    avg_entry = %position.avg_entry_price,
+                                    "SETTLEMENT PLACEHOLDER: Bankroll PnL will be incorrect until manually adjusted. \
+                                     Expected settlement: +${} (win) or -${} (loss)",
+                                    position.quantity,
+                                    position.quantity * position.avg_entry_price
+                                );
                                 let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
                                     severity: "critical".into(),
                                     message: format!(
                                         "Position #{} on {} resolved. Exposure freed with $0 PnL placeholder. \
-                                         MANUAL PnL ADJUSTMENT REQUIRED — check if position won ($1/contract) or lost ($0).",
-                                        position.id, position.platform
+                                         MANUAL PnL ADJUSTMENT REQUIRED — check if position won ($1/contract) or lost ($0).\n\
+                                         Expected: +${:.2} (win) or -${:.2} (loss)",
+                                        position.id, position.platform,
+                                        position.quantity,
+                                        position.quantity * position.avg_entry_price,
                                     ),
                                 });
                                 // Don't continue — fall through to the settlement_tx send and close_position below
