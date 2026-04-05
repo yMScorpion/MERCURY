@@ -347,7 +347,8 @@ impl KalshiFeed {
         tick_tx: &broadcast::Sender<NormalizedTick>,
     ) {
         let ticker = &data.market_ticker;
-        if let Some(book) = self.books.get_mut(ticker) {
+        {
+            let book = self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
             book.is_initialized = true; // CRITICAL FIX: Mark book safe for incoming deltas
             book.bids.clear();
             book.asks.clear();
@@ -371,19 +372,19 @@ impl KalshiFeed {
                         Decimal::from_str(&level[0]),
                         Decimal::from_str(&level[1]),
                     ) {
-                        // CRITICAL FIX: Kalshi sends bids for the NO token. 
+                        // CRITICAL FIX: Kalshi sends bids for the NO token.
                         // A bid for NO at 0.40 is equivalent to an ask for YES at 0.60.
                         let yes_ask_price = Decimal::ONE - p;
                         book.asks.insert(yes_ask_price, s);
                     }
                 }
             }
+        }  // mutable borrow on books ends here
 
-            self.sequence += 1;
-            if let Some(mut tick) = self.emit_tick(ticker) {
-                tick.sequence = self.sequence;
-                let _ = tick_tx.send(tick);
-            }
+        self.sequence += 1;
+        if let Some(mut tick) = self.emit_tick(ticker) {
+            tick.sequence = self.sequence;
+            let _ = tick_tx.send(tick);
         }
     }
 
@@ -395,15 +396,18 @@ impl KalshiFeed {
         let ticker = &data.market_ticker;
         let seq = data.seq.unwrap_or(0);
 
-        if let Some(book) = self.books.get(ticker) {
-            // Fix: If we receive a delta before a snapshot, explicitly trigger a reconnect.
-            if !book.is_initialized {
-                return Err("Delta received before snapshot — reconnect needed");
-            }
-            if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
-                warn!(ticker, expected = book.last_seq + 1, got = seq,
-                    "Kalshi sequence gap — reconnecting to get fresh snapshot");
-                return Err("Sequence gap detected");
+        match self.books.get(ticker) {
+            None => return Err("Delta received before snapshot — reconnect needed"),
+            Some(book) => {
+                // Fix: If we receive a delta before a snapshot, explicitly trigger a reconnect.
+                if !book.is_initialized {
+                    return Err("Delta received before snapshot — reconnect needed");
+                }
+                if seq > 0 && book.last_seq > 0 && seq != book.last_seq + 1 {
+                    warn!(ticker, expected = book.last_seq + 1, got = seq,
+                        "Kalshi sequence gap — reconnecting to get fresh snapshot");
+                    return Err("Sequence gap detected");
+                }
             }
         }
 
@@ -448,3 +452,7 @@ impl KalshiFeed {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "kalshi_tests.rs"]
+mod kalshi_tests;

@@ -384,8 +384,8 @@ impl ForecastExFeed {
                 if tag == target {
                     return Some(&parts[i][eq + 1..]);
                 }
-                // Stop at next entry group
-                if tag == "269" {
+                // Stop at next entry group (skip the 269 at the start position itself)
+                if tag == "269" && i > start {
                     return None;
                 }
             }
@@ -393,3 +393,7 @@ impl ForecastExFeed {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "forecastex_tests.rs"]
+mod forecastex_tests;

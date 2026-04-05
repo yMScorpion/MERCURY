@@ -7,12 +7,13 @@
 #[cfg(test)]
 mod pipeline_tests {
     use crate::db::SqliteDb;
+    use crate::db::traits::Database;
     use crate::engine::detector::ArbitrageDetector;
     use crate::engine::market_registry::MarketRegistry;
     use crate::engine::order_book::UnifiedOrderBook;
     use crate::engine::spread::NetSpreadEngine;
     use crate::risk::bankroll::BankrollManager;
-    use crate::risk::circuit_breaker::CircuitBreakers;
+    use crate::risk::circuit_breaker::{CircuitBreakers, CheckParams};
     use crate::risk::kelly::KellyCalculator;
     use crate::types::*;
     use rust_decimal::Decimal;
@@ -189,9 +190,17 @@ mod pipeline_tests {
         );
 
         // daily_loss_pct is 4% (percent-scale), max is 3% (fraction-scale → 3% percent-scale)
-        let trips = cb.check_all(
-            dec!(100), dec!(10000), dec!(4.0), dec!(0), dec!(0), 0, false, 100, dec!(0),
-        );
+        let trips = cb.check_all(&CheckParams {
+            trade_size: dec!(100),
+            bankroll: dec!(10000),
+            daily_loss_pct: dec!(4.0),
+            drawdown_pct: dec!(0),
+            platform_exposure_pct: dec!(0),
+            open_positions: 0,
+            involves_polymarket: false,
+            ms_since_last_tick: 100,
+            market_exposure_pct: dec!(0),
+        });
 
         assert!(!trips.is_empty(), "CB2 should trip on daily loss exceeding limit");
         assert!(cb.is_trading_halted(), "Trading should be halted after CB2 trip");
@@ -447,9 +456,17 @@ mod pipeline_tests {
             cb.record_execution(false);
         }
 
-        let trips = cb.check_all(
-            dec!(100), dec!(10000), dec!(0), dec!(0), dec!(0), 0, false, 100, dec!(0),
-        );
+        let trips = cb.check_all(&CheckParams {
+            trade_size: dec!(100),
+            bankroll: dec!(10000),
+            daily_loss_pct: dec!(0),
+            drawdown_pct: dec!(0),
+            platform_exposure_pct: dec!(0),
+            open_positions: 0,
+            involves_polymarket: false,
+            ms_since_last_tick: 100,
+            market_exposure_pct: dec!(0),
+        });
 
         let has_cb7 = trips.iter().any(|t| t.breaker_type.contains("CB7"));
         assert!(has_cb7, "CB7 should trip after 5 consecutive failures");

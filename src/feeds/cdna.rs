@@ -213,7 +213,8 @@ impl CdnaFeed {
         let instrument = &channel[5..];
 
         if let Some(data) = v.get("result").and_then(|r| r.get("data")) {
-            if let Some(book) = self.books.get_mut(instrument) {
+            {
+                let book = self.books.entry(instrument.to_string()).or_insert_with(CdnaOrderBook::new);
                 if let Some(bids) = data.get("bids").and_then(|b| b.as_array()) {
                     for entry in bids {
                         if let (Some(p), Some(s)) = (
@@ -235,15 +236,19 @@ impl CdnaFeed {
                         }
                     }
                 }
+            }  // mutable borrow on books ends here
 
-                self.sequence += 1;
-                if let Some(mut tick) = self.emit_tick(instrument) {
-                    tick.sequence = self.sequence;
-                    let _ = tick_tx.send(tick);
-                }
+            self.sequence += 1;
+            if let Some(mut tick) = self.emit_tick(instrument) {
+                tick.sequence = self.sequence;
+                let _ = tick_tx.send(tick);
             }
         }
 
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "cdna_tests.rs"]
+mod cdna_tests;

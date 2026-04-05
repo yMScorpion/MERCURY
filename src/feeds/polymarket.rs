@@ -351,12 +351,12 @@ impl PolymarketFeed {
         match msg.event_type.as_str() {
             "book" => {
                 if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
-                    let mut seq_to_emit = None;
-                    
-                    if let Some(book) = self.books.get_mut(asset_id) {
+                    let seq_to_emit;
+                    {
+                        let book = self.books.entry(asset_id.to_string()).or_insert_with(LocalOrderBook::new);
                         book.bids.clear();
                         book.asks.clear();
-                        
+
                         for e in bids {
                             if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
                                 book.bids.insert(p, s);
@@ -367,31 +367,29 @@ impl PolymarketFeed {
                                 book.asks.insert(p, s);
                             }
                         }
-                        
+
                         // LOW-7 FIX: Properly handle book_snapshot sequence tracking
-                        // Snapshots from Polymarket establish the base sequence. We accept it unconditionally 
+                        // Snapshots from Polymarket establish the base sequence. We accept it unconditionally
                         // because a snapshot means we reconnected and need to hard-reset our local tracker.
                         if let Some(msg_seq) = msg.sequence {
                             book.sequence = msg_seq;
                         } else {
                             book.sequence += 1;
                         }
-                        seq_to_emit = Some(book.sequence);
-                    }
-                    
-                    if let Some(seq) = seq_to_emit {
-                        if let Some(mut tick) = self.emit_tick(asset_id) {
-                            tick.sequence = seq;
-                            let _ = tick_tx.send(tick);
-                        }
+                        seq_to_emit = book.sequence;
+                    }  // mutable borrow ends
+
+                    if let Some(mut tick) = self.emit_tick(asset_id) {
+                        tick.sequence = seq_to_emit;
+                        let _ = tick_tx.send(tick);
                     }
                 }
             }
             "price_change" | "book_update" => {
                 if let Some(changes) = &msg.changes {
                     let mut seq_to_emit = None;
-                    
-                    if let Some(book) = self.books.get_mut(asset_id) {
+                    {
+                        let book = self.books.entry(asset_id.to_string()).or_insert_with(LocalOrderBook::new);
                         if let Some(msg_seq) = msg.sequence {
                             if msg_seq <= book.sequence && book.sequence > 0 { return Ok(()); }
                             if book.sequence > 0 && msg_seq > book.sequence + 1 {
@@ -401,7 +399,7 @@ impl PolymarketFeed {
                         } else {
                             book.sequence += 1;
                         }
-                        
+
                         for change in changes {
                             if let (Ok(p), Ok(s)) = (
                                 Decimal::from_str(&change.price),
@@ -411,8 +409,8 @@ impl PolymarketFeed {
                             }
                         }
                         seq_to_emit = Some(book.sequence);
-                    }
-                    
+                    }  // mutable borrow ends
+
                     if let Some(seq) = seq_to_emit {
                         if let Some(mut tick) = self.emit_tick(asset_id) {
                             tick.sequence = seq;
@@ -437,3 +435,7 @@ impl PolymarketFeed {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "polymarket_tests.rs"]
+mod polymarket_tests;

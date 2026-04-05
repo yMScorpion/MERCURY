@@ -440,3 +440,7 @@ fn normalize_question(q: &str) -> String {
         Ok(markets)
     }
 }
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod discovery_tests;

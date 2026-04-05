@@ -1,6 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
+#[cfg(test)]
+use rust_decimal::prelude::FromPrimitive;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
