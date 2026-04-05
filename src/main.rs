@@ -37,17 +37,50 @@ struct Cli {
     config: String,
 }
 
-// C-4 FIX: Helper to manually load env vars without exposing them to the process environment
-fn load_env_vars() -> std::collections::HashMap<String, String> {
-    let mut env_vars = std::collections::HashMap::new();
-    if let Ok(contents) = std::fs::read_to_string("/opt/mercury/.env") {
-        for line in contents.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                env_vars.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
+// PHASE 4: AOT (Ahead-of-Time) Configuration Validation
+async fn run_preflight_checks(config: &MercuryConfig) -> Result<()> {
+    tracing::info!("Executing Ahead-of-Time (AOT) pre-flight checks...");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()?;
+    let mut tasks = tokio::task::JoinSet::new();
+
+    // 1. Polygon RPC Check
+    let rpc_url = config.polygon_rpc.url.clone();
+    let rpc_client = client.clone();
+    tasks.spawn(async move {
+        let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1});
+        let resp = rpc_client.post(&rpc_url).json(&body).send().await.map_err(|e| anyhow::anyhow!("RPC connectivity failed: {}", e))?;
+        if !resp.status().is_success() { anyhow::bail!("RPC returned HTTP {}", resp.status()); }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // 2. Polymarket Check
+    if config.platforms.polymarket.enabled {
+        let poly_url = config.platforms.polymarket.rest_url.clone();
+        let client = client.clone();
+        tasks.spawn(async move {
+            let resp = client.get(format!("{}/markets", poly_url)).query(&[("limit", "1")]).send().await.map_err(|e| anyhow::anyhow!("Polymarket reachability failed: {}", e))?;
+            if !resp.status().is_success() { anyhow::bail!("Polymarket HTTP {}", resp.status()); }
+            Ok(())
+        });
     }
-    env_vars
+
+    // 3. Kalshi Check
+    if config.platforms.kalshi.enabled {
+        let kalshi_url = config.platforms.kalshi.rest_url.clone();
+        let client = client.clone();
+        tasks.spawn(async move {
+            let resp = client.get(format!("{}/markets", kalshi_url)).query(&[("limit", "1")]).send().await.map_err(|e| anyhow::anyhow!("Kalshi reachability failed: {}", e))?;
+            if !resp.status().is_success() { anyhow::bail!("Kalshi HTTP {}", resp.status()); }
+            Ok(())
+        });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        res??;
+    }
+
+    tracing::info!("All AOT pre-flight checks passed successfully.");
+    Ok(())
 }
 
 // H-5 FIX: Extracted duplicated report generation logic
@@ -148,6 +181,16 @@ async fn main() -> Result<()> {
 
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded");
+    
+    // PHASE 4: Robust Environment Loading using dotenvy
+    if let Err(e) = dotenvy::from_path("/opt/mercury/.env") {
+        warn!("dotenvy could not load /opt/mercury/.env: {}. Falling back to standard OS environment.", e);
+    } else {
+        info!("Secure environment injected from /opt/mercury/.env");
+    }
+    
+    // PHASE 4: Run Pre-flight Checks
+    run_preflight_checks(&mercury_config).await?;
 
     // PHASE 3: ForecastEx Panic safely removed
 
@@ -179,13 +222,11 @@ async fn main() -> Result<()> {
     let (settlement_tx, mut settlement_rx) = mpsc::channel::<SettlementResult>(100);
     let (liveness_tx, mut liveness_rx) = mpsc::channel::<(crate::types::Platform, bool)>(20);
 
-    let env_vars = load_env_vars();
-
     // ─── Telegram ───
-    let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_else(|_| env_vars.get("TELEGRAM_NOTIFICATION_TOKEN").cloned().unwrap_or_default());
-    let tg_daily_token = std::env::var("TELEGRAM_DAILY_TOKEN").unwrap_or_else(|_| env_vars.get("TELEGRAM_DAILY_TOKEN").cloned().unwrap_or_default());
-    let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_else(|_| env_vars.get("TELEGRAM_ALERTS_CHAT_ID").cloned().unwrap_or_default());
-    let tg_report_chat = std::env::var("TELEGRAM_REPORT_CHAT_ID").unwrap_or_else(|_| env_vars.get("TELEGRAM_REPORT_CHAT_ID").cloned().unwrap_or_default());
+    let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
+    let tg_daily_token = std::env::var("TELEGRAM_DAILY_TOKEN").unwrap_or_default();
+    let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_default();
+    let tg_report_chat = std::env::var("TELEGRAM_REPORT_CHAT_ID").unwrap_or_default();
 
     let tg_alerts_enabled = mercury_config.telegram.enabled
         && !tg_notification_token.is_empty()
@@ -271,10 +312,10 @@ async fn main() -> Result<()> {
 
     // ─── Initialize Platform Clients from Environment ───
     let polymarket_client = (|| -> Option<execution::polymarket_client::PolymarketClient> {
-        let api_key = std::env::var("POLYMARKET_API_KEY").unwrap_or_else(|_| env_vars.get("POLYMARKET_API_KEY").cloned().unwrap_or_default());
-        let api_secret = std::env::var("POLYMARKET_API_SECRET").unwrap_or_else(|_| env_vars.get("POLYMARKET_API_SECRET").cloned().unwrap_or_default());
-        let api_passphrase = std::env::var("POLYMARKET_API_PASSPHRASE").unwrap_or_else(|_| env_vars.get("POLYMARKET_API_PASSPHRASE").cloned().unwrap_or_default());
-        let wallet_key = std::env::var("POLYMARKET_WALLET_KEY").unwrap_or_else(|_| env_vars.get("POLYMARKET_WALLET_KEY").cloned().unwrap_or_default());
+        let api_key = std::env::var("POLYMARKET_API_KEY").unwrap_or_default();
+        let api_secret = std::env::var("POLYMARKET_API_SECRET").unwrap_or_default();
+        let api_passphrase = std::env::var("POLYMARKET_API_PASSPHRASE").unwrap_or_default();
+        let wallet_key = std::env::var("POLYMARKET_WALLET_KEY").unwrap_or_default();
         
         // LOW-3: Fail explicitly if credentials exist but are empty
         if api_key.is_empty() || api_secret.is_empty() || api_passphrase.is_empty() || wallet_key.is_empty() {
@@ -287,7 +328,6 @@ async fn main() -> Result<()> {
         std::env::remove_var("POLYMARKET_API_PASSPHRASE");
         std::env::remove_var("POLYMARKET_WALLET_KEY");
         let chain_id: u64 = std::env::var("POLYMARKET_CHAIN_ID")
-            .or_else(|_| env_vars.get("POLYMARKET_CHAIN_ID").cloned().ok_or(std::env::VarError::NotPresent))
             .unwrap_or_else(|_| "137".to_string())
             .parse()
             .unwrap_or(137);
@@ -309,8 +349,8 @@ async fn main() -> Result<()> {
     })();
 
     let kalshi_client = (|| -> Option<execution::kalshi_client::KalshiClient> {
-        let api_key_id = std::env::var("KALSHI_API_KEY_ID").unwrap_or_else(|_| env_vars.get("KALSHI_API_KEY_ID").cloned().unwrap_or_default());
-        let rsa_pem_path = std::env::var("KALSHI_RSA_PEM_PATH").unwrap_or_else(|_| env_vars.get("KALSHI_RSA_PEM_PATH").cloned().unwrap_or_default());
+        let api_key_id = std::env::var("KALSHI_API_KEY_ID").unwrap_or_default();
+        let rsa_pem_path = std::env::var("KALSHI_RSA_PEM_PATH").unwrap_or_default();
         if api_key_id.is_empty() || rsa_pem_path.is_empty() {
             return None;
         }
@@ -339,8 +379,8 @@ async fn main() -> Result<()> {
         if !mercury_config.platforms.cdna.enabled {
             return None;
         }
-        let api_key = std::env::var("CDNA_API_KEY").ok().or_else(|| env_vars.get("CDNA_API_KEY").cloned())?;
-        let api_secret = std::env::var("CDNA_API_SECRET").ok().or_else(|| env_vars.get("CDNA_API_SECRET").cloned())?;
+        let api_key = std::env::var("CDNA_API_KEY").ok()?;
+        let api_secret = std::env::var("CDNA_API_SECRET").ok()?;
         info!("CDNA client initialized");
         Some(execution::cdna_client::CdnaClient::new(
             mercury_config.platforms.cdna.rest_url.clone(),

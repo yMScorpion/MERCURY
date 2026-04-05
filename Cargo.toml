@@ -44,6 +44,9 @@ tokio-native-tls = "0.3"
 # File watching
 notify = "6"
 
+# Environment
+dotenvy = "0.15"
+
 # Crypto & Security
 alloy = { version = "0.8.2", features = ["full", "eip712"] }
 alloy-sol-types = "0.8.26"

@@ -94,26 +94,6 @@ src/types.rs
 
 # Files
 
-## File: .gitignore
-```
-/target
-*.db
-*.db-wal
-*.db-shm
-*.enc
-.env
-data/
-logs/
-keys/
-.cargo/
-.claude/
-.claude-flow/
-.serena/
-CLAUDE.md
-repomix-output.md
-.mcp.json
-```
-
 ## File: deploy/setup.sh
 ```bash
 #!/bin/bash
@@ -362,6 +342,26 @@ pub mod circuit_breaker;
 pub mod bot;
 pub mod alerts;
 pub mod reports;
+```
+
+## File: .gitignore
+```
+/target
+*.db
+*.db-wal
+*.db-shm
+*.enc
+.env
+data/
+logs/
+keys/
+.cargo/
+.claude/
+.claude-flow/
+.serena/
+CLAUDE.md
+repomix-output.md
+.mcp.json
 ```
 
 ## File: deploy/mercury.service
@@ -1886,6 +1886,144 @@ health:
   port: 9090
 ```
 
+## File: src/risk/kelly.rs
+```rust
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
+/// Kelly Criterion calculator for arbitrage
+pub struct KellyCalculator {
+    fraction: Decimal,
+    min_fraction: Decimal,
+    max_fraction: Decimal,
+    config_max_fraction: Decimal,
+    pub arb_loss_fraction: Decimal, // LOW-10
+    hard_cap: Decimal,
+}
+
+impl KellyCalculator {
+    pub fn new(fraction: Decimal, hard_cap: Decimal) -> Self {
+        Self {
+            fraction,
+            min_fraction: dec!(0.05),
+            max_fraction: fraction,
+            config_max_fraction: fraction,
+            arb_loss_fraction: dec!(0.005),
+            hard_cap,
+        }
+    }
+
+    pub fn update_fraction(&mut self, fraction: Decimal, hard_cap: Decimal) {
+        // MED-9: Do not reset current fraction immediately if in drawdown
+        self.config_max_fraction = fraction;
+        self.max_fraction = fraction;
+        self.hard_cap = hard_cap;
+    }
+
+    pub fn set_fraction(&mut self, fraction: Decimal) {
+        self.fraction = fraction.max(self.min_fraction).min(self.max_fraction);
+    }
+
+    pub fn fraction(&self) -> Decimal {
+        self.fraction
+    }
+
+    pub fn optimal_fraction(&self, exec_probability: Decimal, net_spread: Decimal) -> Decimal {
+        if net_spread <= Decimal::ZERO || exec_probability <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let p = exec_probability;
+        let q = Decimal::ONE - p;
+        // Arb-aware Kelly: on execution failure we lose only the fees paid on the
+        // failed leg (~0.5% of notional), not the full notional.  Using net_spread
+        // as `b` in the standard formula (which assumes full-notional loss) produces
+        // near-zero fractions for any realistic spread and kills all trading.
+        let arb_loss_fraction = self.arb_loss_fraction; // LOW-10
+        let full_kelly = (p * net_spread - q * arb_loss_fraction) / (net_spread + arb_loss_fraction);
+        if full_kelly <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        (full_kelly * self.fraction).max(Decimal::ZERO).min(self.hard_cap)
+    }
+
+    pub fn position_size(
+        &self,
+        bankroll: Decimal,
+        exec_probability: Decimal,
+        net_spread: Decimal,
+        max_single_trade_pct: Decimal,
+    ) -> Decimal {
+        let kelly_frac = self.optimal_fraction(exec_probability, net_spread);
+        let kelly_size = bankroll * kelly_frac;
+        let max_size = bankroll * max_single_trade_pct;
+        kelly_size.min(max_size).max(Decimal::ZERO)
+    }
+
+    pub fn multi_asset_kelly(
+        &self,
+        opportunities: &[(Decimal, Decimal)],
+        max_total_exposure: Decimal,
+    ) -> Vec<Decimal> {
+        if opportunities.is_empty() {
+            return Vec::new();
+        }
+        let individual: Vec<Decimal> = opportunities.iter()
+            .map(|(p, spread)| self.optimal_fraction(*p, *spread))
+            .collect();
+        let total: Decimal = individual.iter().sum();
+        if total <= Decimal::ZERO {
+            return vec![Decimal::ZERO; opportunities.len()];
+        }
+        if total > max_total_exposure {
+            let scale = max_total_exposure / total;
+            individual.iter().map(|f| *f * scale).collect()
+        } else {
+            individual
+        }
+    }
+
+    /// Adjust the Kelly fraction in response to drawdown.
+    ///
+    /// `current_drawdown_pct` must be **percent-scale** (0–100);
+    /// e.g. pass `15.0` for a 15 % drawdown from peak.
+    ///
+    /// Drawdown tiers reduce sizing; full recovery (≤ 5 %) restores `max_fraction`
+    /// so the system does not permanently under-trade after recovering from any loss.
+    pub fn adjust_for_drawdown(&mut self, current_drawdown_pct: Decimal) {
+        if current_drawdown_pct > dec!(15) {
+            self.set_fraction(dec!(0.10));
+        } else if current_drawdown_pct > dec!(10) {
+            self.set_fraction(dec!(0.15));
+        } else if current_drawdown_pct > dec!(5) {
+            self.set_fraction(dec!(0.20));
+        } else {
+            // Drawdown ≤ 5 %: fully recovered — restore to max fraction.
+            self.max_fraction = self.config_max_fraction; // MED-9: Restore config ceiling
+            self.set_fraction(self.max_fraction);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_optimal_fraction() {
+        let calc = KellyCalculator::new(dec!(0.10), dec!(0.10));
+        // High win prob, positive spread => > 0
+        let frac = calc.optimal_fraction(dec!(0.90), dec!(0.05));
+        assert!(frac > Decimal::ZERO);
+        assert!(frac <= dec!(0.10));
+
+        // Low win prob, negative spread => 0
+        let frac_bad = calc.optimal_fraction(dec!(0.10), dec!(-0.05));
+        assert_eq!(frac_bad, Decimal::ZERO);
+    }
+}
+```
+
 ## File: src/db/migrations.rs
 ```rust
 use anyhow::Result;
@@ -2073,6 +2211,129 @@ CREATE INDEX IF NOT EXISTS idx_pending_settlements_status ON pending_settlements
 "#;
 ```
 
+## File: src/inventory/reconciler.rs
+```rust
+use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+
+use crate::db::Database;
+use crate::types::*;
+use crate::execution::kalshi_client::KalshiClient;
+use crate::execution::polymarket_client::PolymarketClient;
+
+pub struct Reconciler {
+    db: Arc<dyn Database>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    kalshi_client: Option<KalshiClient>,
+    polymarket_client: Option<PolymarketClient>,
+    interval: Duration,
+    threshold: Decimal,
+}
+
+impl Reconciler {
+    pub fn new(
+        db: Arc<dyn Database>,
+        alert_tx: mpsc::Sender<AlertMessage>,
+        kalshi_client: Option<KalshiClient>,
+        polymarket_client: Option<PolymarketClient>,
+        interval_secs: u64,
+        threshold: Decimal,
+    ) -> Self {
+        Self { db, alert_tx, kalshi_client, polymarket_client, interval: Duration::from_secs(interval_secs), threshold }
+    }
+
+    pub async fn run(self) {
+        info!(interval_secs = self.interval.as_secs(), "Reconciler started");
+        let mut interval = tokio::time::interval(self.interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.reconcile().await {
+                error!(error = %e, "Reconciliation cycle failed");
+            }
+        }
+    }
+
+    async fn reconcile(&self) -> Result<()> {
+        // MED-7: Proactive DB connection ping
+        let _ = self.db.db_size_bytes().await.context("Database health check ping failed")?;
+
+        let positions = self.db.get_open_positions().await?;
+        let balances = self.db.get_all_balances().await?;
+
+        let audit = AuditEntry {
+            timestamp_ns: now_ns(),
+            module: "reconciler".into(),
+            event_type: "reconciliation_cycle".into(),
+            data: serde_json::json!({
+                "open_positions": positions.len(),
+                "platforms_with_balance": balances.len(),
+            }),
+        };
+        self.db.append_audit(&audit).await?;
+
+        for pos in &positions {
+            let age = chrono::Utc::now() - pos.opened_at;
+            if age.num_days() > 30 {
+                warn!(position_id = pos.id, market_id = %pos.market_id, age_days = age.num_days(), "Stale position detected");
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                    severity: "critical".into(),
+                    message: format!(
+                        "🚨 STALE POSITION: Position #{} on {} has been open for {} days. Manual resolution required. Market ID: {}",
+                        pos.id, pos.platform, age.num_days(), pos.market_id
+                    ),
+                });
+            }
+        }
+
+        // Active API Reconciliation (CRITICAL FIX 3-C)
+        if let Some(kalshi) = &self.kalshi_client {
+            if let Ok(live) = kalshi.get_balance().await {
+                let db_bal = balances.iter().find(|b| b.platform == Platform::Kalshi).map(|b| b.total).unwrap_or(Decimal::ZERO);
+                if (live - db_bal).abs() > self.threshold {
+                    warn!(live = %live, db = %db_bal, "Kalshi balance mismatch");
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                        severity: "warning".into(),
+                        message: format!("Kalshi Balance Mismatch: API=${live}, DB=${db_bal}"),
+                    });
+                }
+            }
+        }
+
+        if let Some(poly) = &self.polymarket_client {
+            if let Ok(live) = poly.get_balance().await {
+                let db_bal = balances.iter().find(|b| b.platform == Platform::Polymarket).map(|b| b.total).unwrap_or(Decimal::ZERO);
+                if (live - db_bal).abs() > self.threshold {
+                    warn!(live = %live, db = %db_bal, "Polymarket balance mismatch");
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                        severity: "warning".into(),
+                        message: format!("Polymarket Balance Mismatch: API=${live}, DB=${db_bal}"),
+                    });
+                }
+            }
+        }
+
+        let total_position_value: Decimal = positions.iter()
+            .map(|p| p.quantity * p.avg_entry_price)
+            .sum();
+
+        // Enforce DB TTL pruning to prevent unbounded disk growth (Issue #8)
+        if let Err(e) = self.db.prune_audit_log(7).await {
+            warn!(error = %e, "Failed to prune audit log during reconciliation cycle");
+        }
+
+        // MED-9 FIX: Bound WAL file growth periodically
+        let _ = self.db.checkpoint_wal().await;
+
+        info!(open_positions = positions.len(), total_position_value = %total_position_value.round_dp(2), "Reconciliation complete");
+        Ok(())
+    }
+}
+```
+
 ## File: src/inventory/unwind_watchdog.rs
 ```rust
 //! Periodic watchdog that detects orphaned (one-sided) positions and escalates.
@@ -2243,140 +2504,513 @@ impl UnwindWatchdog {
 }
 ```
 
-## File: src/risk/kelly.rs
+## File: src/monitoring/gas_oracle.rs
 ```rust
+use anyhow::Result;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal_macros::dec;
+use serde::Deserialize;
+use tokio::sync::mpsc;
+use tokio::time::{interval_at, Duration, Instant};
+use tracing::{debug, error, info, warn};
 
-/// Kelly Criterion calculator for arbitrage
-pub struct KellyCalculator {
-    fraction: Decimal,
-    min_fraction: Decimal,
-    max_fraction: Decimal,
-    config_max_fraction: Decimal,
-    pub arb_loss_fraction: Decimal, // LOW-10
-    hard_cap: Decimal,
+/// Sent to the main event loop whenever live prices are refreshed.
+#[derive(Debug, Clone)]
+pub struct GasUpdate {
+    /// Polygon network gas price in gwei.
+    pub gas_gwei: u64,
+    /// MATIC/USD spot price.
+    pub matic_usd: Decimal,
 }
 
-impl KellyCalculator {
-    pub fn new(fraction: Decimal, hard_cap: Decimal) -> Self {
+pub struct GasOracle {
+    rpc_url: String,
+    poll_interval_secs: u64,
+    update_tx: mpsc::Sender<GasUpdate>,
+    http: reqwest::Client,
+}
+
+// ── JSON shapes for eth_gasPrice RPC ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RpcResponse {
+    result: Option<String>,
+    /// JSON-RPC error object returned with HTTP 200 on RPC-level errors.
+    /// Must be captured to produce useful diagnostics instead of "null result".
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+}
+
+
+/// Alert if this many consecutive CoinGecko fetches fail (rate-limited or down).
+const COINGECKO_ALERT_THRESHOLD: u32 = 5;
+
+impl GasOracle {
+    pub fn new(
+        rpc_url: String,
+        poll_interval_secs: u64,
+        update_tx: mpsc::Sender<GasUpdate>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .user_agent("mercury-gas-oracle/1.0")
+            .build()
+            .expect("failed to build gas oracle HTTP client");
+        Self { rpc_url, poll_interval_secs, update_tx, http }
+    }
+
+    pub async fn run(self) {
+        // Start with sane defaults so the engine is never un-initialised.
+        let mut last_gwei: u64 = 50;
+        let mut last_matic: Decimal = dec!(0.50);
+        let mut coingecko_failures: u32 = 0;
+
+        let poll_secs = self.poll_interval_secs.max(10); // floor at 10s
+
+        // Use interval_at(now) so the FIRST tick fires immediately, pushing live
+        // values to the spread engine before any arb detection begins.
+        let mut ticker = interval_at(Instant::now(), Duration::from_secs(poll_secs));
+
+        info!(
+            interval_secs = poll_secs,
+            rpc_url = %self.rpc_url,
+            "Gas oracle started (first fetch is immediate)"
+        );
+
+        loop {
+            ticker.tick().await;
+
+            match self.fetch_gas_gwei().await {
+                Ok(gwei) => {
+                    if gwei != last_gwei {
+                        info!(gwei, prev_gwei = last_gwei, "Polygon gas price updated");
+                    } else {
+                        debug!(gwei, "Polygon gas price unchanged");
+                    }
+                    last_gwei = gwei;
+                }
+                Err(e) => {
+                    warn!(error = %e, last_gwei, "Failed to fetch Polygon gas price — keeping last value");
+                }
+            }
+
+            match self.fetch_matic_usd().await {
+                Ok(raw_price) => {
+                    // Hard floor/ceiling to prevent severe oracle glitches.
+                    // MATIC historically traded up to ~$2.92. Ceiling at $10 gives headroom
+                    // for appreciation while still blocking 1000x glitches.
+                    let price = raw_price.clamp(dec!(0.10), dec!(10.00));
+                    
+                    let change_pct = if last_matic > Decimal::ZERO {
+                        ((price - last_matic) / last_matic * Decimal::from(100)).abs()
+                    } else {
+                        Decimal::from(100)
+                    };
+                    if change_pct > dec!(1) {
+                        info!(matic_usd = %price, prev = %last_matic, "MATIC/USD price updated");
+                    } else {
+                        debug!(matic_usd = %price, "MATIC/USD price refreshed");
+                    }
+                    last_matic = price;
+                    coingecko_failures = 0;
+                }
+                Err(e) => {
+                    coingecko_failures += 1;
+                    if coingecko_failures >= COINGECKO_ALERT_THRESHOLD {
+                        error!(
+                            failures = coingecko_failures,
+                            last_matic = %last_matic,
+                            error = %e,
+                            "CoinGecko MATIC/USD fetch has failed {} consecutive times — \
+                             gas costs may be stale, arb profitability estimates unreliable",
+                            coingecko_failures
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            last_matic = %last_matic,
+                            failures = coingecko_failures,
+                            "Failed to fetch MATIC/USD — keeping last value"
+                        );
+                    }
+                }
+            }
+
+            let update = GasUpdate { gas_gwei: last_gwei, matic_usd: last_matic };
+            // Use try_send (non-blocking) so the oracle never blocks the main loop
+            if let Err(e) = self.update_tx.try_send(update) {
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        warn!("Gas oracle channel full — skipping update");
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        debug!("Gas oracle channel closed — exiting cleanly");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// PHASE 4: Deterministic Consensus Oracle for Gas
+    async fn fetch_gas_gwei(&self) -> Result<u64> {
+        let (rpc_primary, rpc_ankr, gas_station) = tokio::join!(
+            self.try_rpc_gas(&self.rpc_url),
+            self.try_rpc_gas("https://rpc.ankr.com/polygon"),
+            self.try_polygon_gas_station()
+        );
+
+        let mut values = Vec::new();
+        if let Ok(g) = rpc_primary { values.push(g); }
+        if let Ok(g) = rpc_ankr { values.push(g); }
+        if let Ok(g) = gas_station { values.push(g); }
+
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Consensus Oracle Failure: All Gas sources down"));
+        }
+
+        values.sort_unstable();
+        let median = if values.len() % 2 == 0 {
+            (values[values.len() / 2 - 1] + values[values.len() / 2]) / 2
+        } else {
+            values[values.len() / 2]
+        };
+
+        Ok(median.max(1)) // Floor at 1 gwei
+    }
+
+    /// PHASE 4: Deterministic Consensus Oracle for MATIC/USD
+    async fn fetch_matic_usd(&self) -> Result<Decimal> {
+        let (cg, bin, cb) = tokio::join!(
+            self.try_coingecko_price("polygon-ecosystem-token"),
+            self.try_binance_price("MATICUSDT"),
+            self.try_coinbase_price("MATIC-USD")
+        );
+
+        let mut prices = Vec::new();
+        if let Ok(p) = cg { prices.push(p); }
+        if let Ok(p) = bin { prices.push(p); }
+        if let Ok(p) = cb { prices.push(p); }
+
+        if prices.is_empty() {
+            return Err(anyhow::anyhow!("Consensus Oracle Failure: All MATIC/USD sources down"));
+        }
+
+        prices.sort();
+        let median = if prices.len() % 2 == 0 {
+            (prices[prices.len() / 2 - 1] + prices[prices.len() / 2]) / dec!(2.0)
+        } else {
+            prices[prices.len() / 2]
+        };
+
+        Ok(median)
+    }
+
+    async fn try_rpc_gas(&self, url: &str) -> Result<u64> {
+        let body = serde_json::json!({ "jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1 });
+        let resp: RpcResponse = self.http.post(url).json(&body).send().await?.json().await?;
+        if let Some(rpc_err) = resp.error { return Err(anyhow::anyhow!("RPC error: {}", rpc_err.message)); }
+        let hex = resp.result.ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result"))?;
+        let wei = u64::from_str_radix(hex.trim_start_matches("0x"), 16)?;
+        Ok(wei / 1_000_000_000)
+    }
+
+    async fn try_polygon_gas_station(&self) -> Result<u64> {
+        let resp: serde_json::Value = self.http.get("https://gasstation.polygon.technology/v2").send().await?.json().await?;
+        let standard = resp.pointer("/standard/maxFee").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("Gas station missing maxFee"))?;
+        Ok(standard.round() as u64)
+    }
+
+    async fn try_binance_price(&self, symbol: &str) -> Result<Decimal> {
+        let resp: serde_json::Value = self.http.get("https://api.binance.com/api/v3/ticker/price").query(&[("symbol", symbol)]).send().await?.json().await?;
+        let price_str = resp.get("price").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing price"))?;
+        std::str::FromStr::from_str(price_str).map_err(Into::into)
+    }
+
+    async fn try_coinbase_price(&self, pair: &str) -> Result<Decimal> {
+        let url = format!("https://api.coinbase.com/v2/prices/{}/spot", pair);
+        let resp: serde_json::Value = self.http.get(&url).send().await?.json().await?;
+        let price_str = resp.pointer("/data/amount").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Coinbase missing amount"))?;
+        std::str::FromStr::from_str(price_str).map_err(Into::into)
+    }
+
+    async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
+        let resp: serde_json::Value = self.http.get("https://api.coingecko.com/api/v3/simple/price").query(&[("ids", coin_id), ("vs_currencies", "usd")]).send().await?.json().await?;
+        let usd = resp.get(coin_id).and_then(|v| v.get("usd")).and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("Missing usd field"))?;
+        if !usd.is_finite() { return Err(anyhow::anyhow!("Non-finite value")); }
+        rust_decimal::Decimal::from_f64(usd).ok_or_else(|| anyhow::anyhow!("Decimal conversion failed"))
+    }
+}
+```
+
+## File: src/engine/market_registry.rs
+```rust
+use std::collections::HashMap;
+use uuid::Uuid;
+
+use crate::types::*;
+
+/// Cross-platform market matching registry
+#[derive(Clone)]
+pub struct MarketRegistry {
+    markets: HashMap<Uuid, Market>,
+    arb_pairs: HashMap<Uuid, Vec<ArbPair>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbPair {
+    pub market_id: Uuid,
+    pub platform_a: Platform,
+    pub platform_b: Platform,
+    pub confidence: f64,
+}
+
+impl MarketRegistry {
+    pub fn new() -> Self {
         Self {
-            fraction,
-            min_fraction: dec!(0.05),
-            max_fraction: fraction,
-            config_max_fraction: fraction,
-            arb_loss_fraction: dec!(0.005),
-            hard_cap,
+            markets: HashMap::new(),
+            arb_pairs: HashMap::new(),
         }
     }
 
-    pub fn update_fraction(&mut self, fraction: Decimal, hard_cap: Decimal) {
-        // MED-9: Do not reset current fraction immediately if in drawdown
-        self.config_max_fraction = fraction;
-        self.max_fraction = fraction;
-        self.hard_cap = hard_cap;
-    }
-
-    pub fn set_fraction(&mut self, fraction: Decimal) {
-        self.fraction = fraction.max(self.min_fraction).min(self.max_fraction);
-    }
-
-    pub fn fraction(&self) -> Decimal {
-        self.fraction
-    }
-
-    pub fn optimal_fraction(&self, exec_probability: Decimal, net_spread: Decimal) -> Decimal {
-        if net_spread <= Decimal::ZERO || exec_probability <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        let p = exec_probability;
-        let q = Decimal::ONE - p;
-        // Arb-aware Kelly: on execution failure we lose only the fees paid on the
-        // failed leg (~0.5% of notional), not the full notional.  Using net_spread
-        // as `b` in the standard formula (which assumes full-notional loss) produces
-        // near-zero fractions for any realistic spread and kills all trading.
-        let arb_loss_fraction = self.arb_loss_fraction; // LOW-10
-        let full_kelly = (p * net_spread - q * arb_loss_fraction) / (net_spread + arb_loss_fraction);
-        if full_kelly <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        (full_kelly * self.fraction).max(Decimal::ZERO).min(self.hard_cap)
-    }
-
-    pub fn position_size(
-        &self,
-        bankroll: Decimal,
-        exec_probability: Decimal,
-        net_spread: Decimal,
-        max_single_trade_pct: Decimal,
-    ) -> Decimal {
-        let kelly_frac = self.optimal_fraction(exec_probability, net_spread);
-        let kelly_size = bankroll * kelly_frac;
-        let max_size = bankroll * max_single_trade_pct;
-        kelly_size.min(max_size).max(Decimal::ZERO)
-    }
-
-    pub fn multi_asset_kelly(
-        &self,
-        opportunities: &[(Decimal, Decimal)],
-        max_total_exposure: Decimal,
-    ) -> Vec<Decimal> {
-        if opportunities.is_empty() {
-            return Vec::new();
-        }
-        let individual: Vec<Decimal> = opportunities.iter()
-            .map(|(p, spread)| self.optimal_fraction(*p, *spread))
+    /// Remove markets that have expired or been resolved. Call periodically
+    /// to prevent unbounded memory growth during long-running sessions.
+    pub fn evict_stale_markets(&mut self) -> Vec<Uuid> {
+        let now = chrono::Utc::now();
+        let stale_ids: Vec<Uuid> = self.markets.iter()
+            .filter(|(_, m)| {
+                matches!(m.status, crate::types::MarketStatus::Resolved | crate::types::MarketStatus::Expired)
+                || m.expiration < now - chrono::Duration::hours(1)
+            })
+            .map(|(id, _)| *id)
             .collect();
-        let total: Decimal = individual.iter().sum();
-        if total <= Decimal::ZERO {
-            return vec![Decimal::ZERO; opportunities.len()];
+        for id in &stale_ids {
+            self.markets.remove(id);
+            self.arb_pairs.remove(id);
         }
-        if total > max_total_exposure {
-            let scale = max_total_exposure / total;
-            individual.iter().map(|f| *f * scale).collect()
+        stale_ids // Return IDs so the tick router can drop the actor channels
+    }
+
+    /// Register a market. Idempotent: re-registering the same market_id updates
+    /// the market definition but does not create duplicate arb pairs.
+    pub fn register_market(&mut self, market: Market) {
+        let market_id = market.unified_id;
+        let platforms: Vec<Platform> = market.platforms.keys().cloned().collect();
+        let confidence = market.confidence;
+
+        self.markets.insert(market_id, market);
+
+        let mut pairs = Vec::new();
+        if confidence >= 0.95 {
+            for i in 0..platforms.len() {
+                for j in (i + 1)..platforms.len() {
+                    pairs.push(ArbPair {
+                        market_id,
+                        platform_a: platforms[i],
+                        platform_b: platforms[j],
+                        confidence,
+                    });
+                }
+            }
+        }
+        
+        if !pairs.is_empty() {
+            self.arb_pairs.insert(market_id, pairs);
         } else {
-            individual
+            self.arb_pairs.remove(&market_id);
         }
     }
 
-    /// Adjust the Kelly fraction in response to drawdown.
-    ///
-    /// `current_drawdown_pct` must be **percent-scale** (0–100);
-    /// e.g. pass `15.0` for a 15 % drawdown from peak.
-    ///
-    /// Drawdown tiers reduce sizing; full recovery (≤ 5 %) restores `max_fraction`
-    /// so the system does not permanently under-trade after recovering from any loss.
-    pub fn adjust_for_drawdown(&mut self, current_drawdown_pct: Decimal) {
-        if current_drawdown_pct > dec!(15) {
-            self.set_fraction(dec!(0.10));
-        } else if current_drawdown_pct > dec!(10) {
-            self.set_fraction(dec!(0.15));
-        } else if current_drawdown_pct > dec!(5) {
-            self.set_fraction(dec!(0.20));
-        } else {
-            // Drawdown ≤ 5 %: fully recovered — restore to max fraction.
-            self.max_fraction = self.config_max_fraction; // MED-9: Restore config ceiling
-            self.set_fraction(self.max_fraction);
+    pub fn get_arb_pairs_for_market(&self, market_id: &Uuid) -> Option<&Vec<ArbPair>> {
+        self.arb_pairs.get(market_id)
+    }
+
+    pub fn get_market(&self, id: &Uuid) -> Option<&Market> {
+        self.markets.get(id)
+    }
+
+    pub fn get_platform_info(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformMarketInfo> {
+        self.markets.get(market_id)?.platforms.get(platform)
+    }
+}
+```
+
+## File: src/execution/cdna_client.rs
+```rust
+use anyhow::{Context, Result};
+use ring::hmac;
+use rust_decimal::Decimal;
+use tracing::info;
+
+use super::executor::{OrderResult, PlatformOrderClient};
+use crate::types::Side;
+
+#[derive(Clone)]
+pub struct CdnaClient {
+    http: reqwest::Client,
+    rest_url: String,
+    api_key: String,
+    api_secret: String,
+}
+
+impl CdnaClient {
+    pub fn new(rest_url: String, api_key: String, api_secret: String) -> Self {
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5));
+            
+        // M-8 FIX: Explicit TLS Cert Pinning
+        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
+                builder = builder.add_root_certificate(cert);
+            }
         }
+            
+        let http = builder.build().expect("Failed to build CDNA HTTP client");
+        Self { http, rest_url, api_key, api_secret }
+    }
+
+    /// Build CDNA HMAC-SHA256 authentication headers.
+    ///
+    /// CDNA signs requests as:
+    ///   signature = HMAC-SHA256(api_secret, nonce + method + path + body)
+    /// where nonce is a millisecond-precision Unix timestamp string.
+    fn auth_headers(&self, method: &str, path: &str, body: &str) -> Result<[(&'static str, String); 3]> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock before Unix epoch")?
+            .as_millis()
+            .to_string();
+
+        let sign_payload = format!("{}{}{}{}", nonce, method, path, body);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, self.api_secret.as_bytes());
+        let tag = hmac::sign(&key, sign_payload.as_bytes());
+        let signature = hex::encode(tag.as_ref());
+
+        Ok([
+            ("X-API-KEY", self.api_key.clone()),
+            ("X-ACCESS-NONCE", nonce),
+            ("X-ACCESS-SIGN", signature),
+        ])
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_decimal_macros::dec;
+use crate::execution::executor::OrderAction;
 
-    #[test]
-    fn test_optimal_fraction() {
-        let calc = KellyCalculator::new(dec!(0.10), dec!(0.10));
-        // High win prob, positive spread => > 0
-        let frac = calc.optimal_fraction(dec!(0.90), dec!(0.05));
-        assert!(frac > Decimal::ZERO);
-        assert!(frac <= dec!(0.10));
+#[async_trait::async_trait]
+impl PlatformOrderClient for CdnaClient {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
+        let price = price.0;
+        let size = size.0;
+        let fee_rate_bps = fee_rate_bps.0;
+        info!(market_id, action = ?action, side = %side, price = %price, size = %size, "Submitting CDNA order");
+        
+        // CRITICAL FIX: CDNA uses a single instrument where long = YES, short = NO.
+        // To natively sell (unwind) a position, we must inverse the initial order type.
+        let side_str = match (action, side) {
+            (OrderAction::Buy, Side::Yes) => "BUY",
+            (OrderAction::Buy, Side::No) => "SELL",
+            (OrderAction::Sell, Side::Yes) => "SELL", // Dump long position
+            (OrderAction::Sell, Side::No) => "BUY",   // Cover short position
+        };
+        
+        // CRITICAL FIX: CDNA is priced exclusively in YES terms.
+        // If we are Buying NO at 0.40, we must SELL the instrument at 0.60.
+        // If we are covering a short (Selling NO aggressively at 0.01), we must BUY the instrument up to 0.99.
+        let cdna_price = match (action, side) {
+            (OrderAction::Buy, Side::Yes) => price,
+            (OrderAction::Buy, Side::No) => Decimal::ONE - price,
+            (OrderAction::Sell, Side::Yes) => price, 
+            (OrderAction::Sell, Side::No) => Decimal::ONE - price, 
+        };
+        
+        let path = "/private/create-order";
+        let url = format!("{}{}", self.rest_url, path);
+        let body_json = serde_json::json!({
+            "instrument_name": market_id,
+            "side": side_str,
+            "type": "LIMIT",
+            "price": cdna_price.to_string(),
+            "quantity": size.to_string(),
+            // Ensure FOK so partial fills don't leave orphaned legs
+            "time_in_force": "FOK", 
+        });
+        let body_str = body_json.to_string();
+        let auth = self.auth_headers("POST", path, &body_str)?;
 
-        // Low win prob, negative spread => 0
-        let frac_bad = calc.optimal_fraction(dec!(0.10), dec!(-0.05));
-        assert_eq!(frac_bad, Decimal::ZERO);
+        let resp = self.http
+            .post(&url)
+            .header(auth[0].0, &auth[0].1)
+            .header(auth[1].0, &auth[1].1)
+            .header(auth[2].0, &auth[2].1)
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await
+            .context("CDNA order failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
+                order_id: String::new(),
+                error: Some(format!("HTTP {}: {}", status, body_text)),
+            });
+        }
+
+        let result: serde_json::Value = resp.json().await.unwrap_or_default();
+
+        let filled = result.get("result").and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str()).map(|s| s == "FILLED").unwrap_or(false);
+        let fill_price = result.get("result").and_then(|r| r.get("avg_price"))
+            .and_then(|p| p.as_str()).and_then(|s| s.parse::<Decimal>().ok()).unwrap_or(price);
+
+        let api_status = result.get("result").and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str()).unwrap_or("UNKNOWN").to_string();
+
+        let fill_size = if filled { size } else { Decimal::ZERO };
+        // Compute taker fee from the bps rate supplied by the caller.
+        let fee = Decimal::from(fee_rate_bps) / Decimal::from(10_000) * fill_price * fill_size;
+        Ok(OrderResult {
+            filled,
+            fill_price: crate::types::Usd(fill_price),
+            fill_size: crate::types::Contracts(fill_size),
+            fee: crate::types::Usd(fee),
+            order_id: result.get("result").and_then(|r| r.get("order_id"))
+                .and_then(|o| o.as_str()).unwrap_or("").to_string(),
+            error: if !filled { Some(api_status) } else { None },
+        })
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let path = "/private/cancel-order";
+        let url = format!("{}{}", self.rest_url, path);
+        let body_str = serde_json::json!({"order_id": order_id}).to_string();
+        let auth = self.auth_headers("POST", path, &body_str)?;
+        let resp = self.http.post(&url)
+            .header(auth[0].0, &auth[0].1)
+            .header(auth[1].0, &auth[1].1)
+            .header(auth[2].0, &auth[2].1)
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await
+            .context("CDNA cancel_order send failed")?;
+        if !resp.status().is_success() {
+            tracing::warn!("CDNA cancel_order returned HTTP {}", resp.status());
+        }
+        Ok(())
     }
 }
 ```
@@ -2704,788 +3338,6 @@ pub async fn run_with_reconnect(
         warn!(%platform, backoff_secs, consecutive_failures, "Reconnecting after backoff");
         metrics.inc_reconnects();
         backoff_secs = (backoff_secs * 2).min(max_backoff);
-    }
-}
-```
-
-## File: src/inventory/reconciler.rs
-```rust
-use anyhow::{Context, Result};
-use rust_decimal::Decimal;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-
-use crate::db::Database;
-use crate::types::*;
-use crate::execution::kalshi_client::KalshiClient;
-use crate::execution::polymarket_client::PolymarketClient;
-
-pub struct Reconciler {
-    db: Arc<dyn Database>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    kalshi_client: Option<KalshiClient>,
-    polymarket_client: Option<PolymarketClient>,
-    interval: Duration,
-    threshold: Decimal,
-}
-
-impl Reconciler {
-    pub fn new(
-        db: Arc<dyn Database>,
-        alert_tx: mpsc::Sender<AlertMessage>,
-        kalshi_client: Option<KalshiClient>,
-        polymarket_client: Option<PolymarketClient>,
-        interval_secs: u64,
-        threshold: Decimal,
-    ) -> Self {
-        Self { db, alert_tx, kalshi_client, polymarket_client, interval: Duration::from_secs(interval_secs), threshold }
-    }
-
-    pub async fn run(self) {
-        info!(interval_secs = self.interval.as_secs(), "Reconciler started");
-        let mut interval = tokio::time::interval(self.interval);
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.reconcile().await {
-                error!(error = %e, "Reconciliation cycle failed");
-            }
-        }
-    }
-
-    async fn reconcile(&self) -> Result<()> {
-        // MED-7: Proactive DB connection ping
-        let _ = self.db.db_size_bytes().await.context("Database health check ping failed")?;
-
-        let positions = self.db.get_open_positions().await?;
-        let balances = self.db.get_all_balances().await?;
-
-        let audit = AuditEntry {
-            timestamp_ns: now_ns(),
-            module: "reconciler".into(),
-            event_type: "reconciliation_cycle".into(),
-            data: serde_json::json!({
-                "open_positions": positions.len(),
-                "platforms_with_balance": balances.len(),
-            }),
-        };
-        self.db.append_audit(&audit).await?;
-
-        for pos in &positions {
-            let age = chrono::Utc::now() - pos.opened_at;
-            if age.num_days() > 30 {
-                warn!(position_id = pos.id, market_id = %pos.market_id, age_days = age.num_days(), "Stale position detected");
-                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                    severity: "critical".into(),
-                    message: format!(
-                        "🚨 STALE POSITION: Position #{} on {} has been open for {} days. Manual resolution required. Market ID: {}",
-                        pos.id, pos.platform, age.num_days(), pos.market_id
-                    ),
-                });
-            }
-        }
-
-        // Active API Reconciliation (CRITICAL FIX 3-C)
-        if let Some(kalshi) = &self.kalshi_client {
-            if let Ok(live) = kalshi.get_balance().await {
-                let db_bal = balances.iter().find(|b| b.platform == Platform::Kalshi).map(|b| b.total).unwrap_or(Decimal::ZERO);
-                if (live - db_bal).abs() > self.threshold {
-                    warn!(live = %live, db = %db_bal, "Kalshi balance mismatch");
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                        severity: "warning".into(),
-                        message: format!("Kalshi Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    });
-                }
-            }
-        }
-
-        if let Some(poly) = &self.polymarket_client {
-            if let Ok(live) = poly.get_balance().await {
-                let db_bal = balances.iter().find(|b| b.platform == Platform::Polymarket).map(|b| b.total).unwrap_or(Decimal::ZERO);
-                if (live - db_bal).abs() > self.threshold {
-                    warn!(live = %live, db = %db_bal, "Polymarket balance mismatch");
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                        severity: "warning".into(),
-                        message: format!("Polymarket Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    });
-                }
-            }
-        }
-
-        let total_position_value: Decimal = positions.iter()
-            .map(|p| p.quantity * p.avg_entry_price)
-            .sum();
-
-        // Enforce DB TTL pruning to prevent unbounded disk growth (Issue #8)
-        if let Err(e) = self.db.prune_audit_log(7).await {
-            warn!(error = %e, "Failed to prune audit log during reconciliation cycle");
-        }
-
-        // MED-9 FIX: Bound WAL file growth periodically
-        let _ = self.db.checkpoint_wal().await;
-
-        info!(open_positions = positions.len(), total_position_value = %total_position_value.round_dp(2), "Reconciliation complete");
-        Ok(())
-    }
-}
-```
-
-## File: src/monitoring/gas_oracle.rs
-```rust
-use anyhow::Result;
-use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
-use rust_decimal_macros::dec;
-use serde::Deserialize;
-use tokio::sync::mpsc;
-use tokio::time::{interval_at, Duration, Instant};
-use tracing::{debug, error, info, warn};
-
-/// Sent to the main event loop whenever live prices are refreshed.
-#[derive(Debug, Clone)]
-pub struct GasUpdate {
-    /// Polygon network gas price in gwei.
-    pub gas_gwei: u64,
-    /// MATIC/USD spot price.
-    pub matic_usd: Decimal,
-}
-
-pub struct GasOracle {
-    rpc_url: String,
-    poll_interval_secs: u64,
-    update_tx: mpsc::Sender<GasUpdate>,
-    http: reqwest::Client,
-}
-
-// ── JSON shapes for eth_gasPrice RPC ───────────────────────────────────────
-
-#[derive(Deserialize)]
-struct RpcResponse {
-    result: Option<String>,
-    /// JSON-RPC error object returned with HTTP 200 on RPC-level errors.
-    /// Must be captured to produce useful diagnostics instead of "null result".
-    error: Option<RpcError>,
-}
-
-#[derive(Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-
-/// Alert if this many consecutive CoinGecko fetches fail (rate-limited or down).
-const COINGECKO_ALERT_THRESHOLD: u32 = 5;
-
-impl GasOracle {
-    pub fn new(
-        rpc_url: String,
-        poll_interval_secs: u64,
-        update_tx: mpsc::Sender<GasUpdate>,
-    ) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("mercury-gas-oracle/1.0")
-            .build()
-            .expect("failed to build gas oracle HTTP client");
-        Self { rpc_url, poll_interval_secs, update_tx, http }
-    }
-
-    pub async fn run(self) {
-        // Start with sane defaults so the engine is never un-initialised.
-        let mut last_gwei: u64 = 50;
-        let mut last_matic: Decimal = dec!(0.50);
-        let mut coingecko_failures: u32 = 0;
-
-        let poll_secs = self.poll_interval_secs.max(10); // floor at 10s
-
-        // Use interval_at(now) so the FIRST tick fires immediately, pushing live
-        // values to the spread engine before any arb detection begins.
-        let mut ticker = interval_at(Instant::now(), Duration::from_secs(poll_secs));
-
-        info!(
-            interval_secs = poll_secs,
-            rpc_url = %self.rpc_url,
-            "Gas oracle started (first fetch is immediate)"
-        );
-
-        loop {
-            ticker.tick().await;
-
-            match self.fetch_gas_gwei().await {
-                Ok(gwei) => {
-                    if gwei != last_gwei {
-                        info!(gwei, prev_gwei = last_gwei, "Polygon gas price updated");
-                    } else {
-                        debug!(gwei, "Polygon gas price unchanged");
-                    }
-                    last_gwei = gwei;
-                }
-                Err(e) => {
-                    warn!(error = %e, last_gwei, "Failed to fetch Polygon gas price — keeping last value");
-                }
-            }
-
-            match self.fetch_matic_usd().await {
-                Ok(raw_price) => {
-                    // Hard floor/ceiling to prevent severe oracle glitches.
-                    // MATIC historically traded up to ~$2.92. Ceiling at $10 gives headroom
-                    // for appreciation while still blocking 1000x glitches.
-                    let price = raw_price.clamp(dec!(0.10), dec!(10.00));
-                    
-                    let change_pct = if last_matic > Decimal::ZERO {
-                        ((price - last_matic) / last_matic * Decimal::from(100)).abs()
-                    } else {
-                        Decimal::from(100)
-                    };
-                    if change_pct > dec!(1) {
-                        info!(matic_usd = %price, prev = %last_matic, "MATIC/USD price updated");
-                    } else {
-                        debug!(matic_usd = %price, "MATIC/USD price refreshed");
-                    }
-                    last_matic = price;
-                    coingecko_failures = 0;
-                }
-                Err(e) => {
-                    coingecko_failures += 1;
-                    if coingecko_failures >= COINGECKO_ALERT_THRESHOLD {
-                        error!(
-                            failures = coingecko_failures,
-                            last_matic = %last_matic,
-                            error = %e,
-                            "CoinGecko MATIC/USD fetch has failed {} consecutive times — \
-                             gas costs may be stale, arb profitability estimates unreliable",
-                            coingecko_failures
-                        );
-                    } else {
-                        warn!(
-                            error = %e,
-                            last_matic = %last_matic,
-                            failures = coingecko_failures,
-                            "Failed to fetch MATIC/USD — keeping last value"
-                        );
-                    }
-                }
-            }
-
-            let update = GasUpdate { gas_gwei: last_gwei, matic_usd: last_matic };
-            // Use try_send (non-blocking) so the oracle never blocks the main loop
-            if let Err(e) = self.update_tx.try_send(update) {
-                match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        warn!("Gas oracle channel full — skipping update");
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        debug!("Gas oracle channel closed — exiting cleanly");
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Call `eth_gasPrice` on the configured Polygon RPC endpoint.
-    async fn fetch_gas_gwei(&self) -> Result<u64> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_gasPrice",
-            "params": [],
-            "id": 1
-        });
-
-        let resp: RpcResponse = self.http
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        // Surface JSON-RPC errors (returned with HTTP 200 by most RPC providers).
-        if let Some(rpc_err) = resp.error {
-            return Err(anyhow::anyhow!(
-                "Polygon RPC error {}: {}",
-                rpc_err.code,
-                rpc_err.message
-            ));
-        }
-
-        let hex = resp.result
-            .ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result (no error field)"))?;
-
-        // Result is a hex string like "0x..." representing wei
-        let hex_stripped = hex.trim_start_matches("0x");
-        let wei = u64::from_str_radix(hex_stripped, 16)
-            .map_err(|e| anyhow::anyhow!("failed to parse gas price hex '{}': {}", hex, e))?;
-        let gwei = wei / 1_000_000_000;
-        Ok(gwei.max(1)) // floor at 1 gwei to avoid zero gas cost in spread calc
-    }
-
-    /// Fetch MATIC/USD (or POL/USD) from CoinGecko's free simple/price endpoint.
-    /// Tries both the legacy `matic-network` and new `polygon-ecosystem-token` IDs.
-    async fn fetch_matic_usd(&self) -> Result<Decimal> {
-        // Try the current ID first, fall back to legacy
-        for coin_id in &["polygon-ecosystem-token", "matic-network"] {
-            match self.try_coingecko_price(coin_id).await {
-                Ok(price) => return Ok(price),
-                Err(e) => {
-                    tracing::debug!(coin_id, error = %e, "CoinGecko fetch failed, trying next ID");
-                }
-            }
-        }
-        // MED-6: Binance fallback for stability
-        match self.try_binance_price("MATICUSDT").await {
-            Ok(price) => return Ok(price),
-            Err(e) => tracing::debug!(error = %e, "Binance fallback failed"),
-        }
-        Err(anyhow::anyhow!("All price oracles failed for MATIC/POL price"))
-    }
-
-    async fn try_binance_price(&self, symbol: &str) -> Result<Decimal> {
-        let http_resp = self.http.get("https://api.binance.com/api/v3/ticker/price")
-            .query(&[("symbol", symbol)]).send().await?;
-        if !http_resp.status().is_success() {
-            return Err(anyhow::anyhow!("Binance HTTP {}", http_resp.status()));
-        }
-        let resp: serde_json::Value = http_resp.json().await?;
-        let price_str = resp.get("price").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing price"))?;
-        std::str::FromStr::from_str(price_str).map_err(|e| anyhow::anyhow!("Parse error: {}", e))
-    }
-
-    async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
-        let http_resp = self.http
-            .get("https://api.coingecko.com/api/v3/simple/price")
-            .query(&[("ids", coin_id), ("vs_currencies", "usd")])
-            .send()
-            .await?;
-
-        let status = http_resp.status();
-        if !status.is_success() {
-            let body = http_resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "CoinGecko HTTP {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-
-        let resp: serde_json::Value = http_resp.json().await?;
-        let usd = resp.get(coin_id)
-            .and_then(|v| v.get("usd"))
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
-
-        if !usd.is_finite() {
-            return Err(anyhow::anyhow!("CoinGecko value is not finite: {}", usd));
-        }
-        Decimal::from_f64(usd)
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert f64 to Decimal: {}", usd))
-    }
-}
-```
-
-## File: Cargo.toml
-```toml
-[package]
-name = "mercury"
-version = "0.1.0"
-edition = "2021"
-description = "Cross-market prediction arbitrage engine"
-
-[dependencies]
-# Async runtime & execution
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
-futures-util = "0.3"
-async-trait = "0.1"
-
-# Error handling & logging
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2.4"
-
-# Numerics & time
-rust_decimal = { version = "1", features = ["maths", "serde-with-str"] }
-rust_decimal_macros = "1"
-chrono = { version = "0.4", features = ["serde"] }
-
-# Data structures & caching
-uuid = { version = "1", features = ["v4", "serde"] }
-arrayvec = { version = "0.7", features = ["serde"] }
-lru = "0.12"
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-
-# Database
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "chrono", "uuid", "rust_decimal"] }
-
-# Networking & HTTP
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
-native-tls = "0.2"
-tokio-native-tls = "0.3"
-
-# File watching
-notify = "6"
-
-# Crypto & Security
-alloy = { version = "0.8.2", features = ["full", "eip712"] }
-alloy-sol-types = "0.8.26"
-hex = "0.4"
-zeroize = { version = "1", features = ["derive", "zeroize_derive"] }
-sha2 = "0.10"
-ring = "0.17"
-jsonwebtoken = "9"
-rsa = { version = "0.9", features = ["pem"] }
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-[dev-dependencies]
-proptest = "1.4"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
-```
-
-## File: src/db/traits.rs
-```rust
-use anyhow::Result;
-use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
-use rust_decimal::Decimal;
-use uuid::Uuid;
-
-use crate::types::*;
-
-#[async_trait]
-pub trait Database: Send + Sync + 'static {
-    // Markets
-    async fn upsert_market(&self, market: &Market) -> Result<()>;
-    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>>;
-    async fn get_active_markets(&self) -> Result<Vec<Market>>;
-    async fn get_suspended_markets(&self) -> Result<Vec<Market>>;
-    async fn update_market_status(&self, id: &Uuid, status: MarketStatus) -> Result<()>;
-
-    // Trades
-    async fn insert_trade(&self, result: &TradeResult) -> Result<i64>;
-    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>>;
-    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>>;
-    async fn get_trade_count(&self) -> Result<i64>;
-    /// Count distinct in-flight arbitrage pairs (not individual position records).
-    async fn get_open_arb_count(&self) -> Result<usize>;
-    /// Sum cumulative profit of all successful trades to recover state post-crash
-    async fn get_cumulative_profit(&self) -> Result<Decimal>;
-
-    // Positions
-    async fn upsert_position(&self, position: &Position) -> Result<()>;
-    /// Upsert two positions (both legs of an arbitrage) atomically.
-    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()>;
-    async fn get_open_positions(&self) -> Result<Vec<Position>>;
-    async fn close_position(&self, id: i64) -> Result<()>;
-    
-    // Settlement Queue
-    async fn enqueue_settlement(&self, position_id: i64, market_id: &Uuid, platform: Platform, quantity: Decimal, avg_entry: Decimal, pnl: Decimal) -> Result<()>;
-    async fn get_pending_settlements(&self) -> Result<Vec<(i64, SettlementResult)>>;
-    async fn mark_settlement_resolved(&self, id: i64) -> Result<()>;
-
-    // Balances
-    async fn update_balance(&self, balance: &PlatformBalance) -> Result<()>;
-    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>>;
-    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>>;
-
-    // Daily snapshots
-    async fn insert_daily_snapshot(&self, snapshot: &DailySnapshot) -> Result<()>;
-    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>>;
-    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()>;
-
-    // Audit log
-    async fn append_audit(&self, entry: &AuditEntry) -> Result<()>;
-    /// Batch-insert multiple audit entries in a single transaction.
-    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()>;
-
-    // Config history
-    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()>;
-
-    // Utility
-    async fn prune_audit_log(&self, keep_days: u32) -> Result<()>;
-    async fn checkpoint_wal(&self) -> Result<()>;
-    async fn db_size_bytes(&self) -> Result<u64>;
-    /// Create an atomic backup of the database to the given file path.
-    async fn backup_to_file(&self, dest_path: &str) -> Result<()>;
-}
-```
-
-## File: src/engine/market_registry.rs
-```rust
-use std::collections::HashMap;
-use uuid::Uuid;
-
-use crate::types::*;
-
-/// Cross-platform market matching registry
-#[derive(Clone)]
-pub struct MarketRegistry {
-    markets: HashMap<Uuid, Market>,
-    arb_pairs: HashMap<Uuid, Vec<ArbPair>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ArbPair {
-    pub market_id: Uuid,
-    pub platform_a: Platform,
-    pub platform_b: Platform,
-    pub confidence: f64,
-}
-
-impl MarketRegistry {
-    pub fn new() -> Self {
-        Self {
-            markets: HashMap::new(),
-            arb_pairs: HashMap::new(),
-        }
-    }
-
-    /// Remove markets that have expired or been resolved. Call periodically
-    /// to prevent unbounded memory growth during long-running sessions.
-    pub fn evict_stale_markets(&mut self) -> Vec<Uuid> {
-        let now = chrono::Utc::now();
-        let stale_ids: Vec<Uuid> = self.markets.iter()
-            .filter(|(_, m)| {
-                matches!(m.status, crate::types::MarketStatus::Resolved | crate::types::MarketStatus::Expired)
-                || m.expiration < now - chrono::Duration::hours(1)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &stale_ids {
-            self.markets.remove(id);
-            self.arb_pairs.remove(id);
-        }
-        stale_ids // Return IDs so the tick router can drop the actor channels
-    }
-
-    /// Register a market. Idempotent: re-registering the same market_id updates
-    /// the market definition but does not create duplicate arb pairs.
-    pub fn register_market(&mut self, market: Market) {
-        let market_id = market.unified_id;
-        let platforms: Vec<Platform> = market.platforms.keys().cloned().collect();
-        let confidence = market.confidence;
-
-        self.markets.insert(market_id, market);
-
-        let mut pairs = Vec::new();
-        if confidence >= 0.95 {
-            for i in 0..platforms.len() {
-                for j in (i + 1)..platforms.len() {
-                    pairs.push(ArbPair {
-                        market_id,
-                        platform_a: platforms[i],
-                        platform_b: platforms[j],
-                        confidence,
-                    });
-                }
-            }
-        }
-        
-        if !pairs.is_empty() {
-            self.arb_pairs.insert(market_id, pairs);
-        } else {
-            self.arb_pairs.remove(&market_id);
-        }
-    }
-
-    pub fn get_arb_pairs_for_market(&self, market_id: &Uuid) -> Option<&Vec<ArbPair>> {
-        self.arb_pairs.get(market_id)
-    }
-
-    pub fn get_market(&self, id: &Uuid) -> Option<&Market> {
-        self.markets.get(id)
-    }
-
-    pub fn get_platform_info(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformMarketInfo> {
-        self.markets.get(market_id)?.platforms.get(platform)
-    }
-}
-```
-
-## File: src/execution/cdna_client.rs
-```rust
-use anyhow::{Context, Result};
-use ring::hmac;
-use rust_decimal::Decimal;
-use tracing::info;
-
-use super::executor::{OrderResult, PlatformOrderClient};
-use crate::types::Side;
-
-#[derive(Clone)]
-pub struct CdnaClient {
-    http: reqwest::Client,
-    rest_url: String,
-    api_key: String,
-    api_secret: String,
-}
-
-impl CdnaClient {
-    pub fn new(rest_url: String, api_key: String, api_secret: String) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5));
-            
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-            
-        let http = builder.build().expect("Failed to build CDNA HTTP client");
-        Self { http, rest_url, api_key, api_secret }
-    }
-
-    /// Build CDNA HMAC-SHA256 authentication headers.
-    ///
-    /// CDNA signs requests as:
-    ///   signature = HMAC-SHA256(api_secret, nonce + method + path + body)
-    /// where nonce is a millisecond-precision Unix timestamp string.
-    fn auth_headers(&self, method: &str, path: &str, body: &str) -> Result<[(&'static str, String); 3]> {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("system clock before Unix epoch")?
-            .as_millis()
-            .to_string();
-
-        let sign_payload = format!("{}{}{}{}", nonce, method, path, body);
-        let key = hmac::Key::new(hmac::HMAC_SHA256, self.api_secret.as_bytes());
-        let tag = hmac::sign(&key, sign_payload.as_bytes());
-        let signature = hex::encode(tag.as_ref());
-
-        Ok([
-            ("X-API-KEY", self.api_key.clone()),
-            ("X-ACCESS-NONCE", nonce),
-            ("X-ACCESS-SIGN", signature),
-        ])
-    }
-}
-
-use crate::execution::executor::OrderAction;
-
-#[async_trait::async_trait]
-impl PlatformOrderClient for CdnaClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
-        let price = price.0;
-        let size = size.0;
-        let fee_rate_bps = fee_rate_bps.0;
-        info!(market_id, action = ?action, side = %side, price = %price, size = %size, "Submitting CDNA order");
-        
-        // CRITICAL FIX: CDNA uses a single instrument where long = YES, short = NO.
-        // To natively sell (unwind) a position, we must inverse the initial order type.
-        let side_str = match (action, side) {
-            (OrderAction::Buy, Side::Yes) => "BUY",
-            (OrderAction::Buy, Side::No) => "SELL",
-            (OrderAction::Sell, Side::Yes) => "SELL", // Dump long position
-            (OrderAction::Sell, Side::No) => "BUY",   // Cover short position
-        };
-        
-        // CRITICAL FIX: CDNA is priced exclusively in YES terms.
-        // If we are Buying NO at 0.40, we must SELL the instrument at 0.60.
-        // If we are covering a short (Selling NO aggressively at 0.01), we must BUY the instrument up to 0.99.
-        let cdna_price = match (action, side) {
-            (OrderAction::Buy, Side::Yes) => price,
-            (OrderAction::Buy, Side::No) => Decimal::ONE - price,
-            (OrderAction::Sell, Side::Yes) => price, 
-            (OrderAction::Sell, Side::No) => Decimal::ONE - price, 
-        };
-        
-        let path = "/private/create-order";
-        let url = format!("{}{}", self.rest_url, path);
-        let body_json = serde_json::json!({
-            "instrument_name": market_id,
-            "side": side_str,
-            "type": "LIMIT",
-            "price": cdna_price.to_string(),
-            "quantity": size.to_string(),
-            // Ensure FOK so partial fills don't leave orphaned legs
-            "time_in_force": "FOK", 
-        });
-        let body_str = body_json.to_string();
-        let auth = self.auth_headers("POST", path, &body_str)?;
-
-        let resp = self.http
-            .post(&url)
-            .header(auth[0].0, &auth[0].1)
-            .header(auth[1].0, &auth[1].1)
-            .header(auth[2].0, &auth[2].1)
-            .header("Content-Type", "application/json")
-            .body(body_str)
-            .send()
-            .await
-            .context("CDNA order failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            return Ok(OrderResult {
-                filled: false,
-                fill_price: crate::types::Usd(Decimal::ZERO),
-                fill_size: crate::types::Contracts(Decimal::ZERO),
-                fee: crate::types::Usd(Decimal::ZERO),
-                order_id: String::new(),
-                error: Some(format!("HTTP {}: {}", status, body_text)),
-            });
-        }
-
-        let result: serde_json::Value = resp.json().await.unwrap_or_default();
-
-        let filled = result.get("result").and_then(|r| r.get("status"))
-            .and_then(|s| s.as_str()).map(|s| s == "FILLED").unwrap_or(false);
-        let fill_price = result.get("result").and_then(|r| r.get("avg_price"))
-            .and_then(|p| p.as_str()).and_then(|s| s.parse::<Decimal>().ok()).unwrap_or(price);
-
-        let api_status = result.get("result").and_then(|r| r.get("status"))
-            .and_then(|s| s.as_str()).unwrap_or("UNKNOWN").to_string();
-
-        let fill_size = if filled { size } else { Decimal::ZERO };
-        // Compute taker fee from the bps rate supplied by the caller.
-        let fee = Decimal::from(fee_rate_bps) / Decimal::from(10_000) * fill_price * fill_size;
-        Ok(OrderResult {
-            filled,
-            fill_price: crate::types::Usd(fill_price),
-            fill_size: crate::types::Contracts(fill_size),
-            fee: crate::types::Usd(fee),
-            order_id: result.get("result").and_then(|r| r.get("order_id"))
-                .and_then(|o| o.as_str()).unwrap_or("").to_string(),
-            error: if !filled { Some(api_status) } else { None },
-        })
-    }
-
-    async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let path = "/private/cancel-order";
-        let url = format!("{}{}", self.rest_url, path);
-        let body_str = serde_json::json!({"order_id": order_id}).to_string();
-        let auth = self.auth_headers("POST", path, &body_str)?;
-        let resp = self.http.post(&url)
-            .header(auth[0].0, &auth[0].1)
-            .header(auth[1].0, &auth[1].1)
-            .header(auth[2].0, &auth[2].1)
-            .header("Content-Type", "application/json")
-            .body(body_str)
-            .send()
-            .await
-            .context("CDNA cancel_order send failed")?;
-        if !resp.status().is_success() {
-            tracing::warn!("CDNA cancel_order returned HTTP {}", resp.status());
-        }
-        Ok(())
     }
 }
 ```
@@ -4407,6 +4259,148 @@ mod tests {
 }
 ```
 
+## File: Cargo.toml
+```toml
+[package]
+name = "mercury"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-market prediction arbitrage engine"
+
+[dependencies]
+# Async runtime & execution
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+async-trait = "0.1"
+
+# Error handling & logging
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2.4"
+
+# Numerics & time
+rust_decimal = { version = "1", features = ["maths", "serde-with-str"] }
+rust_decimal_macros = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Data structures & caching
+uuid = { version = "1", features = ["v4", "serde"] }
+arrayvec = { version = "0.7", features = ["serde"] }
+lru = "0.12"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Database
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "chrono", "uuid", "rust_decimal"] }
+
+# Networking & HTTP
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+
+# File watching
+notify = "6"
+
+# Environment
+dotenvy = "0.15"
+
+# Crypto & Security
+alloy = { version = "0.8.2", features = ["full", "eip712"] }
+alloy-sol-types = "0.8.26"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive", "zeroize_derive"] }
+sha2 = "0.10"
+ring = "0.17"
+jsonwebtoken = "9"
+rsa = { version = "0.9", features = ["pem"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+```
+
+## File: src/db/traits.rs
+```rust
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
+use uuid::Uuid;
+
+use crate::types::*;
+
+#[async_trait]
+pub trait Database: Send + Sync + 'static {
+    // Markets
+    async fn upsert_market(&self, market: &Market) -> Result<()>;
+    async fn get_market(&self, id: &Uuid) -> Result<Option<Market>>;
+    async fn get_active_markets(&self) -> Result<Vec<Market>>;
+    async fn get_suspended_markets(&self) -> Result<Vec<Market>>;
+    async fn update_market_status(&self, id: &Uuid, status: MarketStatus) -> Result<()>;
+
+    // Trades
+    async fn insert_trade(&self, result: &TradeResult) -> Result<i64>;
+    async fn get_trades_since(&self, since: DateTime<Utc>) -> Result<Vec<TradeResult>>;
+    async fn get_trades_for_date(&self, date: NaiveDate) -> Result<Vec<TradeResult>>;
+    async fn get_trade_count(&self) -> Result<i64>;
+    /// Count distinct in-flight arbitrage pairs (not individual position records).
+    async fn get_open_arb_count(&self) -> Result<usize>;
+    /// Sum cumulative profit of all successful trades to recover state post-crash
+    async fn get_cumulative_profit(&self) -> Result<Decimal>;
+
+    // Positions
+    async fn upsert_position(&self, position: &Position) -> Result<()>;
+    /// Upsert two positions (both legs of an arbitrage) atomically.
+    async fn upsert_position_pair(&self, pos_a: &Position, pos_b: &Position) -> Result<()>;
+    async fn get_open_positions(&self) -> Result<Vec<Position>>;
+    async fn close_position(&self, id: i64) -> Result<()>;
+    
+    // Settlement Queue
+    async fn enqueue_settlement(&self, position_id: i64, market_id: &Uuid, platform: Platform, quantity: Decimal, avg_entry: Decimal, pnl: Decimal) -> Result<()>;
+    async fn get_pending_settlements(&self) -> Result<Vec<(i64, SettlementResult)>>;
+    async fn mark_settlement_resolved(&self, id: i64) -> Result<()>;
+
+    // Balances
+    async fn update_balance(&self, balance: &PlatformBalance) -> Result<()>;
+    async fn get_balance(&self, platform: Platform) -> Result<Option<PlatformBalance>>;
+    async fn get_all_balances(&self) -> Result<Vec<PlatformBalance>>;
+
+    // Daily snapshots
+    async fn insert_daily_snapshot(&self, snapshot: &DailySnapshot) -> Result<()>;
+    async fn get_daily_snapshot(&self, date: NaiveDate) -> Result<Option<DailySnapshot>>;
+    async fn mark_report_sent(&self, date: NaiveDate) -> Result<()>;
+
+    // Audit log
+    async fn append_audit(&self, entry: &AuditEntry) -> Result<()>;
+    /// Batch-insert multiple audit entries in a single transaction.
+    async fn append_audit_batch(&self, entries: &[AuditEntry]) -> Result<()>;
+
+    // Config history
+    async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()>;
+
+    // Utility
+    async fn prune_audit_log(&self, keep_days: u32) -> Result<()>;
+    async fn checkpoint_wal(&self) -> Result<()>;
+    async fn db_size_bytes(&self) -> Result<u64>;
+    /// Create an atomic backup of the database to the given file path.
+    async fn backup_to_file(&self, dest_path: &str) -> Result<()>;
+}
+```
+
 ## File: src/feeds/cdna.rs
 ```rust
 use anyhow::{Context, Result};
@@ -4786,183 +4780,6 @@ mod tests {
 }
 ```
 
-## File: src/inventory/settlement.rs
-```rust
-use anyhow::Result;
-use rust_decimal::Decimal;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{info, warn};
-
-use crate::db::Database;
-use crate::types::*;
-use serde_json::json;
-
-pub struct SettlementMonitor {
-    db: Arc<dyn Database>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    settlement_tx: mpsc::Sender<SettlementResult>,
-    check_interval: Duration,
-    kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
-}
-
-impl SettlementMonitor {
-    pub fn new(
-        db: Arc<dyn Database>, 
-        alert_tx: mpsc::Sender<AlertMessage>, 
-        settlement_tx: mpsc::Sender<SettlementResult>,
-        check_interval_secs: u64,
-        kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
-    ) -> Self {
-        Self { db, alert_tx, settlement_tx, check_interval: Duration::from_secs(check_interval_secs), kalshi_client }
-    }
-
-    pub async fn run(self) {
-        info!("Settlement monitor started");
-        let mut interval = tokio::time::interval(self.check_interval);
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.check_settlements().await {
-                tracing::error!(error = %e, "Settlement check failed");
-            }
-        }
-    }
-
-    async fn check_settlements(&self) -> Result<()> {
-        let positions = self.db.get_open_positions().await?;
-        let now = chrono::Utc::now();
-
-        for position in &positions {
-            if let Some(market) = self.db.get_market(&position.market_id).await? {
-                match market.status {
-                    MarketStatus::Resolved => {
-                        info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
-                        
-                        let mut realized_pnl = -(position.avg_entry_price * position.quantity); // Assume total loss by default
-                        
-                        if let Some(info) = market.platforms.get(&position.platform) {
-                            if position.platform == Platform::Kalshi {
-                                if let Some(client) = &self.kalshi_client {
-                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                                    if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
-                                        realized_pnl = pnl;
-                                    }
-                                }
-                            } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
-                                tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
-                                // Credit a conservative zero-PnL settlement so the locked exposure is freed.
-                                // The actual PnL (win/loss) must be manually adjusted by the operator.
-                                // Without this, exposure is permanently locked and the bankroll is understated.
-                                realized_pnl = Decimal::ZERO;
-                                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                    severity: "critical".into(),
-                                    message: format!(
-                                        "Position #{} on {} resolved. Exposure freed with $0 PnL placeholder. \
-                                         MANUAL PnL ADJUSTMENT REQUIRED — check if position won ($1/contract) or lost ($0).",
-                                        position.id, position.platform
-                                    ),
-                                });
-                                // Don't continue — fall through to the settlement_tx send and close_position below
-                            }
-                        }
-                        
-                        let audit = AuditEntry {
-                            timestamp_ns: now_ns(),
-                            module: "settlement".into(),
-                            event_type: "position_settled".into(),
-                            data: json!({
-                                "position_id": position.id,
-                                "market": market.question,
-                                "platform": position.platform.to_string(),
-                                "quantity": position.quantity.to_string(),
-                                "avg_entry_price": position.avg_entry_price.to_string(),
-                                "realized_pnl": realized_pnl.to_string(),
-                            }),
-                        };
-                        if let Err(e) = self.db.append_audit(&audit).await {
-                            warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
-                        }
-                        
-                        // PHASE 3 FIX: Backpressure-Aware Persistent Settlement Queue
-                        // Log to SQLite first. If the Bankroll actor is saturated, the background 
-                        // worker will autonomously retry with exponential backoff. No PnL is ever dropped.
-                        if let Err(e) = self.db.enqueue_settlement(
-                            position.id,
-                            &position.market_id,
-                            position.platform,
-                            position.quantity,
-                            position.avg_entry_price,
-                            realized_pnl
-                        ).await {
-                            tracing::error!(error = %e, position_id = position.id, "CRITICAL: Failed to enqueue settlement. PnL not persisted.");
-                        } else {
-                            self.db.close_position(position.id).await?;
-                        }
-                        
-                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                            severity: "info".into(),
-                            message: format!(
-                                "Position #{} settled: {} {} on {} ({} contracts @ ${})\nRealized PnL: ${}",
-                                position.id, position.side, market.question,
-                                position.platform, position.quantity, position.avg_entry_price, realized_pnl.round_dp(2),
-                            ),
-                        });
-                    }
-                    MarketStatus::Expired => {
-                        warn!(position_id = position.id, market = %market.question, "Market expired with open position");
-                        let audit = AuditEntry {
-                            timestamp_ns: now_ns(),
-                            module: "settlement".into(),
-                            event_type: "position_expired".into(),
-                            data: json!({
-                                "position_id": position.id,
-                                "market": market.question,
-                                "platform": position.platform.to_string(),
-                            }),
-                        };
-                        if let Err(e) = self.db.append_audit(&audit).await {
-                            warn!(error = %e, position_id = position.id, "Failed to write expiry audit entry");
-                        }
-                        self.db.close_position(position.id).await?;
-                    }
-                    _ => {
-                        let time_to_expiry = market.expiration - now;
-                        if time_to_expiry.num_hours() < 1 && time_to_expiry.num_seconds() > 0 {
-                            let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                severity: "warning".into(),
-                                message: format!(
-                                    "Position #{} expiring in {:.0} minutes: {}",
-                                    position.id, time_to_expiry.num_minutes(), market.question,
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Drain pending settlements queue
-        if let Ok(pending) = self.db.get_pending_settlements().await {
-            for (id, settlement) in pending {
-                match self.settlement_tx.try_send(settlement.clone()) {
-                    Ok(()) => {
-                        let _ = self.db.mark_settlement_resolved(id).await;
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!("Bankroll actor saturated. Settlement {} retained in DB queue for backoff retry.", id);
-                        break; // Stop draining, try again next tick
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-```
-
 ## File: src/telegram/bot.rs
 ```rust
 use anyhow::{Context, Result};
@@ -5137,6 +4954,183 @@ impl TelegramBot {
         let url = format!("{}{}/answerCallbackQuery", TELEGRAM_API_BASE, self.token.as_str());
         let body = AnswerCallbackQueryRequest { callback_query_id: query_id, text };
         self.client.post(&url).json(&body).send().await?;
+        Ok(())
+    }
+}
+```
+
+## File: src/inventory/settlement.rs
+```rust
+use anyhow::Result;
+use rust_decimal::Decimal;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::db::Database;
+use crate::types::*;
+use serde_json::json;
+
+pub struct SettlementMonitor {
+    db: Arc<dyn Database>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    settlement_tx: mpsc::Sender<SettlementResult>,
+    check_interval: Duration,
+    kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+}
+
+impl SettlementMonitor {
+    pub fn new(
+        db: Arc<dyn Database>, 
+        alert_tx: mpsc::Sender<AlertMessage>, 
+        settlement_tx: mpsc::Sender<SettlementResult>,
+        check_interval_secs: u64,
+        kalshi_client: Option<crate::execution::kalshi_client::KalshiClient>,
+    ) -> Self {
+        Self { db, alert_tx, settlement_tx, check_interval: Duration::from_secs(check_interval_secs), kalshi_client }
+    }
+
+    pub async fn run(self) {
+        info!("Settlement monitor started");
+        let mut interval = tokio::time::interval(self.check_interval);
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.check_settlements().await {
+                tracing::error!(error = %e, "Settlement check failed");
+            }
+        }
+    }
+
+    async fn check_settlements(&self) -> Result<()> {
+        let positions = self.db.get_open_positions().await?;
+        let now = chrono::Utc::now();
+
+        for position in &positions {
+            if let Some(market) = self.db.get_market(&position.market_id).await? {
+                match market.status {
+                    MarketStatus::Resolved => {
+                        info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
+                        
+                        let mut realized_pnl = -(position.avg_entry_price * position.quantity); // Assume total loss by default
+                        
+                        if let Some(info) = market.platforms.get(&position.platform) {
+                            if position.platform == Platform::Kalshi {
+                                if let Some(client) = &self.kalshi_client {
+                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                    if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
+                                        realized_pnl = pnl;
+                                    }
+                                }
+                            } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
+                                tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
+                                // Credit a conservative zero-PnL settlement so the locked exposure is freed.
+                                // The actual PnL (win/loss) must be manually adjusted by the operator.
+                                // Without this, exposure is permanently locked and the bankroll is understated.
+                                realized_pnl = Decimal::ZERO;
+                                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                    severity: "critical".into(),
+                                    message: format!(
+                                        "Position #{} on {} resolved. Exposure freed with $0 PnL placeholder. \
+                                         MANUAL PnL ADJUSTMENT REQUIRED — check if position won ($1/contract) or lost ($0).",
+                                        position.id, position.platform
+                                    ),
+                                });
+                                // Don't continue — fall through to the settlement_tx send and close_position below
+                            }
+                        }
+                        
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_settled".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                                "quantity": position.quantity.to_string(),
+                                "avg_entry_price": position.avg_entry_price.to_string(),
+                                "realized_pnl": realized_pnl.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write settlement audit entry");
+                        }
+                        
+                        // PHASE 3 FIX: Backpressure-Aware Persistent Settlement Queue
+                        // Log to SQLite first. If the Bankroll actor is saturated, the background 
+                        // worker will autonomously retry with exponential backoff. No PnL is ever dropped.
+                        if let Err(e) = self.db.enqueue_settlement(
+                            position.id,
+                            &position.market_id,
+                            position.platform,
+                            position.quantity,
+                            position.avg_entry_price,
+                            realized_pnl
+                        ).await {
+                            tracing::error!(error = %e, position_id = position.id, "CRITICAL: Failed to enqueue settlement. PnL not persisted.");
+                        } else {
+                            self.db.close_position(position.id).await?;
+                        }
+                        
+                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                            severity: "info".into(),
+                            message: format!(
+                                "Position #{} settled: {} {} on {} ({} contracts @ ${})\nRealized PnL: ${}",
+                                position.id, position.side, market.question,
+                                position.platform, position.quantity, position.avg_entry_price, realized_pnl.round_dp(2),
+                            ),
+                        });
+                    }
+                    MarketStatus::Expired => {
+                        warn!(position_id = position.id, market = %market.question, "Market expired with open position");
+                        let audit = AuditEntry {
+                            timestamp_ns: now_ns(),
+                            module: "settlement".into(),
+                            event_type: "position_expired".into(),
+                            data: json!({
+                                "position_id": position.id,
+                                "market": market.question,
+                                "platform": position.platform.to_string(),
+                            }),
+                        };
+                        if let Err(e) = self.db.append_audit(&audit).await {
+                            warn!(error = %e, position_id = position.id, "Failed to write expiry audit entry");
+                        }
+                        self.db.close_position(position.id).await?;
+                    }
+                    _ => {
+                        let time_to_expiry = market.expiration - now;
+                        if time_to_expiry.num_hours() < 1 && time_to_expiry.num_seconds() > 0 {
+                            let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                severity: "warning".into(),
+                                message: format!(
+                                    "Position #{} expiring in {:.0} minutes: {}",
+                                    position.id, time_to_expiry.num_minutes(), market.question,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Drain pending settlements queue
+        if let Ok(pending) = self.db.get_pending_settlements().await {
+            for (id, settlement) in pending {
+                match self.settlement_tx.try_send(settlement.clone()) {
+                    Ok(()) => {
+                        let _ = self.db.mark_settlement_resolved(id).await;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!("Bankroll actor saturated. Settlement {} retained in DB queue for backoff retry.", id);
+                        break; // Stop draining, try again next tick
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -5829,310 +5823,6 @@ impl ConfigManager {
 }
 ```
 
-## File: src/engine/detector.rs
-```rust
-use rust_decimal::Decimal;
-use tracing::{debug};
-use uuid::Uuid;
-
-use crate::engine::market_registry::MarketRegistry;
-use crate::engine::order_book::UnifiedOrderBook;
-use crate::engine::spread::{NetSpreadEngine, SpreadResult};
-use crate::types::*;
-
-/// Rejection reason for the 5-gate pipeline
-#[derive(Debug, Clone)]
-pub enum RejectionReason {
-    BelowSpreadThreshold(Decimal),
-    InsufficientLiquidity { available: Decimal, required: Decimal },
-    StaleData { age_ms: u64, max_ms: u64 },
-    CorrelationExposure { current: Decimal, max: Decimal },
-    RiskBudgetExceeded { reason: String },
-}
-
-/// Deterministic natural logarithm approximation using Taylor series for `rust_decimal`
-/// Eliminates non-deterministic `f64` math across CPU architectures.
-fn decimal_ln(mut x: Decimal) -> Decimal {
-    if x <= Decimal::ZERO { return Decimal::ZERO; }
-    if x == Decimal::ONE { return Decimal::ZERO; }
-    
-    let mut shifts = 0;
-    let two = rust_decimal_macros::dec!(2.0);
-    
-    // Range reduction to [0.5, 1.5] for faster convergence
-    while x > rust_decimal_macros::dec!(1.5) { x /= two; shifts += 1; }
-    while x < rust_decimal_macros::dec!(0.5) { x *= two; shifts -= 1; }
-
-    let z = (x - Decimal::ONE) / (x + Decimal::ONE);
-    let z_squared = z * z;
-    let mut term = z;
-    let mut sum = z;
-    let mut n = Decimal::ONE;
-
-    for _ in 1..20 {
-        term *= z_squared;
-        n += two;
-        let next_sum = sum + term / n;
-        if next_sum == sum { break; }
-        sum = next_sum;
-    }
-    
-    // ln(2) ≈ 0.6931471805599453
-    (sum * two) + (Decimal::from(shifts) * rust_decimal_macros::dec!(0.6931471805599453))
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct DetectorStats {
-    pub opportunities_detected: u64,
-    pub gate1_rejected: u64,
-    pub gate2_rejected: u64,
-    pub gate3_rejected: u64,
-    pub gate4_rejected: u64,
-    pub gate5_rejected: u64,
-    pub opportunities_passed: u64,
-}
-
-#[derive(Clone)]
-pub struct ArbitrageDetector {
-    min_spread: Decimal,
-    min_order_size: Decimal,
-    stale_timeout_ms: u64,
-    max_concurrent: usize,
-    active_arbs: usize,
-    pub stats: DetectorStats,
-    paused_until_ns: u64,
-    platform_liveness: std::collections::HashMap<Platform, bool>,
-}
-
-impl ArbitrageDetector {
-    pub fn new(
-        min_spread: Decimal,
-        min_order_size: Decimal,
-        stale_timeout_ms: u64,
-        max_concurrent: usize,
-    ) -> Self {
-        Self {
-            min_spread,
-            min_order_size,
-            stale_timeout_ms,
-            max_concurrent,
-            active_arbs: 0,
-            stats: DetectorStats::default(),
-            paused_until_ns: 0,
-            platform_liveness: std::collections::HashMap::new(),
-        }
-    }
-
-    pub fn set_platform_liveness(&mut self, platform: Platform, is_alive: bool) {
-        self.platform_liveness.insert(platform, is_alive);
-    }
-
-    pub fn pause_detection_until(&mut self, ns: u64) {
-        self.paused_until_ns = ns;
-    }
-
-    pub fn update_thresholds(&mut self, min_spread: Decimal, stale_timeout_ms: u64, max_concurrent: usize) {
-        self.min_spread = min_spread;
-        self.stale_timeout_ms = stale_timeout_ms;
-        self.max_concurrent = max_concurrent;
-    }
-
-    pub fn set_active_arbs(&mut self, count: usize) {
-        self.active_arbs = count;
-    }
-
-    /// Evaluates spreads ONLY for the specific market that just updated.
-    pub fn detect_for_market(
-        &mut self,
-        market_id: &Uuid,
-        registry: &MarketRegistry,
-        uob: &UnifiedOrderBook,
-        spread_engine: &NetSpreadEngine,
-        target_size: Decimal,
-    ) -> Vec<ArbitrageOpportunity> {
-        let mut opportunities = Vec::new();
-
-        // HIGH-1 FIX: Do not evaluate spreads if the engine is in a cooldown period
-        // (e.g., recovering from a broadcast::Lagged event repopulating the order books).
-        if crate::types::now_ns() < self.paused_until_ns {
-            return opportunities;
-        }
-
-        let pairs = match registry.get_arb_pairs_for_market(market_id) {
-            Some(p) => p,
-            None => return opportunities,
-        };
-
-        for pair in pairs {
-            // PHASE 3 FIX: Enhanced Feed Health Guard
-            // Invalidate the pair if either platform feed is currently offline
-            let a_alive = self.platform_liveness.get(&pair.platform_a).copied().unwrap_or(true);
-            let b_alive = self.platform_liveness.get(&pair.platform_b).copied().unwrap_or(true);
-            if !a_alive || !b_alive {
-                continue;
-            }
-
-            // CRITICAL FIX: The Time-to-Maturity Trap
-            // Do not evaluate spreads if the market resolves in less than 60 seconds.
-            // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 
-            // in time to dump the naked leg before the exchange locks the order book.
-            if let Some(market) = registry.get_market(&pair.market_id) {
-                let seconds_to_exp = (market.expiration - chrono::Utc::now()).num_seconds();
-                if seconds_to_exp < 60 {
-                    continue; 
-                }
-            }
-
-            let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
-                Some(b) => b,
-                None => continue,
-            };
-            let book_b = match uob.get_book(&pair.market_id, &pair.platform_b) {
-                Some(b) => b,
-                None => continue,
-            };
-
-            let spreads = spread_engine.compute_spreads(book_a, book_b, target_size);
-
-            for spread in spreads {
-                self.stats.opportunities_detected += 1;
-
-                match self.run_gates(&spread, book_a, book_b, pair.confidence) {
-                    Ok(()) => {
-                        self.stats.opportunities_passed += 1;
-
-                        // Fetch the native exchange identifiers and fee rates from the registry
-                        let info_a = registry.get_platform_info(&pair.market_id, &pair.platform_a);
-                        let info_b = registry.get_platform_info(&pair.market_id, &pair.platform_b);
-                        
-                        let (plat_id_a, fee_bps_a) = if let Some(i) = info_a { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
-                        let (plat_id_b, fee_bps_b) = if let Some(i) = info_b { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
-
-                        let liquidity = spread.leg_a_available.min(spread.leg_b_available);
-                        let log_liq = if liquidity > Decimal::ZERO {
-                            (decimal_ln(liquidity) + Decimal::ONE).max(rust_decimal_macros::dec!(0.1))
-                        } else {
-                            Decimal::ONE
-                        };
-                        let confidence_dec = Decimal::try_from(pair.confidence).unwrap_or(Decimal::ONE);
-                        let score = spread.net_spread * log_liq * confidence_dec;
-
-                        opportunities.push(ArbitrageOpportunity {
-                            opp_id: Uuid::new_v4(),
-                            market_id: spread.market_id,
-                            market_question: String::new(), // M-9 FIX: Defer allocation until after truncation
-                            leg_a: LegDetail {
-                                platform: spread.leg_a_platform,
-                                side: spread.leg_a_side,
-                                price: spread.leg_a_price,
-                                available_size: spread.leg_a_available,
-                                fee_estimate: spread.leg_a_fee,
-                                fee_rate_bps: fee_bps_a as u32, 
-                                platform_market_id: plat_id_a, 
-                            },
-                            leg_b: LegDetail {
-                                platform: spread.leg_b_platform,
-                                side: spread.leg_b_side,
-                                price: spread.leg_b_price,
-                                available_size: spread.leg_b_available,
-                                fee_estimate: spread.leg_b_fee,
-                                fee_rate_bps: fee_bps_b as u32,
-                                platform_market_id: plat_id_b, 
-                            },
-                            raw_spread: spread.raw_spread,
-                            net_spread: spread.net_spread,
-                            kelly_fraction: Decimal::ZERO, 
-                            recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
-                            score,
-                            detected_at: now_ns(),
-                            // FIX: Reduce Time-to-Live to 200ms. If the execution queue backs up,
-                            // prices will move. Drops stale arbs before they execute at a loss.
-                            ttl_ms: 200,
-                        });
-                    }
-                    Err(reason) => {
-                        debug!(?reason, market_id = %spread.market_id, "Opportunity rejected");
-                    }
-                }
-            }
-        }
-
-        opportunities.sort_by(|a, b| b.score.cmp(&a.score));
-        let slots = self.max_concurrent.saturating_sub(self.active_arbs);
-        opportunities.truncate(slots);
-
-        // M-9 FIX: Allocate strings only for the opportunities that actually made the cut
-        for opp in &mut opportunities {
-            if let Some(market) = registry.get_market(&opp.market_id) {
-                opp.market_question = market.question.clone();
-            }
-        }
-
-        opportunities
-    }
-
-    fn run_gates(
-        &mut self,
-        spread: &SpreadResult,
-        book_a: &crate::engine::order_book::PlatformBook,
-        book_b: &crate::engine::order_book::PlatformBook,
-        confidence: f64,
-    ) -> Result<(), RejectionReason> {
-        if spread.net_spread < self.min_spread {
-            self.stats.gate1_rejected += 1;
-            return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
-        }
-
-        let min_available = spread.leg_a_available.min(spread.leg_b_available);
-        if min_available < self.min_order_size {
-            self.stats.gate2_rejected += 1;
-            return Err(RejectionReason::InsufficientLiquidity {
-                available: min_available,
-                required: self.min_order_size,
-            });
-        }
-
-        let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
-        let now = now_ns();
-
-        let age_a = now.saturating_sub(book_a.last_update_ns);
-        if age_a > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
-            return Err(RejectionReason::StaleData {
-                age_ms: age_a / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
-        }
-
-        let age_b = now.saturating_sub(book_b.last_update_ns);
-        if age_b > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
-            return Err(RejectionReason::StaleData {
-                age_ms: age_b / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
-        }
-
-        if confidence < 0.95 {
-            self.stats.gate4_rejected += 1;
-            return Err(RejectionReason::CorrelationExposure {
-                current: Decimal::ZERO,
-                max: Decimal::ZERO,
-            });
-        }
-
-        if self.active_arbs >= self.max_concurrent {
-            self.stats.gate5_rejected += 1;
-            return Err(RejectionReason::RiskBudgetExceeded {
-                reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
-            });
-        }
-
-        Ok(())
-    }
-}
-```
-
 ## File: src/feeds/discovery.rs
 ```rust
 //! Market discovery: polls platform REST APIs, matches equivalent markets
@@ -6575,6 +6265,310 @@ fn normalize_question(q: &str) -> String {
             }
         }
         Ok(markets)
+    }
+}
+```
+
+## File: src/engine/detector.rs
+```rust
+use rust_decimal::Decimal;
+use tracing::{debug};
+use uuid::Uuid;
+
+use crate::engine::market_registry::MarketRegistry;
+use crate::engine::order_book::UnifiedOrderBook;
+use crate::engine::spread::{NetSpreadEngine, SpreadResult};
+use crate::types::*;
+
+/// Rejection reason for the 5-gate pipeline
+#[derive(Debug, Clone)]
+pub enum RejectionReason {
+    BelowSpreadThreshold(Decimal),
+    InsufficientLiquidity { available: Decimal, required: Decimal },
+    StaleData { age_ms: u64, max_ms: u64 },
+    CorrelationExposure { current: Decimal, max: Decimal },
+    RiskBudgetExceeded { reason: String },
+}
+
+/// Deterministic natural logarithm approximation using Taylor series for `rust_decimal`
+/// Eliminates non-deterministic `f64` math across CPU architectures.
+fn decimal_ln(mut x: Decimal) -> Decimal {
+    if x <= Decimal::ZERO { return Decimal::ZERO; }
+    if x == Decimal::ONE { return Decimal::ZERO; }
+    
+    let mut shifts = 0;
+    let two = rust_decimal_macros::dec!(2.0);
+    
+    // Range reduction to [0.5, 1.5] for faster convergence
+    while x > rust_decimal_macros::dec!(1.5) { x /= two; shifts += 1; }
+    while x < rust_decimal_macros::dec!(0.5) { x *= two; shifts -= 1; }
+
+    let z = (x - Decimal::ONE) / (x + Decimal::ONE);
+    let z_squared = z * z;
+    let mut term = z;
+    let mut sum = z;
+    let mut n = Decimal::ONE;
+
+    for _ in 1..20 {
+        term *= z_squared;
+        n += two;
+        let next_sum = sum + term / n;
+        if next_sum == sum { break; }
+        sum = next_sum;
+    }
+    
+    // ln(2) ≈ 0.6931471805599453
+    (sum * two) + (Decimal::from(shifts) * rust_decimal_macros::dec!(0.6931471805599453))
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DetectorStats {
+    pub opportunities_detected: u64,
+    pub gate1_rejected: u64,
+    pub gate2_rejected: u64,
+    pub gate3_rejected: u64,
+    pub gate4_rejected: u64,
+    pub gate5_rejected: u64,
+    pub opportunities_passed: u64,
+}
+
+#[derive(Clone)]
+pub struct ArbitrageDetector {
+    min_spread: Decimal,
+    min_order_size: Decimal,
+    stale_timeout_ms: u64,
+    max_concurrent: usize,
+    active_arbs: usize,
+    pub stats: DetectorStats,
+    paused_until_ns: u64,
+    platform_liveness: std::collections::HashMap<Platform, bool>,
+}
+
+impl ArbitrageDetector {
+    pub fn new(
+        min_spread: Decimal,
+        min_order_size: Decimal,
+        stale_timeout_ms: u64,
+        max_concurrent: usize,
+    ) -> Self {
+        Self {
+            min_spread,
+            min_order_size,
+            stale_timeout_ms,
+            max_concurrent,
+            active_arbs: 0,
+            stats: DetectorStats::default(),
+            paused_until_ns: 0,
+            platform_liveness: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn set_platform_liveness(&mut self, platform: Platform, is_alive: bool) {
+        self.platform_liveness.insert(platform, is_alive);
+    }
+
+    pub fn pause_detection_until(&mut self, ns: u64) {
+        self.paused_until_ns = ns;
+    }
+
+    pub fn update_thresholds(&mut self, min_spread: Decimal, stale_timeout_ms: u64, max_concurrent: usize) {
+        self.min_spread = min_spread;
+        self.stale_timeout_ms = stale_timeout_ms;
+        self.max_concurrent = max_concurrent;
+    }
+
+    pub fn set_active_arbs(&mut self, count: usize) {
+        self.active_arbs = count;
+    }
+
+    /// Evaluates spreads ONLY for the specific market that just updated.
+    pub fn detect_for_market(
+        &mut self,
+        market_id: &Uuid,
+        registry: &MarketRegistry,
+        uob: &UnifiedOrderBook,
+        spread_engine: &NetSpreadEngine,
+        target_size: Decimal,
+    ) -> Vec<ArbitrageOpportunity> {
+        let mut opportunities = Vec::new();
+
+        // HIGH-1 FIX: Do not evaluate spreads if the engine is in a cooldown period
+        // (e.g., recovering from a broadcast::Lagged event repopulating the order books).
+        if crate::types::now_ns() < self.paused_until_ns {
+            return opportunities;
+        }
+
+        let pairs = match registry.get_arb_pairs_for_market(market_id) {
+            Some(p) => p,
+            None => return opportunities,
+        };
+
+        for pair in pairs {
+            // PHASE 3 FIX: Enhanced Feed Health Guard
+            // Invalidate the pair if either platform feed is currently offline
+            let a_alive = self.platform_liveness.get(&pair.platform_a).copied().unwrap_or(true);
+            let b_alive = self.platform_liveness.get(&pair.platform_b).copied().unwrap_or(true);
+            if !a_alive || !b_alive {
+                continue;
+            }
+
+            // CRITICAL FIX: The Time-to-Maturity Trap
+            // Do not evaluate spreads if the market resolves in less than 60 seconds.
+            // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 
+            // in time to dump the naked leg before the exchange locks the order book.
+            if let Some(market) = registry.get_market(&pair.market_id) {
+                let seconds_to_exp = (market.expiration - chrono::Utc::now()).num_seconds();
+                if seconds_to_exp < 60 {
+                    continue; 
+                }
+            }
+
+            let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {
+                Some(b) => b,
+                None => continue,
+            };
+            let book_b = match uob.get_book(&pair.market_id, &pair.platform_b) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let spreads = spread_engine.compute_spreads(book_a, book_b, target_size);
+
+            for spread in spreads {
+                self.stats.opportunities_detected += 1;
+
+                match self.run_gates(&spread, book_a, book_b, pair.confidence) {
+                    Ok(()) => {
+                        self.stats.opportunities_passed += 1;
+
+                        // Fetch the native exchange identifiers and fee rates from the registry
+                        let info_a = registry.get_platform_info(&pair.market_id, &pair.platform_a);
+                        let info_b = registry.get_platform_info(&pair.market_id, &pair.platform_b);
+                        
+                        let (plat_id_a, fee_bps_a) = if let Some(i) = info_a { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
+                        let (plat_id_b, fee_bps_b) = if let Some(i) = info_b { (i.platform_market_id.clone(), i.fee_rate_bps) } else { continue; };
+
+                        let liquidity = spread.leg_a_available.min(spread.leg_b_available);
+                        let log_liq = if liquidity > Decimal::ZERO {
+                            (decimal_ln(liquidity) + Decimal::ONE).max(rust_decimal_macros::dec!(0.1))
+                        } else {
+                            Decimal::ONE
+                        };
+                        let confidence_dec = Decimal::try_from(pair.confidence).unwrap_or(Decimal::ONE);
+                        let score = spread.net_spread * log_liq * confidence_dec;
+
+                        opportunities.push(ArbitrageOpportunity {
+                            opp_id: Uuid::new_v4(),
+                            market_id: spread.market_id,
+                            market_question: String::new(), // M-9 FIX: Defer allocation until after truncation
+                            leg_a: LegDetail {
+                                platform: spread.leg_a_platform,
+                                side: spread.leg_a_side,
+                                price: spread.leg_a_price,
+                                available_size: spread.leg_a_available,
+                                fee_estimate: spread.leg_a_fee,
+                                fee_rate_bps: fee_bps_a as u32, 
+                                platform_market_id: plat_id_a, 
+                            },
+                            leg_b: LegDetail {
+                                platform: spread.leg_b_platform,
+                                side: spread.leg_b_side,
+                                price: spread.leg_b_price,
+                                available_size: spread.leg_b_available,
+                                fee_estimate: spread.leg_b_fee,
+                                fee_rate_bps: fee_bps_b as u32,
+                                platform_market_id: plat_id_b, 
+                            },
+                            raw_spread: spread.raw_spread,
+                            net_spread: spread.net_spread,
+                            kelly_fraction: Decimal::ZERO, 
+                            recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
+                            score,
+                            detected_at: now_ns(),
+                            // FIX: Reduce Time-to-Live to 200ms. If the execution queue backs up,
+                            // prices will move. Drops stale arbs before they execute at a loss.
+                            ttl_ms: 200,
+                        });
+                    }
+                    Err(reason) => {
+                        debug!(?reason, market_id = %spread.market_id, "Opportunity rejected");
+                    }
+                }
+            }
+        }
+
+        opportunities.sort_by(|a, b| b.score.cmp(&a.score));
+        let slots = self.max_concurrent.saturating_sub(self.active_arbs);
+        opportunities.truncate(slots);
+
+        // M-9 FIX: Allocate strings only for the opportunities that actually made the cut
+        for opp in &mut opportunities {
+            if let Some(market) = registry.get_market(&opp.market_id) {
+                opp.market_question = market.question.clone();
+            }
+        }
+
+        opportunities
+    }
+
+    fn run_gates(
+        &mut self,
+        spread: &SpreadResult,
+        book_a: &crate::engine::order_book::PlatformBook,
+        book_b: &crate::engine::order_book::PlatformBook,
+        confidence: f64,
+    ) -> Result<(), RejectionReason> {
+        if spread.net_spread < self.min_spread {
+            self.stats.gate1_rejected += 1;
+            return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
+        }
+
+        let min_available = spread.leg_a_available.min(spread.leg_b_available);
+        if min_available < self.min_order_size {
+            self.stats.gate2_rejected += 1;
+            return Err(RejectionReason::InsufficientLiquidity {
+                available: min_available,
+                required: self.min_order_size,
+            });
+        }
+
+        let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
+        let now = now_ns();
+
+        let age_a = now.saturating_sub(book_a.last_update_ns);
+        if age_a > stale_timeout_ns {
+            self.stats.gate3_rejected += 1;
+            return Err(RejectionReason::StaleData {
+                age_ms: age_a / 1_000_000,
+                max_ms: self.stale_timeout_ms,
+            });
+        }
+
+        let age_b = now.saturating_sub(book_b.last_update_ns);
+        if age_b > stale_timeout_ns {
+            self.stats.gate3_rejected += 1;
+            return Err(RejectionReason::StaleData {
+                age_ms: age_b / 1_000_000,
+                max_ms: self.stale_timeout_ms,
+            });
+        }
+
+        if confidence < 0.95 {
+            self.stats.gate4_rejected += 1;
+            return Err(RejectionReason::CorrelationExposure {
+                current: Decimal::ZERO,
+                max: Decimal::ZERO,
+            });
+        }
+
+        if self.active_arbs >= self.max_concurrent {
+            self.stats.gate5_rejected += 1;
+            return Err(RejectionReason::RiskBudgetExceeded {
+                reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
+            });
+        }
+
+        Ok(())
     }
 }
 ```
@@ -7712,259 +7706,6 @@ impl BankrollHandle {
 }
 ```
 
-## File: src/execution/kalshi_client.rs
-```rust
-use anyhow::{Context, Result};
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
-use serde::{Deserialize, Serialize};
-use tracing::info;
-
-use super::executor::{OrderResult, PlatformOrderClient};
-use crate::crypto::jwt::KalshiAuth;
-use crate::types::Side;
-
-use std::sync::Arc;
-
-#[derive(Clone)]
-pub struct KalshiClient {
-    http: reqwest::Client,
-    rest_url: String,
-    auth: Arc<KalshiAuth>,
-}
-
-#[derive(Serialize)]
-struct KalshiOrderRequest {
-    ticker: String,
-    action: String,
-    side: String,
-    #[serde(rename = "type")]
-    order_type: String,
-    count: i64,
-    yes_price: Option<i64>,
-    no_price: Option<i64>,
-    expiration_ts: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    client_order_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    time_in_force: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct KalshiOrderResponse {
-    #[serde(default)]
-    order: Option<KalshiOrder>,
-    #[serde(default)]
-    error: Option<KalshiError>,
-}
-
-#[derive(Deserialize)]
-struct KalshiOrder {
-    order_id: String,
-    #[serde(default)]
-    yes_price: i64,
-    #[serde(default)]
-    no_price: i64,
-    #[serde(default)]
-    count: i64,
-    #[serde(default)]
-    remaining_count: i64,
-}
-
-#[derive(Deserialize)]
-struct KalshiError {
-    message: String,
-}
-
-impl KalshiClient {
-    pub fn new(rest_url: String, auth: KalshiAuth) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5));
-            
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-            
-        let http = builder.build().expect("failed to build Kalshi HTTP client");
-        Self { http, rest_url, auth: Arc::new(auth) }
-    }
-}
-
-use crate::execution::executor::OrderAction;
-
-#[async_trait::async_trait]
-impl PlatformOrderClient for KalshiClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, _fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
-        let price = price.0;
-        let size = size.0;
-        // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
-
-        // Avoid string parsing panics by directly safely converting rounded decimals
-        let mut price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
-        
-        // CRITICAL FIX: Kalshi explicitly rejects prices of 0 or 100.
-        price_cents = price_cents.clamp(1, 99);
-        
-        // CRIT-1 / MED-10 FIX: Prevent catastrophic fallback to i64::MAX on extreme size overflows
-        let count = size.floor().to_i64().unwrap_or(0).clamp(1, 10_000);
-
-        // MED-5: Basic rate limiting to prevent 429s on burst arbs
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let (kalshi_side, yes_price, no_price) = match side {
-            Side::Yes => ("yes".to_string(), Some(price_cents), None),
-            Side::No => ("no".to_string(), None, Some(price_cents)),
-        };
-
-        let kalshi_action = match action {
-            OrderAction::Buy => "buy".to_string(),
-            OrderAction::Sell => "sell".to_string(),
-        };
-
-        info!(ticker = market_id, action = %kalshi_action, side = %kalshi_side, price_cents, count, "Submitting Kalshi order");
-
-        let url = format!("{}/portfolio/orders", self.rest_url);
-        let auth_header = self.auth.auth_header().await?;
-
-        let req = KalshiOrderRequest {
-            ticker: market_id.to_string(),
-            action: kalshi_action,
-            side: kalshi_side,
-            order_type: "limit".to_string(),
-            count,
-            yes_price,
-            no_price,
-            expiration_ts: None,
-            client_order_id: None,
-            // CRITICAL FIX: Ensure the order is Fill-or-Kill so it doesn't rest on the book
-            time_in_force: Some("fok".to_string()), 
-        };
-
-        let resp = self.http
-            .post(&url)
-            .header("Authorization", &auth_header)
-            .header("Content-Type", "application/json")
-            .json(&req)
-            .send()
-            .await
-            .context("Kalshi order submission failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                tracing::warn!("Kalshi rate limited: {}", body);
-            }
-            return Ok(OrderResult {
-                filled: false,
-                fill_price: crate::types::Usd(Decimal::ZERO),
-                fill_size: crate::types::Contracts(Decimal::ZERO),
-                fee: crate::types::Usd(Decimal::ZERO),
-                order_id: String::new(),
-                error: Some(format!("HTTP {}: {}", status, body)),
-            });
-        }
-
-        let body: KalshiOrderResponse = resp.json().await.unwrap_or(KalshiOrderResponse {
-            order: None,
-            error: Some(KalshiError { message: "Failed to decode response".to_string() }),
-        });
-
-        if let Some(order) = body.order {
-            let filled_count = order.count - order.remaining_count;
-            let filled = filled_count > 0;
-            let fill_price = Decimal::from(order.yes_price.max(order.no_price)) / Decimal::from(100);
-            // CRIT-5 FIX: Centralize fee math to ensure consistency with spread engine
-            let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count));
-            Ok(OrderResult {
-                filled,
-                fill_price: crate::types::Usd(fill_price),
-                fill_size: crate::types::Contracts(Decimal::from(filled_count)),
-                fee: crate::types::Usd(total_fee),
-                order_id: order.order_id,
-                error: if !filled { Some("Order not filled".into()) } else { None },
-            })
-        } else {
-            let error_msg = body.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".into());
-            Ok(OrderResult { filled: false, fill_price: crate::types::Usd(Decimal::ZERO), fill_size: crate::types::Contracts(Decimal::ZERO), fee: crate::types::Usd(Decimal::ZERO), order_id: String::new(), error: Some(error_msg) })
-        }
-    }
-
-    async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let url = format!("{}/portfolio/orders/{}", self.rest_url, order_id);
-        let auth_header = self.auth.auth_header().await?;
-        let resp = self.http.delete(&url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await
-            .context("Kalshi cancel failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            tracing::warn!("Kalshi cancel_order failed: HTTP {}", status);
-        }
-        Ok(())
-    }
-}
-
-impl KalshiClient {
-    /// Queries the Kalshi API for the actual revenue generated by a settled market position.
-    pub async fn fetch_settlement_payout(&self, ticker: &str, quantity: Decimal, avg_entry: Decimal) -> Result<Decimal> {
-        let url = format!("{}/portfolio/settlements?ticker={}", self.rest_url, ticker);
-        let auth_header = self.auth.auth_header().await?;
-        let resp = self.http.get(&url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await
-            .context("Kalshi settlement fetch failed")?;
-            
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        
-        let mut total_revenue_cents: i64 = 0;
-        let mut total_contracts: i64 = 0;
-        
-        // FIX: Compute the average payout per contract to prevent multi-arb double counting
-        if let Some(settlements) = body.get("settlements").and_then(|v| v.as_array()) {
-            for settlement in settlements {
-                total_revenue_cents += settlement.get("revenue").and_then(|v| v.as_i64()).unwrap_or(0);
-                total_contracts += settlement.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            }
-        }
-        
-        let revenue_per_contract = if total_contracts > 0 {
-            Decimal::from(total_revenue_cents) / Decimal::from(total_contracts) / Decimal::from(100)
-        } else {
-            Decimal::ZERO
-        };
-        
-        let total_revenue = quantity * revenue_per_contract;
-        let cost_basis = quantity * avg_entry;
-        let realized_pnl = total_revenue - cost_basis;
-        
-        Ok(realized_pnl)
-    }
-
-    /// Queries the Kalshi API for the actual live balance of the wallet
-    pub async fn get_balance(&self) -> Result<Decimal> {
-        let url = format!("{}/portfolio/balance", self.rest_url);
-        let auth_header = self.auth.auth_header().await?;
-        let resp = self.http.get(&url)
-            .header("Authorization", &auth_header)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Kalshi get_balance failed: {}", resp.status());
-        }
-        let body: serde_json::Value = resp.json().await?;
-        let balance_cents = body.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-        Ok(Decimal::from(balance_cents) / Decimal::from(100))
-    }
-}
-```
-
 ## File: src/feeds/kalshi.rs
 ```rust
 use anyhow::{Context, Result};
@@ -8419,6 +8160,259 @@ impl KalshiFeed {
 }
 ```
 
+## File: src/execution/kalshi_client.rs
+```rust
+use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use tracing::info;
+
+use super::executor::{OrderResult, PlatformOrderClient};
+use crate::crypto::jwt::KalshiAuth;
+use crate::types::Side;
+
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct KalshiClient {
+    http: reqwest::Client,
+    rest_url: String,
+    auth: Arc<KalshiAuth>,
+}
+
+#[derive(Serialize)]
+struct KalshiOrderRequest {
+    ticker: String,
+    action: String,
+    side: String,
+    #[serde(rename = "type")]
+    order_type: String,
+    count: i64,
+    yes_price: Option<i64>,
+    no_price: Option<i64>,
+    expiration_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_in_force: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KalshiOrderResponse {
+    #[serde(default)]
+    order: Option<KalshiOrder>,
+    #[serde(default)]
+    error: Option<KalshiError>,
+}
+
+#[derive(Deserialize)]
+struct KalshiOrder {
+    order_id: String,
+    #[serde(default)]
+    yes_price: i64,
+    #[serde(default)]
+    no_price: i64,
+    #[serde(default)]
+    count: i64,
+    #[serde(default)]
+    remaining_count: i64,
+}
+
+#[derive(Deserialize)]
+struct KalshiError {
+    message: String,
+}
+
+impl KalshiClient {
+    pub fn new(rest_url: String, auth: KalshiAuth) -> Self {
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5));
+            
+        // M-8 FIX: Explicit TLS Cert Pinning
+        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
+            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+            
+        let http = builder.build().expect("failed to build Kalshi HTTP client");
+        Self { http, rest_url, auth: Arc::new(auth) }
+    }
+}
+
+use crate::execution::executor::OrderAction;
+
+#[async_trait::async_trait]
+impl PlatformOrderClient for KalshiClient {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, _fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
+        let price = price.0;
+        let size = size.0;
+        // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
+
+        // Avoid string parsing panics by directly safely converting rounded decimals
+        let mut price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
+        
+        // CRITICAL FIX: Kalshi explicitly rejects prices of 0 or 100.
+        price_cents = price_cents.clamp(1, 99);
+        
+        // CRIT-1 / MED-10 FIX: Prevent catastrophic fallback to i64::MAX on extreme size overflows
+        let count = size.floor().to_i64().unwrap_or(0).clamp(1, 10_000);
+
+        // MED-5: Basic rate limiting to prevent 429s on burst arbs
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (kalshi_side, yes_price, no_price) = match side {
+            Side::Yes => ("yes".to_string(), Some(price_cents), None),
+            Side::No => ("no".to_string(), None, Some(price_cents)),
+        };
+
+        let kalshi_action = match action {
+            OrderAction::Buy => "buy".to_string(),
+            OrderAction::Sell => "sell".to_string(),
+        };
+
+        info!(ticker = market_id, action = %kalshi_action, side = %kalshi_side, price_cents, count, "Submitting Kalshi order");
+
+        let url = format!("{}/portfolio/orders", self.rest_url);
+        let auth_header = self.auth.auth_header().await?;
+
+        let req = KalshiOrderRequest {
+            ticker: market_id.to_string(),
+            action: kalshi_action,
+            side: kalshi_side,
+            order_type: "limit".to_string(),
+            count,
+            yes_price,
+            no_price,
+            expiration_ts: None,
+            client_order_id: None,
+            // CRITICAL FIX: Ensure the order is Fill-or-Kill so it doesn't rest on the book
+            time_in_force: Some("fok".to_string()), 
+        };
+
+        let resp = self.http
+            .post(&url)
+            .header("Authorization", &auth_header)
+            .header("Content-Type", "application/json")
+            .json(&req)
+            .send()
+            .await
+            .context("Kalshi order submission failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                tracing::warn!("Kalshi rate limited: {}", body);
+            }
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
+                order_id: String::new(),
+                error: Some(format!("HTTP {}: {}", status, body)),
+            });
+        }
+
+        let body: KalshiOrderResponse = resp.json().await.unwrap_or(KalshiOrderResponse {
+            order: None,
+            error: Some(KalshiError { message: "Failed to decode response".to_string() }),
+        });
+
+        if let Some(order) = body.order {
+            let filled_count = order.count - order.remaining_count;
+            let filled = filled_count > 0;
+            let fill_price = Decimal::from(order.yes_price.max(order.no_price)) / Decimal::from(100);
+            // CRIT-5 FIX: Centralize fee math to ensure consistency with spread engine
+            let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count));
+            Ok(OrderResult {
+                filled,
+                fill_price: crate::types::Usd(fill_price),
+                fill_size: crate::types::Contracts(Decimal::from(filled_count)),
+                fee: crate::types::Usd(total_fee),
+                order_id: order.order_id,
+                error: if !filled { Some("Order not filled".into()) } else { None },
+            })
+        } else {
+            let error_msg = body.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".into());
+            Ok(OrderResult { filled: false, fill_price: crate::types::Usd(Decimal::ZERO), fill_size: crate::types::Contracts(Decimal::ZERO), fee: crate::types::Usd(Decimal::ZERO), order_id: String::new(), error: Some(error_msg) })
+        }
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let url = format!("{}/portfolio/orders/{}", self.rest_url, order_id);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.delete(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .context("Kalshi cancel failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!("Kalshi cancel_order failed: HTTP {}", status);
+        }
+        Ok(())
+    }
+}
+
+impl KalshiClient {
+    /// Queries the Kalshi API for the actual revenue generated by a settled market position.
+    pub async fn fetch_settlement_payout(&self, ticker: &str, quantity: Decimal, avg_entry: Decimal) -> Result<Decimal> {
+        let url = format!("{}/portfolio/settlements?ticker={}", self.rest_url, ticker);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.get(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .context("Kalshi settlement fetch failed")?;
+            
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        
+        let mut total_revenue_cents: i64 = 0;
+        let mut total_contracts: i64 = 0;
+        
+        // FIX: Compute the average payout per contract to prevent multi-arb double counting
+        if let Some(settlements) = body.get("settlements").and_then(|v| v.as_array()) {
+            for settlement in settlements {
+                total_revenue_cents += settlement.get("revenue").and_then(|v| v.as_i64()).unwrap_or(0);
+                total_contracts += settlement.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            }
+        }
+        
+        let revenue_per_contract = if total_contracts > 0 {
+            Decimal::from(total_revenue_cents) / Decimal::from(total_contracts) / Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        };
+        
+        let total_revenue = quantity * revenue_per_contract;
+        let cost_basis = quantity * avg_entry;
+        let realized_pnl = total_revenue - cost_basis;
+        
+        Ok(realized_pnl)
+    }
+
+    /// Queries the Kalshi API for the actual live balance of the wallet
+    pub async fn get_balance(&self) -> Result<Decimal> {
+        let url = format!("{}/portfolio/balance", self.rest_url);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.get(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Kalshi get_balance failed: {}", resp.status());
+        }
+        let body: serde_json::Value = resp.json().await?;
+        let balance_cents = body.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+        Ok(Decimal::from(balance_cents) / Decimal::from(100))
+    }
+}
+```
+
 ## File: src/feeds/polymarket.rs
 ```rust
 use anyhow::{Context, Result};
@@ -8858,6 +8852,592 @@ impl PolymarketFeed {
             }
         }
         Ok(())
+    }
+}
+```
+
+## File: src/execution/executor.rs
+```rust
+use anyhow::Result;
+use chrono::Utc;
+use rust_decimal::Decimal;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+
+use crate::db::Database;
+use crate::types::*;
+use super::polymarket_client::PolymarketClient;
+use super::kalshi_client::KalshiClient;
+use super::cdna_client::CdnaClient;
+use super::forecastex_client::ForecastExClient;
+
+#[derive(Debug, Clone)]
+pub struct OrderResult {
+    pub filled: bool,
+    pub fill_price: Usd,
+    pub fill_size: Contracts,
+    pub fee: Usd,
+    pub order_id: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderAction {
+    Buy,
+    Sell,
+}
+
+#[async_trait::async_trait]
+pub trait PlatformOrderClient: Send + Sync {
+    async fn submit_order(
+        &self,
+        market_id: &str,
+        action: OrderAction,
+        side: Side,
+        price: Usd,
+        size: Contracts,
+        fee_rate_bps: BasisPoints,
+    ) -> Result<OrderResult>;
+
+    async fn cancel_order(&self, order_id: &str) -> Result<()>;
+}
+
+pub struct ExecutionEngine {
+    rx: mpsc::Receiver<ValidatedOpportunity>,
+    trade_result_tx: mpsc::Sender<TradeResult>,
+    alert_tx: mpsc::Sender<AlertMessage>,
+    db: Arc<dyn Database>,
+    polymarket_client: Option<PolymarketClient>,
+    kalshi_client: Option<KalshiClient>,
+    cdna_client: Option<CdnaClient>,
+    forecastex_client: Option<ForecastExClient>,
+    executed_opps: lru::LruCache<uuid::Uuid, ()>,
+}
+
+impl ExecutionEngine {
+    pub fn new(
+        rx: mpsc::Receiver<ValidatedOpportunity>,
+        trade_result_tx: mpsc::Sender<TradeResult>,
+        alert_tx: mpsc::Sender<AlertMessage>,
+        db: Arc<dyn Database>,
+        polymarket_client: Option<PolymarketClient>,
+        kalshi_client: Option<KalshiClient>,
+        cdna_client: Option<CdnaClient>,
+        forecastex_client: Option<ForecastExClient>,
+    ) -> Self {
+        Self {
+            rx,
+            trade_result_tx,
+            alert_tx,
+            db,
+            polymarket_client,
+            kalshi_client,
+            cdna_client,
+            forecastex_client,
+            executed_opps: lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
+        }
+    }
+
+    pub async fn run(mut self) {
+        info!("Execution engine started");
+        loop {
+            // HIGH-3 FIX: Use recv() with a periodic timeout so the task
+            // doesn't block forever if the sender is dropped or the system
+            // is shutting down. This allows the JoinSet monitor to detect
+            // executor health issues within 5 seconds.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.rx.recv(),
+            ).await {
+                Ok(Some(opp)) => {
+                    if let Err(e) = self.execute_arbitrage(opp).await {
+                        error!(error = %e, "Arbitrage execution error");
+                    }
+                }
+                Ok(None) => {
+                    // Channel closed — sender dropped, begin graceful shutdown
+                    info!("Execution engine: opportunity channel closed, draining");
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — no opportunities in 5s, just loop and check again.
+                    // This prevents the task from appearing "stuck" to the JoinSet monitor.
+                    continue;
+                }
+            }
+        }
+        info!("Execution engine stopped");
+    }
+
+    async fn execute_arbitrage(&mut self, validated: ValidatedOpportunity) -> Result<()> {
+        let opp = &validated.opportunity;
+        let start = Instant::now();
+        
+        let halves: Vec<&str> = opp.market_question.split(" / ").collect();
+        if halves.len() == 2 {
+            let nums_a: Vec<f64> = halves[0].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
+            let nums_b: Vec<f64> = halves[1].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
+            if nums_a != nums_b && (!nums_a.is_empty() || !nums_b.is_empty()) {
+                tracing::error!(question = %opp.market_question, "Mismatched numerical targets in execution. Aborting trade.");
+                return Ok(());
+            }
+        }
+        
+        // HIGH-4: Idempotency Guard
+        if self.executed_opps.put(opp.opp_id, ()).is_some() {
+            tracing::warn!(opp_id = %opp.opp_id, "Duplicate opportunity execution prevented");
+            return Ok(());
+        }
+
+        // CRITICAL FIX: The TTL Guard
+        // Drop the opportunity immediately if it sat in the async queue longer than its Time-To-Live.
+        // Executing stale arbs guarantees negative PnL.
+        let current_time_ns = crate::types::now_ns();
+        let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
+        
+        // Trade ID is assigned by the DB via AUTOINCREMENT. Use 0 as placeholder.
+        let current_trade_id: i64 = 0;
+
+        if current_time_ns > expiration_ns {
+            let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
+            tracing::warn!(
+                opp_id = %opp.opp_id, 
+                delay_ms, 
+                "Opportunity TTL expired in execution queue — dropping to prevent slippage"
+            );
+            
+            let trade_result = TradeResult {
+                trade_id: current_trade_id,
+                opp_id: opp.opp_id,
+                market_id: opp.market_id,
+                market_question: opp.market_question.clone(),
+                leg_a_platform: opp.leg_a.platform,
+                leg_a_side: opp.leg_a.side,
+                leg_a_price: opp.leg_a.price,
+                leg_a_size: Decimal::ZERO,
+                leg_a_fill_price: Decimal::ZERO,
+                leg_a_fee: Decimal::ZERO,
+                leg_b_platform: opp.leg_b.platform,
+                leg_b_side: opp.leg_b.side,
+                leg_b_price: opp.leg_b.price,
+                leg_b_size: Decimal::ZERO,
+                leg_b_fill_price: Decimal::ZERO,
+                leg_b_fee: Decimal::ZERO,
+                raw_spread: opp.raw_spread,
+                net_spread: opp.net_spread,
+                profit: Decimal::ZERO,
+                status: TradeStatus::Fail,
+                failure_reason: Some("Opportunity TTL expired in execution queue".into()),
+                execution_ms: 0,
+                executed_at: chrono::Utc::now(),
+                bankroll_after: Decimal::ZERO,
+                bankroll_change_pct: Decimal::ZERO,
+                approved_size: validated.approved_size,
+            };
+            let _ = self.trade_result_tx.try_send(trade_result);
+            return Ok(());
+        }
+
+        // Note: The software pre-execution slippage guard was removed.
+        // Because the Engine routes trades instantly and all client execution calls mandate 
+        // 'FOK' (Fill Or Kill), the target exchange matching engine provides a native,
+        // zero-latency slippage guard. If the price moves, the order simply fails to fill.
+
+        info!(
+            opp_id = %opp.opp_id,
+            market = %opp.market_question,
+            net_spread = %opp.net_spread,
+            size = %validated.approved_size,
+            "Executing arbitrage"
+        );
+
+        let (first_leg, second_leg) = self.order_legs(opp);
+
+        let first_result = self.execute_leg(
+            &first_leg.platform,
+            &first_leg.platform_market_id,
+            OrderAction::Buy,
+            first_leg.side,
+            Usd(first_leg.price),
+            Contracts(validated.approved_size),
+            BasisPoints(first_leg.fee_rate_bps),
+        ).await;
+
+        let (leg_a_result, leg_b_result) = match first_result {
+            Ok(first_fill) if first_fill.filled => {
+                let hedge_size = first_fill.fill_size; 
+                let second_result = self.execute_leg(
+                    &second_leg.platform,
+                    &second_leg.platform_market_id,
+                    OrderAction::Buy,
+                    second_leg.side,
+                    Usd(second_leg.price),
+                    Contracts(hedge_size.0),
+                    BasisPoints(second_leg.fee_rate_bps),
+                ).await;
+
+                match second_result {
+                    Ok(second_fill) if second_fill.filled => {
+                        (first_fill, second_fill)
+                    }
+                    Ok(second_fill) => {
+                        warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
+                        let mut final_first_fill = first_fill.clone();
+                        
+                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
+                            // Calculate exact realized loss from the round-trip FOK sell
+                            let buy_cost = first_fill.fill_size.0 * first_fill.fill_price.0 + first_fill.fee.0;
+                            let sell_revenue = unwind_fill.fill_size.0 * unwind_fill.fill_price.0;
+                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee.0;
+                            
+                            // Zero out size to prevent DB position tracking, but pack the loss into the fee
+                            // so `compute_result` logs the exact financial hit.
+                            final_first_fill.fill_size = Contracts(Decimal::ZERO);
+                            final_first_fill.fee = Usd(realized_loss);
+                            final_first_fill.error = Some("Leg B failed, automated unwind successful".into());
+                        }
+                        
+                        (final_first_fill, second_fill)
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Hedge leg error, attempting unwind");
+                        let mut final_first_fill = first_fill.clone();
+                        
+                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
+                            let buy_cost = first_fill.fill_size.0 * first_fill.fill_price.0 + first_fill.fee.0;
+                            let sell_revenue = unwind_fill.fill_size.0 * unwind_fill.fill_price.0;
+                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee.0;
+                            
+                            final_first_fill.fill_size = Contracts(Decimal::ZERO);
+                            final_first_fill.fee = Usd(realized_loss);
+                            final_first_fill.error = Some("Leg B error, automated unwind successful".into());
+                        }
+                        
+                        let failed2 = OrderResult {
+                            filled: false,
+                            fill_price: Usd(Decimal::ZERO),
+                            fill_size: Contracts(Decimal::ZERO),
+                            fee: Usd(Decimal::ZERO),
+                            order_id: String::new(),
+                            error: Some(e.to_string()),
+                        };
+                        
+                        // Return the stranded leg unmodified if unwind fails so the DB tracks it correctly
+                        (final_first_fill, failed2)
+                    }
+                }
+            }
+            Ok(first_fill) => {
+                let failed = OrderResult {
+                    filled: false,
+                    fill_price: Usd(Decimal::ZERO),
+                    fill_size: Contracts(Decimal::ZERO),
+                    fee: Usd(Decimal::ZERO),
+                    order_id: String::new(),
+                    error: None,
+                };
+                (first_fill, failed)
+            }
+            Err(e) => {
+                error!(error = %e, "First leg execution error");
+                let failed = OrderResult {
+                    filled: false,
+                    fill_price: Usd(Decimal::ZERO),
+                    fill_size: Contracts(Decimal::ZERO),
+                    fee: Usd(Decimal::ZERO),
+                    order_id: String::new(),
+                    error: Some(e.to_string()),
+                };
+                let failed2 = failed.clone();
+                (failed, failed2)
+            }
+        };
+
+    let execution_ms = start.elapsed().as_millis() as u64;
+
+        let (status, profit, failure_reason) = Self::compute_result(
+            &leg_a_result, &leg_b_result, opp,
+        );
+
+        // CRITICAL FIX (4-B): The execution engine sorts legs by liquidity to reduce slippage risk.
+        // We must map the execution results back to the original Opportunity's Leg A and Leg B
+        // to prevent database/audit-trail cross-contamination.
+        let (actual_leg_a_result, actual_leg_b_result) = if first_leg.platform == opp.leg_a.platform {
+            (&leg_a_result, &leg_b_result)
+        } else {
+            (&leg_b_result, &leg_a_result)
+        };
+
+        let trade_result = TradeResult {
+            trade_id: current_trade_id,
+            opp_id: opp.opp_id,
+            market_id: opp.market_id,
+            market_question: opp.market_question.clone(),
+            approved_size: validated.approved_size,
+            leg_a_platform: opp.leg_a.platform,
+            leg_a_side: opp.leg_a.side,
+            leg_a_price: opp.leg_a.price,
+            leg_a_size: actual_leg_a_result.fill_size.0,
+            leg_a_fill_price: actual_leg_a_result.fill_price.0,
+            leg_a_fee: actual_leg_a_result.fee.0,
+            leg_b_platform: opp.leg_b.platform,
+            leg_b_side: opp.leg_b.side,
+            leg_b_price: opp.leg_b.price,
+            leg_b_size: actual_leg_b_result.fill_size.0,
+            leg_b_fill_price: actual_leg_b_result.fill_price.0,
+            leg_b_fee: actual_leg_b_result.fee.0,
+            raw_spread: opp.raw_spread,
+            net_spread: opp.net_spread,
+            profit,
+            status,
+            failure_reason,
+            execution_ms,
+            executed_at: Utc::now(),
+            bankroll_after: Decimal::ZERO,
+            bankroll_change_pct: Decimal::ZERO,
+        };
+
+        // Pass the result directly back to the orchestrator.
+        // The executor MUST NOT dispatch to Telegram or SQLite. 
+        if let Err(e) = self.trade_result_tx.try_send(trade_result) {
+            tracing::error!(error = %e, "Trade result channel full — dropping notification");
+        }
+
+        Ok(())
+    }
+
+    fn order_legs<'a>(&self, opp: &'a ArbitrageOpportunity) -> (&'a LegDetail, &'a LegDetail) {
+        let a_liquidity = opp.leg_a.available_size;
+        let b_liquidity = opp.leg_b.available_size;
+
+        if a_liquidity <= b_liquidity {
+            (&opp.leg_a, &opp.leg_b) 
+        } else {
+            (&opp.leg_b, &opp.leg_a)
+        }
+    }
+
+    async fn execute_leg(
+        &self,
+        platform: &Platform,
+        market_id: &str,
+        action: OrderAction,
+        side: Side,
+        price: Usd,
+        size: Contracts,
+        fee_rate_bps: BasisPoints,
+    ) -> Result<OrderResult> {
+        match platform {
+            Platform::Polymarket | Platform::PolymarketUs => {
+                if let Some(client) = &self.polymarket_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("Polymarket client not configured")
+                }
+            }
+            Platform::Kalshi => {
+                if let Some(client) = &self.kalshi_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("Kalshi client not configured")
+                }
+            }
+            Platform::Cdna => {
+                if let Some(client) = &self.cdna_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("CDNA client not configured")
+                }
+            }
+            Platform::ForecastEx => {
+                if let Some(client) = &self.forecastex_client {
+                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
+                } else {
+                    anyhow::bail!("ForecastEx client not configured")
+                }
+            }
+        }
+    }
+
+
+    /// Executes a synthetic automated unwind.
+    /// By natively SELLING the stranded contracts back to the resting bids, 
+    /// we cap our risk instantly and free up capital without locking collateral.
+    async fn attempt_unwind(
+        &self,
+        stranded_leg: &LegDetail,
+        original_fill: &OrderResult,
+    ) -> Result<OrderResult> {
+        // Sell at 0.01 to aggressively cross the spread and ensure the FOK SELL order
+        // executes against whatever bids are resting on the book.
+        let aggressive_sell_price = rust_decimal_macros::dec!(0.01);
+
+        warn!(
+            platform = %stranded_leg.platform,
+            market_id = %stranded_leg.platform_market_id,
+            stranded_side = %stranded_leg.side,
+            size = %original_fill.fill_size,
+            "Hedge failed. Executing aggressive FOK SELL unwind to dump inventory."
+        );
+
+        let unwind_result = self.execute_leg(
+            &stranded_leg.platform,
+            &stranded_leg.platform_market_id,
+            OrderAction::Sell,
+            stranded_leg.side, // Same side! We sell the exact inventory we hold.
+            Usd(aggressive_sell_price),
+            original_fill.fill_size,
+            BasisPoints(stranded_leg.fee_rate_bps),
+        ).await;
+
+        match unwind_result {
+            Ok(fill) if fill.filled => {
+                let msg = format!(
+                    "⚠️ <b>AUTOMATED UNWIND SUCCESSFUL</b> ⚠️\n\n\
+                     Platform: {}\nMarket: {}\nUnwound: {} {}\n\
+                     <b>Delta exposure neutralized.</b>",
+                     stranded_leg.platform, stranded_leg.platform_market_id, fill.fill_size.0, stranded_leg.side
+                );
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
+                    severity: "warning".into(), 
+                    message: msg 
+                });
+                Ok(fill)
+            }
+            Ok(_) | Err(_) => {
+                let err_msg = unwind_result.err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "FOK Unwind Rejected by matching engine".into());
+                
+                error!(error = %err_msg, "Automated unwind failed. Naked exposure remains.");
+                
+                let msg = format!(
+                    "🚨 <b>CRITICAL: UNWIND FAILED - NAKED EXPOSURE</b> 🚨\n\n\
+                     Platform: {}\nMarket: {}\nStranded Size: {} {}\n\
+                     Error: {}\n\
+                     <b>MANUAL INTERVENTION REQUIRED IMMEDIATELY.</b>",
+                     stranded_leg.platform, stranded_leg.platform_market_id, 
+                     original_fill.fill_size.0, stranded_leg.side, err_msg
+                );
+                
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
+                    severity: "critical".into(), 
+                    message: msg 
+                });
+                
+                anyhow::bail!("Automated unwind failed: {}", err_msg)
+            }
+        }
+    }
+
+    fn compute_result(
+        leg_a: &OrderResult,
+        leg_b: &OrderResult,
+        opp: &ArbitrageOpportunity,
+    ) -> (TradeStatus, Decimal, Option<String>) {
+        if leg_a.filled && leg_b.filled {
+            let total_cost = leg_a.fill_price.0 + leg_b.fill_price.0;
+            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.0.min(leg_b.fill_size.0);
+            let net_profit = gross_profit - leg_a.fee.0 - leg_b.fee.0;
+            
+            let status = if leg_a.fill_size.0 == leg_b.fill_size.0 {
+                TradeStatus::Success
+            } else {
+                TradeStatus::Partial
+            };
+            
+            (status, net_profit, None)
+        } else if leg_a.filled && !leg_b.filled {
+            if leg_a.fill_size.0 == Decimal::ZERO && leg_a.fee.0 > Decimal::ZERO {
+                let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge failed, unwind successful".into());
+                (TradeStatus::Fail, -leg_a.fee.0, Some(reason))
+            } else {
+                let filled_value = leg_a.fill_price.0 * leg_a.fill_size.0;
+                let dynamic_penalty_pct = opp.raw_spread
+                    .max(rust_decimal_macros::dec!(0.02))
+                    .min(rust_decimal_macros::dec!(0.10));
+                let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
+                let estimated_loss = dynamic_unwind_slippage + leg_a.fee.0; 
+                let reason = leg_b.error.clone().unwrap_or_else(|| {
+                    format!("Hedge leg failed — ESTIMATED loss ${:.2} (manual resolution required)", estimated_loss)
+                });
+                (TradeStatus::Fail, -estimated_loss, Some(reason))
+            }
+        } else {
+            let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
+            (TradeStatus::Fail, Decimal::ZERO, Some(reason))
+        }
+    }
+}
+
+#[cfg(test)]
+mod verification {
+    use super::*;
+    use proptest::prelude::*;
+    use rust_decimal_macros::dec;
+
+    proptest! {
+        #[test]
+        fn formal_verify_compute_result_safety(
+            filled_a in any::<bool>(),
+            price_a in 0.01f64..0.99,
+            size_a in 1.0f64..1000.0,
+            fee_a in 0.0f64..50.0,
+            filled_b in any::<bool>(),
+            price_b in 0.01f64..0.99,
+            size_b in 1.0f64..1000.0,
+            fee_b in 0.0f64..50.0,
+        ) {
+            let leg_a = OrderResult {
+                filled: filled_a,
+                fill_price: Usd(Decimal::from_f64(price_a).unwrap()),
+                fill_size: Contracts(if filled_a { Decimal::from_f64(size_a).unwrap() } else { Decimal::ZERO }),
+                fee: Usd(Decimal::from_f64(fee_a).unwrap()),
+                order_id: "A".into(),
+                error: None,
+            };
+            
+            let leg_b = OrderResult {
+                filled: filled_b,
+                fill_price: Usd(Decimal::from_f64(price_b).unwrap()),
+                fill_size: Contracts(if filled_b { Decimal::from_f64(size_b).unwrap() } else { Decimal::ZERO }),
+                fee: Usd(Decimal::from_f64(fee_b).unwrap()),
+                order_id: "B".into(),
+                error: None,
+            };
+
+            let opp = ArbitrageOpportunity {
+                opp_id: uuid::Uuid::new_v4(),
+                market_id: uuid::Uuid::new_v4(),
+                market_question: "".into(),
+                leg_a: LegDetail { platform: Platform::Polymarket, platform_market_id: "".into(), fee_rate_bps: 0, side: Side::Yes, price: dec!(0), available_size: dec!(0), fee_estimate: dec!(0) },
+                leg_b: LegDetail { platform: Platform::Kalshi, platform_market_id: "".into(), fee_rate_bps: 0, side: Side::No, price: dec!(0), available_size: dec!(0), fee_estimate: dec!(0) },
+                raw_spread: dec!(0.05),
+                net_spread: dec!(0.03),
+                kelly_fraction: dec!(0),
+                recommended_size: dec!(0),
+                score: dec!(0),
+                detected_at: 0,
+                ttl_ms: 0,
+            };
+
+            let (status, profit, _) = ExecutionEngine::compute_result(&leg_a, &leg_b, &opp);
+
+            // Formal state validation
+            if filled_a && filled_b {
+                prop_assert!(status == TradeStatus::Success || status == TradeStatus::Partial);
+                let max_possible_gross = leg_a.fill_size.0.min(leg_b.fill_size.0) * Decimal::ONE;
+                prop_assert!(profit <= max_possible_gross); // Profit must always be logically bounded
+            } else if filled_a && !filled_b {
+                prop_assert_eq!(status, TradeStatus::Fail);
+                prop_assert!(profit <= Decimal::ZERO); // Unwinds or stranded legs must correctly book a loss
+            } else {
+                prop_assert_eq!(status, TradeStatus::Fail);
+                prop_assert_eq!(profit, Decimal::ZERO);
+            }
+        }
     }
 }
 ```
@@ -9652,592 +10232,6 @@ fn row_to_position(row: &sqlx::sqlite::SqliteRow) -> Result<Position> {
 }
 ```
 
-## File: src/execution/executor.rs
-```rust
-use anyhow::Result;
-use chrono::Utc;
-use rust_decimal::Decimal;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-
-use crate::db::Database;
-use crate::types::*;
-use super::polymarket_client::PolymarketClient;
-use super::kalshi_client::KalshiClient;
-use super::cdna_client::CdnaClient;
-use super::forecastex_client::ForecastExClient;
-
-#[derive(Debug, Clone)]
-pub struct OrderResult {
-    pub filled: bool,
-    pub fill_price: Usd,
-    pub fill_size: Contracts,
-    pub fee: Usd,
-    pub order_id: String,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderAction {
-    Buy,
-    Sell,
-}
-
-#[async_trait::async_trait]
-pub trait PlatformOrderClient: Send + Sync {
-    async fn submit_order(
-        &self,
-        market_id: &str,
-        action: OrderAction,
-        side: Side,
-        price: Usd,
-        size: Contracts,
-        fee_rate_bps: BasisPoints,
-    ) -> Result<OrderResult>;
-
-    async fn cancel_order(&self, order_id: &str) -> Result<()>;
-}
-
-pub struct ExecutionEngine {
-    rx: mpsc::Receiver<ValidatedOpportunity>,
-    trade_result_tx: mpsc::Sender<TradeResult>,
-    alert_tx: mpsc::Sender<AlertMessage>,
-    db: Arc<dyn Database>,
-    polymarket_client: Option<PolymarketClient>,
-    kalshi_client: Option<KalshiClient>,
-    cdna_client: Option<CdnaClient>,
-    forecastex_client: Option<ForecastExClient>,
-    executed_opps: lru::LruCache<uuid::Uuid, ()>,
-}
-
-impl ExecutionEngine {
-    pub fn new(
-        rx: mpsc::Receiver<ValidatedOpportunity>,
-        trade_result_tx: mpsc::Sender<TradeResult>,
-        alert_tx: mpsc::Sender<AlertMessage>,
-        db: Arc<dyn Database>,
-        polymarket_client: Option<PolymarketClient>,
-        kalshi_client: Option<KalshiClient>,
-        cdna_client: Option<CdnaClient>,
-        forecastex_client: Option<ForecastExClient>,
-    ) -> Self {
-        Self {
-            rx,
-            trade_result_tx,
-            alert_tx,
-            db,
-            polymarket_client,
-            kalshi_client,
-            cdna_client,
-            forecastex_client,
-            executed_opps: lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
-        }
-    }
-
-    pub async fn run(mut self) {
-        info!("Execution engine started");
-        loop {
-            // HIGH-3 FIX: Use recv() with a periodic timeout so the task
-            // doesn't block forever if the sender is dropped or the system
-            // is shutting down. This allows the JoinSet monitor to detect
-            // executor health issues within 5 seconds.
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.rx.recv(),
-            ).await {
-                Ok(Some(opp)) => {
-                    if let Err(e) = self.execute_arbitrage(opp).await {
-                        error!(error = %e, "Arbitrage execution error");
-                    }
-                }
-                Ok(None) => {
-                    // Channel closed — sender dropped, begin graceful shutdown
-                    info!("Execution engine: opportunity channel closed, draining");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout — no opportunities in 5s, just loop and check again.
-                    // This prevents the task from appearing "stuck" to the JoinSet monitor.
-                    continue;
-                }
-            }
-        }
-        info!("Execution engine stopped");
-    }
-
-    async fn execute_arbitrage(&mut self, validated: ValidatedOpportunity) -> Result<()> {
-        let opp = &validated.opportunity;
-        let start = Instant::now();
-        
-        let halves: Vec<&str> = opp.market_question.split(" / ").collect();
-        if halves.len() == 2 {
-            let nums_a: Vec<f64> = halves[0].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
-            let nums_b: Vec<f64> = halves[1].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
-            if nums_a != nums_b && (!nums_a.is_empty() || !nums_b.is_empty()) {
-                tracing::error!(question = %opp.market_question, "Mismatched numerical targets in execution. Aborting trade.");
-                return Ok(());
-            }
-        }
-        
-        // HIGH-4: Idempotency Guard
-        if self.executed_opps.put(opp.opp_id, ()).is_some() {
-            tracing::warn!(opp_id = %opp.opp_id, "Duplicate opportunity execution prevented");
-            return Ok(());
-        }
-
-        // CRITICAL FIX: The TTL Guard
-        // Drop the opportunity immediately if it sat in the async queue longer than its Time-To-Live.
-        // Executing stale arbs guarantees negative PnL.
-        let current_time_ns = crate::types::now_ns();
-        let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
-        
-        // Trade ID is assigned by the DB via AUTOINCREMENT. Use 0 as placeholder.
-        let current_trade_id: i64 = 0;
-
-        if current_time_ns > expiration_ns {
-            let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
-            tracing::warn!(
-                opp_id = %opp.opp_id, 
-                delay_ms, 
-                "Opportunity TTL expired in execution queue — dropping to prevent slippage"
-            );
-            
-            let trade_result = TradeResult {
-                trade_id: current_trade_id,
-                opp_id: opp.opp_id,
-                market_id: opp.market_id,
-                market_question: opp.market_question.clone(),
-                leg_a_platform: opp.leg_a.platform,
-                leg_a_side: opp.leg_a.side,
-                leg_a_price: opp.leg_a.price,
-                leg_a_size: Decimal::ZERO,
-                leg_a_fill_price: Decimal::ZERO,
-                leg_a_fee: Decimal::ZERO,
-                leg_b_platform: opp.leg_b.platform,
-                leg_b_side: opp.leg_b.side,
-                leg_b_price: opp.leg_b.price,
-                leg_b_size: Decimal::ZERO,
-                leg_b_fill_price: Decimal::ZERO,
-                leg_b_fee: Decimal::ZERO,
-                raw_spread: opp.raw_spread,
-                net_spread: opp.net_spread,
-                profit: Decimal::ZERO,
-                status: TradeStatus::Fail,
-                failure_reason: Some("Opportunity TTL expired in execution queue".into()),
-                execution_ms: 0,
-                executed_at: chrono::Utc::now(),
-                bankroll_after: Decimal::ZERO,
-                bankroll_change_pct: Decimal::ZERO,
-                approved_size: validated.approved_size,
-            };
-            let _ = self.trade_result_tx.try_send(trade_result);
-            return Ok(());
-        }
-
-        // Note: The software pre-execution slippage guard was removed.
-        // Because the Engine routes trades instantly and all client execution calls mandate 
-        // 'FOK' (Fill Or Kill), the target exchange matching engine provides a native,
-        // zero-latency slippage guard. If the price moves, the order simply fails to fill.
-
-        info!(
-            opp_id = %opp.opp_id,
-            market = %opp.market_question,
-            net_spread = %opp.net_spread,
-            size = %validated.approved_size,
-            "Executing arbitrage"
-        );
-
-        let (first_leg, second_leg) = self.order_legs(opp);
-
-        let first_result = self.execute_leg(
-            &first_leg.platform,
-            &first_leg.platform_market_id,
-            OrderAction::Buy,
-            first_leg.side,
-            Usd(first_leg.price),
-            Contracts(validated.approved_size),
-            BasisPoints(first_leg.fee_rate_bps),
-        ).await;
-
-        let (leg_a_result, leg_b_result) = match first_result {
-            Ok(first_fill) if first_fill.filled => {
-                let hedge_size = first_fill.fill_size; 
-                let second_result = self.execute_leg(
-                    &second_leg.platform,
-                    &second_leg.platform_market_id,
-                    OrderAction::Buy,
-                    second_leg.side,
-                    Usd(second_leg.price),
-                    Contracts(hedge_size.0),
-                    BasisPoints(second_leg.fee_rate_bps),
-                ).await;
-
-                match second_result {
-                    Ok(second_fill) if second_fill.filled => {
-                        (first_fill, second_fill)
-                    }
-                    Ok(second_fill) => {
-                        warn!(opp_id = %opp.opp_id, "Hedge leg failed, attempting unwind");
-                        let mut final_first_fill = first_fill.clone();
-                        
-                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
-                            // Calculate exact realized loss from the round-trip FOK sell
-                            let buy_cost = first_fill.fill_size.0 * first_fill.fill_price.0 + first_fill.fee.0;
-                            let sell_revenue = unwind_fill.fill_size.0 * unwind_fill.fill_price.0;
-                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee.0;
-                            
-                            // Zero out size to prevent DB position tracking, but pack the loss into the fee
-                            // so `compute_result` logs the exact financial hit.
-                            final_first_fill.fill_size = Contracts(Decimal::ZERO);
-                            final_first_fill.fee = Usd(realized_loss);
-                            final_first_fill.error = Some("Leg B failed, automated unwind successful".into());
-                        }
-                        
-                        (final_first_fill, second_fill)
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Hedge leg error, attempting unwind");
-                        let mut final_first_fill = first_fill.clone();
-                        
-                        if let Ok(unwind_fill) = self.attempt_unwind(first_leg, &first_fill).await {
-                            let buy_cost = first_fill.fill_size.0 * first_fill.fill_price.0 + first_fill.fee.0;
-                            let sell_revenue = unwind_fill.fill_size.0 * unwind_fill.fill_price.0;
-                            let realized_loss = (buy_cost - sell_revenue) + unwind_fill.fee.0;
-                            
-                            final_first_fill.fill_size = Contracts(Decimal::ZERO);
-                            final_first_fill.fee = Usd(realized_loss);
-                            final_first_fill.error = Some("Leg B error, automated unwind successful".into());
-                        }
-                        
-                        let failed2 = OrderResult {
-                            filled: false,
-                            fill_price: Usd(Decimal::ZERO),
-                            fill_size: Contracts(Decimal::ZERO),
-                            fee: Usd(Decimal::ZERO),
-                            order_id: String::new(),
-                            error: Some(e.to_string()),
-                        };
-                        
-                        // Return the stranded leg unmodified if unwind fails so the DB tracks it correctly
-                        (final_first_fill, failed2)
-                    }
-                }
-            }
-            Ok(first_fill) => {
-                let failed = OrderResult {
-                    filled: false,
-                    fill_price: Usd(Decimal::ZERO),
-                    fill_size: Contracts(Decimal::ZERO),
-                    fee: Usd(Decimal::ZERO),
-                    order_id: String::new(),
-                    error: None,
-                };
-                (first_fill, failed)
-            }
-            Err(e) => {
-                error!(error = %e, "First leg execution error");
-                let failed = OrderResult {
-                    filled: false,
-                    fill_price: Usd(Decimal::ZERO),
-                    fill_size: Contracts(Decimal::ZERO),
-                    fee: Usd(Decimal::ZERO),
-                    order_id: String::new(),
-                    error: Some(e.to_string()),
-                };
-                let failed2 = failed.clone();
-                (failed, failed2)
-            }
-        };
-
-    let execution_ms = start.elapsed().as_millis() as u64;
-
-        let (status, profit, failure_reason) = Self::compute_result(
-            &leg_a_result, &leg_b_result, opp,
-        );
-
-        // CRITICAL FIX (4-B): The execution engine sorts legs by liquidity to reduce slippage risk.
-        // We must map the execution results back to the original Opportunity's Leg A and Leg B
-        // to prevent database/audit-trail cross-contamination.
-        let (actual_leg_a_result, actual_leg_b_result) = if first_leg.platform == opp.leg_a.platform {
-            (&leg_a_result, &leg_b_result)
-        } else {
-            (&leg_b_result, &leg_a_result)
-        };
-
-        let trade_result = TradeResult {
-            trade_id: current_trade_id,
-            opp_id: opp.opp_id,
-            market_id: opp.market_id,
-            market_question: opp.market_question.clone(),
-            approved_size: validated.approved_size,
-            leg_a_platform: opp.leg_a.platform,
-            leg_a_side: opp.leg_a.side,
-            leg_a_price: opp.leg_a.price,
-            leg_a_size: actual_leg_a_result.fill_size.0,
-            leg_a_fill_price: actual_leg_a_result.fill_price.0,
-            leg_a_fee: actual_leg_a_result.fee.0,
-            leg_b_platform: opp.leg_b.platform,
-            leg_b_side: opp.leg_b.side,
-            leg_b_price: opp.leg_b.price,
-            leg_b_size: actual_leg_b_result.fill_size.0,
-            leg_b_fill_price: actual_leg_b_result.fill_price.0,
-            leg_b_fee: actual_leg_b_result.fee.0,
-            raw_spread: opp.raw_spread,
-            net_spread: opp.net_spread,
-            profit,
-            status,
-            failure_reason,
-            execution_ms,
-            executed_at: Utc::now(),
-            bankroll_after: Decimal::ZERO,
-            bankroll_change_pct: Decimal::ZERO,
-        };
-
-        // Pass the result directly back to the orchestrator.
-        // The executor MUST NOT dispatch to Telegram or SQLite. 
-        if let Err(e) = self.trade_result_tx.try_send(trade_result) {
-            tracing::error!(error = %e, "Trade result channel full — dropping notification");
-        }
-
-        Ok(())
-    }
-
-    fn order_legs<'a>(&self, opp: &'a ArbitrageOpportunity) -> (&'a LegDetail, &'a LegDetail) {
-        let a_liquidity = opp.leg_a.available_size;
-        let b_liquidity = opp.leg_b.available_size;
-
-        if a_liquidity <= b_liquidity {
-            (&opp.leg_a, &opp.leg_b) 
-        } else {
-            (&opp.leg_b, &opp.leg_a)
-        }
-    }
-
-    async fn execute_leg(
-        &self,
-        platform: &Platform,
-        market_id: &str,
-        action: OrderAction,
-        side: Side,
-        price: Usd,
-        size: Contracts,
-        fee_rate_bps: BasisPoints,
-    ) -> Result<OrderResult> {
-        match platform {
-            Platform::Polymarket | Platform::PolymarketUs => {
-                if let Some(client) = &self.polymarket_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Polymarket client not configured")
-                }
-            }
-            Platform::Kalshi => {
-                if let Some(client) = &self.kalshi_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("Kalshi client not configured")
-                }
-            }
-            Platform::Cdna => {
-                if let Some(client) = &self.cdna_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("CDNA client not configured")
-                }
-            }
-            Platform::ForecastEx => {
-                if let Some(client) = &self.forecastex_client {
-                    client.submit_order(market_id, action, side, price, size, fee_rate_bps).await
-                } else {
-                    anyhow::bail!("ForecastEx client not configured")
-                }
-            }
-        }
-    }
-
-
-    /// Executes a synthetic automated unwind.
-    /// By natively SELLING the stranded contracts back to the resting bids, 
-    /// we cap our risk instantly and free up capital without locking collateral.
-    async fn attempt_unwind(
-        &self,
-        stranded_leg: &LegDetail,
-        original_fill: &OrderResult,
-    ) -> Result<OrderResult> {
-        // Sell at 0.01 to aggressively cross the spread and ensure the FOK SELL order
-        // executes against whatever bids are resting on the book.
-        let aggressive_sell_price = rust_decimal_macros::dec!(0.01);
-
-        warn!(
-            platform = %stranded_leg.platform,
-            market_id = %stranded_leg.platform_market_id,
-            stranded_side = %stranded_leg.side,
-            size = %original_fill.fill_size,
-            "Hedge failed. Executing aggressive FOK SELL unwind to dump inventory."
-        );
-
-        let unwind_result = self.execute_leg(
-            &stranded_leg.platform,
-            &stranded_leg.platform_market_id,
-            OrderAction::Sell,
-            stranded_leg.side, // Same side! We sell the exact inventory we hold.
-            Usd(aggressive_sell_price),
-            original_fill.fill_size,
-            BasisPoints(stranded_leg.fee_rate_bps),
-        ).await;
-
-        match unwind_result {
-            Ok(fill) if fill.filled => {
-                let msg = format!(
-                    "⚠️ <b>AUTOMATED UNWIND SUCCESSFUL</b> ⚠️\n\n\
-                     Platform: {}\nMarket: {}\nUnwound: {} {}\n\
-                     <b>Delta exposure neutralized.</b>",
-                     stranded_leg.platform, stranded_leg.platform_market_id, fill.fill_size.0, stranded_leg.side
-                );
-                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
-                    severity: "warning".into(), 
-                    message: msg 
-                });
-                Ok(fill)
-            }
-            Ok(_) | Err(_) => {
-                let err_msg = unwind_result.err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "FOK Unwind Rejected by matching engine".into());
-                
-                error!(error = %err_msg, "Automated unwind failed. Naked exposure remains.");
-                
-                let msg = format!(
-                    "🚨 <b>CRITICAL: UNWIND FAILED - NAKED EXPOSURE</b> 🚨\n\n\
-                     Platform: {}\nMarket: {}\nStranded Size: {} {}\n\
-                     Error: {}\n\
-                     <b>MANUAL INTERVENTION REQUIRED IMMEDIATELY.</b>",
-                     stranded_leg.platform, stranded_leg.platform_market_id, 
-                     original_fill.fill_size.0, stranded_leg.side, err_msg
-                );
-                
-                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert { 
-                    severity: "critical".into(), 
-                    message: msg 
-                });
-                
-                anyhow::bail!("Automated unwind failed: {}", err_msg)
-            }
-        }
-    }
-
-    fn compute_result(
-        leg_a: &OrderResult,
-        leg_b: &OrderResult,
-        opp: &ArbitrageOpportunity,
-    ) -> (TradeStatus, Decimal, Option<String>) {
-        if leg_a.filled && leg_b.filled {
-            let total_cost = leg_a.fill_price.0 + leg_b.fill_price.0;
-            let gross_profit = (Decimal::ONE - total_cost) * leg_a.fill_size.0.min(leg_b.fill_size.0);
-            let net_profit = gross_profit - leg_a.fee.0 - leg_b.fee.0;
-            
-            let status = if leg_a.fill_size.0 == leg_b.fill_size.0 {
-                TradeStatus::Success
-            } else {
-                TradeStatus::Partial
-            };
-            
-            (status, net_profit, None)
-        } else if leg_a.filled && !leg_b.filled {
-            if leg_a.fill_size.0 == Decimal::ZERO && leg_a.fee.0 > Decimal::ZERO {
-                let reason = leg_b.error.clone().unwrap_or_else(|| "Hedge failed, unwind successful".into());
-                (TradeStatus::Fail, -leg_a.fee.0, Some(reason))
-            } else {
-                let filled_value = leg_a.fill_price.0 * leg_a.fill_size.0;
-                let dynamic_penalty_pct = opp.raw_spread
-                    .max(rust_decimal_macros::dec!(0.02))
-                    .min(rust_decimal_macros::dec!(0.10));
-                let dynamic_unwind_slippage = filled_value * dynamic_penalty_pct; 
-                let estimated_loss = dynamic_unwind_slippage + leg_a.fee.0; 
-                let reason = leg_b.error.clone().unwrap_or_else(|| {
-                    format!("Hedge leg failed — ESTIMATED loss ${:.2} (manual resolution required)", estimated_loss)
-                });
-                (TradeStatus::Fail, -estimated_loss, Some(reason))
-            }
-        } else {
-            let reason = leg_a.error.clone().unwrap_or_else(|| "First leg failed to fill".into());
-            (TradeStatus::Fail, Decimal::ZERO, Some(reason))
-        }
-    }
-}
-
-#[cfg(test)]
-mod verification {
-    use super::*;
-    use proptest::prelude::*;
-    use rust_decimal_macros::dec;
-
-    proptest! {
-        #[test]
-        fn formal_verify_compute_result_safety(
-            filled_a in any::<bool>(),
-            price_a in 0.01f64..0.99,
-            size_a in 1.0f64..1000.0,
-            fee_a in 0.0f64..50.0,
-            filled_b in any::<bool>(),
-            price_b in 0.01f64..0.99,
-            size_b in 1.0f64..1000.0,
-            fee_b in 0.0f64..50.0,
-        ) {
-            let leg_a = OrderResult {
-                filled: filled_a,
-                fill_price: Usd(Decimal::from_f64(price_a).unwrap()),
-                fill_size: Contracts(if filled_a { Decimal::from_f64(size_a).unwrap() } else { Decimal::ZERO }),
-                fee: Usd(Decimal::from_f64(fee_a).unwrap()),
-                order_id: "A".into(),
-                error: None,
-            };
-            
-            let leg_b = OrderResult {
-                filled: filled_b,
-                fill_price: Usd(Decimal::from_f64(price_b).unwrap()),
-                fill_size: Contracts(if filled_b { Decimal::from_f64(size_b).unwrap() } else { Decimal::ZERO }),
-                fee: Usd(Decimal::from_f64(fee_b).unwrap()),
-                order_id: "B".into(),
-                error: None,
-            };
-
-            let opp = ArbitrageOpportunity {
-                opp_id: uuid::Uuid::new_v4(),
-                market_id: uuid::Uuid::new_v4(),
-                market_question: "".into(),
-                leg_a: LegDetail { platform: Platform::Polymarket, platform_market_id: "".into(), fee_rate_bps: 0, side: Side::Yes, price: dec!(0), available_size: dec!(0), fee_estimate: dec!(0) },
-                leg_b: LegDetail { platform: Platform::Kalshi, platform_market_id: "".into(), fee_rate_bps: 0, side: Side::No, price: dec!(0), available_size: dec!(0), fee_estimate: dec!(0) },
-                raw_spread: dec!(0.05),
-                net_spread: dec!(0.03),
-                kelly_fraction: dec!(0),
-                recommended_size: dec!(0),
-                score: dec!(0),
-                detected_at: 0,
-                ttl_ms: 0,
-            };
-
-            let (status, profit, _) = ExecutionEngine::compute_result(&leg_a, &leg_b, &opp);
-
-            // Formal state validation
-            if filled_a && filled_b {
-                prop_assert!(status == TradeStatus::Success || status == TradeStatus::Partial);
-                let max_possible_gross = leg_a.fill_size.0.min(leg_b.fill_size.0) * Decimal::ONE;
-                prop_assert!(profit <= max_possible_gross); // Profit must always be logically bounded
-            } else if filled_a && !filled_b {
-                prop_assert_eq!(status, TradeStatus::Fail);
-                prop_assert!(profit <= Decimal::ZERO); // Unwinds or stranded legs must correctly book a loss
-            } else {
-                prop_assert_eq!(status, TradeStatus::Fail);
-                prop_assert_eq!(profit, Decimal::ZERO);
-            }
-        }
-    }
-}
-```
-
 ## File: src/main.rs
 ```rust
 use anyhow::Result;
@@ -10279,17 +10273,50 @@ struct Cli {
     config: String,
 }
 
-// C-4 FIX: Helper to manually load env vars without exposing them to the process environment
-fn load_env_vars() -> std::collections::HashMap<String, String> {
-    let mut env_vars = std::collections::HashMap::new();
-    if let Ok(contents) = std::fs::read_to_string("/opt/mercury/.env") {
-        for line in contents.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                env_vars.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
+// PHASE 4: AOT (Ahead-of-Time) Configuration Validation
+async fn run_preflight_checks(config: &MercuryConfig) -> Result<()> {
+    tracing::info!("Executing Ahead-of-Time (AOT) pre-flight checks...");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()?;
+    let mut tasks = tokio::task::JoinSet::new();
+
+    // 1. Polygon RPC Check
+    let rpc_url = config.polygon_rpc.url.clone();
+    let rpc_client = client.clone();
+    tasks.spawn(async move {
+        let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1});
+        let resp = rpc_client.post(&rpc_url).json(&body).send().await.map_err(|e| anyhow::anyhow!("RPC connectivity failed: {}", e))?;
+        if !resp.status().is_success() { anyhow::bail!("RPC returned HTTP {}", resp.status()); }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // 2. Polymarket Check
+    if config.platforms.polymarket.enabled {
+        let poly_url = config.platforms.polymarket.rest_url.clone();
+        let client = client.clone();
+        tasks.spawn(async move {
+            let resp = client.get(format!("{}/markets", poly_url)).query(&[("limit", "1")]).send().await.map_err(|e| anyhow::anyhow!("Polymarket reachability failed: {}", e))?;
+            if !resp.status().is_success() { anyhow::bail!("Polymarket HTTP {}", resp.status()); }
+            Ok(())
+        });
     }
-    env_vars
+
+    // 3. Kalshi Check
+    if config.platforms.kalshi.enabled {
+        let kalshi_url = config.platforms.kalshi.rest_url.clone();
+        let client = client.clone();
+        tasks.spawn(async move {
+            let resp = client.get(format!("{}/markets", kalshi_url)).query(&[("limit", "1")]).send().await.map_err(|e| anyhow::anyhow!("Kalshi reachability failed: {}", e))?;
+            if !resp.status().is_success() { anyhow::bail!("Kalshi HTTP {}", resp.status()); }
+            Ok(())
+        });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        res??;
+    }
+
+    tracing::info!("All AOT pre-flight checks passed successfully.");
+    Ok(())
 }
 
 // H-5 FIX: Extracted duplicated report generation logic
@@ -10390,6 +10417,16 @@ async fn main() -> Result<()> {
 
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded");
+    
+    // PHASE 4: Robust Environment Loading using dotenvy
+    if let Err(e) = dotenvy::from_path("/opt/mercury/.env") {
+        warn!("dotenvy could not load /opt/mercury/.env: {}. Falling back to standard OS environment.", e);
+    } else {
+        info!("Secure environment injected from /opt/mercury/.env");
+    }
+    
+    // PHASE 4: Run Pre-flight Checks
+    run_preflight_checks(&mercury_config).await?;
 
     // PHASE 3: ForecastEx Panic safely removed
 
@@ -10421,13 +10458,11 @@ async fn main() -> Result<()> {
     let (settlement_tx, mut settlement_rx) = mpsc::channel::<SettlementResult>(100);
     let (liveness_tx, mut liveness_rx) = mpsc::channel::<(crate::types::Platform, bool)>(20);
 
-    let env_vars = load_env_vars();
-
     // ─── Telegram ───
-    let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_else(|_| env_vars.get("TELEGRAM_NOTIFICATION_TOKEN").cloned().unwrap_or_default());
-    let tg_daily_token = std::env::var("TELEGRAM_DAILY_TOKEN").unwrap_or_else(|_| env_vars.get("TELEGRAM_DAILY_TOKEN").cloned().unwrap_or_default());
-    let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_else(|_| env_vars.get("TELEGRAM_ALERTS_CHAT_ID").cloned().unwrap_or_default());
-    let tg_report_chat = std::env::var("TELEGRAM_REPORT_CHAT_ID").unwrap_or_else(|_| env_vars.get("TELEGRAM_REPORT_CHAT_ID").cloned().unwrap_or_default());
+    let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
+    let tg_daily_token = std::env::var("TELEGRAM_DAILY_TOKEN").unwrap_or_default();
+    let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_default();
+    let tg_report_chat = std::env::var("TELEGRAM_REPORT_CHAT_ID").unwrap_or_default();
 
     let tg_alerts_enabled = mercury_config.telegram.enabled
         && !tg_notification_token.is_empty()
@@ -10513,10 +10548,10 @@ async fn main() -> Result<()> {
 
     // ─── Initialize Platform Clients from Environment ───
     let polymarket_client = (|| -> Option<execution::polymarket_client::PolymarketClient> {
-        let api_key = std::env::var("POLYMARKET_API_KEY").unwrap_or_else(|_| env_vars.get("POLYMARKET_API_KEY").cloned().unwrap_or_default());
-        let api_secret = std::env::var("POLYMARKET_API_SECRET").unwrap_or_else(|_| env_vars.get("POLYMARKET_API_SECRET").cloned().unwrap_or_default());
-        let api_passphrase = std::env::var("POLYMARKET_API_PASSPHRASE").unwrap_or_else(|_| env_vars.get("POLYMARKET_API_PASSPHRASE").cloned().unwrap_or_default());
-        let wallet_key = std::env::var("POLYMARKET_WALLET_KEY").unwrap_or_else(|_| env_vars.get("POLYMARKET_WALLET_KEY").cloned().unwrap_or_default());
+        let api_key = std::env::var("POLYMARKET_API_KEY").unwrap_or_default();
+        let api_secret = std::env::var("POLYMARKET_API_SECRET").unwrap_or_default();
+        let api_passphrase = std::env::var("POLYMARKET_API_PASSPHRASE").unwrap_or_default();
+        let wallet_key = std::env::var("POLYMARKET_WALLET_KEY").unwrap_or_default();
         
         // LOW-3: Fail explicitly if credentials exist but are empty
         if api_key.is_empty() || api_secret.is_empty() || api_passphrase.is_empty() || wallet_key.is_empty() {
@@ -10529,7 +10564,6 @@ async fn main() -> Result<()> {
         std::env::remove_var("POLYMARKET_API_PASSPHRASE");
         std::env::remove_var("POLYMARKET_WALLET_KEY");
         let chain_id: u64 = std::env::var("POLYMARKET_CHAIN_ID")
-            .or_else(|_| env_vars.get("POLYMARKET_CHAIN_ID").cloned().ok_or(std::env::VarError::NotPresent))
             .unwrap_or_else(|_| "137".to_string())
             .parse()
             .unwrap_or(137);
@@ -10551,8 +10585,8 @@ async fn main() -> Result<()> {
     })();
 
     let kalshi_client = (|| -> Option<execution::kalshi_client::KalshiClient> {
-        let api_key_id = std::env::var("KALSHI_API_KEY_ID").unwrap_or_else(|_| env_vars.get("KALSHI_API_KEY_ID").cloned().unwrap_or_default());
-        let rsa_pem_path = std::env::var("KALSHI_RSA_PEM_PATH").unwrap_or_else(|_| env_vars.get("KALSHI_RSA_PEM_PATH").cloned().unwrap_or_default());
+        let api_key_id = std::env::var("KALSHI_API_KEY_ID").unwrap_or_default();
+        let rsa_pem_path = std::env::var("KALSHI_RSA_PEM_PATH").unwrap_or_default();
         if api_key_id.is_empty() || rsa_pem_path.is_empty() {
             return None;
         }
@@ -10581,8 +10615,8 @@ async fn main() -> Result<()> {
         if !mercury_config.platforms.cdna.enabled {
             return None;
         }
-        let api_key = std::env::var("CDNA_API_KEY").ok().or_else(|| env_vars.get("CDNA_API_KEY").cloned())?;
-        let api_secret = std::env::var("CDNA_API_SECRET").ok().or_else(|| env_vars.get("CDNA_API_SECRET").cloned())?;
+        let api_key = std::env::var("CDNA_API_KEY").ok()?;
+        let api_secret = std::env::var("CDNA_API_SECRET").ok()?;
         info!("CDNA client initialized");
         Some(execution::cdna_client::CdnaClient::new(
             mercury_config.platforms.cdna.rest_url.clone(),

@@ -151,101 +151,92 @@ impl GasOracle {
         }
     }
 
-    /// Call `eth_gasPrice` on the configured Polygon RPC endpoint.
+    /// PHASE 4: Deterministic Consensus Oracle for Gas
     async fn fetch_gas_gwei(&self) -> Result<u64> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_gasPrice",
-            "params": [],
-            "id": 1
-        });
+        let (rpc_primary, rpc_ankr, gas_station) = tokio::join!(
+            self.try_rpc_gas(&self.rpc_url),
+            self.try_rpc_gas("https://rpc.ankr.com/polygon"),
+            self.try_polygon_gas_station()
+        );
 
-        let resp: RpcResponse = self.http
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let mut values = Vec::new();
+        if let Ok(g) = rpc_primary { values.push(g); }
+        if let Ok(g) = rpc_ankr { values.push(g); }
+        if let Ok(g) = gas_station { values.push(g); }
 
-        // Surface JSON-RPC errors (returned with HTTP 200 by most RPC providers).
-        if let Some(rpc_err) = resp.error {
-            return Err(anyhow::anyhow!(
-                "Polygon RPC error {}: {}",
-                rpc_err.code,
-                rpc_err.message
-            ));
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Consensus Oracle Failure: All Gas sources down"));
         }
 
-        let hex = resp.result
-            .ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result (no error field)"))?;
+        values.sort_unstable();
+        let median = if values.len() % 2 == 0 {
+            (values[values.len() / 2 - 1] + values[values.len() / 2]) / 2
+        } else {
+            values[values.len() / 2]
+        };
 
-        // Result is a hex string like "0x..." representing wei
-        let hex_stripped = hex.trim_start_matches("0x");
-        let wei = u64::from_str_radix(hex_stripped, 16)
-            .map_err(|e| anyhow::anyhow!("failed to parse gas price hex '{}': {}", hex, e))?;
-        let gwei = wei / 1_000_000_000;
-        Ok(gwei.max(1)) // floor at 1 gwei to avoid zero gas cost in spread calc
+        Ok(median.max(1)) // Floor at 1 gwei
     }
 
-    /// Fetch MATIC/USD (or POL/USD) from CoinGecko's free simple/price endpoint.
-    /// Tries both the legacy `matic-network` and new `polygon-ecosystem-token` IDs.
+    /// PHASE 4: Deterministic Consensus Oracle for MATIC/USD
     async fn fetch_matic_usd(&self) -> Result<Decimal> {
-        // Try the current ID first, fall back to legacy
-        for coin_id in &["polygon-ecosystem-token", "matic-network"] {
-            match self.try_coingecko_price(coin_id).await {
-                Ok(price) => return Ok(price),
-                Err(e) => {
-                    tracing::debug!(coin_id, error = %e, "CoinGecko fetch failed, trying next ID");
-                }
-            }
+        let (cg, bin, cb) = tokio::join!(
+            self.try_coingecko_price("polygon-ecosystem-token"),
+            self.try_binance_price("MATICUSDT"),
+            self.try_coinbase_price("MATIC-USD")
+        );
+
+        let mut prices = Vec::new();
+        if let Ok(p) = cg { prices.push(p); }
+        if let Ok(p) = bin { prices.push(p); }
+        if let Ok(p) = cb { prices.push(p); }
+
+        if prices.is_empty() {
+            return Err(anyhow::anyhow!("Consensus Oracle Failure: All MATIC/USD sources down"));
         }
-        // MED-6: Binance fallback for stability
-        match self.try_binance_price("MATICUSDT").await {
-            Ok(price) => return Ok(price),
-            Err(e) => tracing::debug!(error = %e, "Binance fallback failed"),
-        }
-        Err(anyhow::anyhow!("All price oracles failed for MATIC/POL price"))
+
+        prices.sort();
+        let median = if prices.len() % 2 == 0 {
+            (prices[prices.len() / 2 - 1] + prices[prices.len() / 2]) / dec!(2.0)
+        } else {
+            prices[prices.len() / 2]
+        };
+
+        Ok(median)
+    }
+
+    async fn try_rpc_gas(&self, url: &str) -> Result<u64> {
+        let body = serde_json::json!({ "jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1 });
+        let resp: RpcResponse = self.http.post(url).json(&body).send().await?.json().await?;
+        if let Some(rpc_err) = resp.error { return Err(anyhow::anyhow!("RPC error: {}", rpc_err.message)); }
+        let hex = resp.result.ok_or_else(|| anyhow::anyhow!("eth_gasPrice returned null result"))?;
+        let wei = u64::from_str_radix(hex.trim_start_matches("0x"), 16)?;
+        Ok(wei / 1_000_000_000)
+    }
+
+    async fn try_polygon_gas_station(&self) -> Result<u64> {
+        let resp: serde_json::Value = self.http.get("https://gasstation.polygon.technology/v2").send().await?.json().await?;
+        let standard = resp.pointer("/standard/maxFee").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("Gas station missing maxFee"))?;
+        Ok(standard.round() as u64)
     }
 
     async fn try_binance_price(&self, symbol: &str) -> Result<Decimal> {
-        let http_resp = self.http.get("https://api.binance.com/api/v3/ticker/price")
-            .query(&[("symbol", symbol)]).send().await?;
-        if !http_resp.status().is_success() {
-            return Err(anyhow::anyhow!("Binance HTTP {}", http_resp.status()));
-        }
-        let resp: serde_json::Value = http_resp.json().await?;
+        let resp: serde_json::Value = self.http.get("https://api.binance.com/api/v3/ticker/price").query(&[("symbol", symbol)]).send().await?.json().await?;
         let price_str = resp.get("price").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing price"))?;
-        std::str::FromStr::from_str(price_str).map_err(|e| anyhow::anyhow!("Parse error: {}", e))
+        std::str::FromStr::from_str(price_str).map_err(Into::into)
+    }
+
+    async fn try_coinbase_price(&self, pair: &str) -> Result<Decimal> {
+        let url = format!("https://api.coinbase.com/v2/prices/{}/spot", pair);
+        let resp: serde_json::Value = self.http.get(&url).send().await?.json().await?;
+        let price_str = resp.pointer("/data/amount").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Coinbase missing amount"))?;
+        std::str::FromStr::from_str(price_str).map_err(Into::into)
     }
 
     async fn try_coingecko_price(&self, coin_id: &str) -> Result<Decimal> {
-        let http_resp = self.http
-            .get("https://api.coingecko.com/api/v3/simple/price")
-            .query(&[("ids", coin_id), ("vs_currencies", "usd")])
-            .send()
-            .await?;
-
-        let status = http_resp.status();
-        if !status.is_success() {
-            let body = http_resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "CoinGecko HTTP {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-
-        let resp: serde_json::Value = http_resp.json().await?;
-        let usd = resp.get(coin_id)
-            .and_then(|v| v.get("usd"))
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow::anyhow!("CoinGecko response missing '{}.usd' field", coin_id))?;
-
-        if !usd.is_finite() {
-            return Err(anyhow::anyhow!("CoinGecko value is not finite: {}", usd));
-        }
-        Decimal::from_f64(usd)
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert f64 to Decimal: {}", usd))
+        let resp: serde_json::Value = self.http.get("https://api.coingecko.com/api/v3/simple/price").query(&[("ids", coin_id), ("vs_currencies", "usd")]).send().await?.json().await?;
+        let usd = resp.get(coin_id).and_then(|v| v.get("usd")).and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("Missing usd field"))?;
+        if !usd.is_finite() { return Err(anyhow::anyhow!("Non-finite value")); }
+        rust_decimal::Decimal::from_f64(usd).ok_or_else(|| anyhow::anyhow!("Decimal conversion failed"))
     }
 }
