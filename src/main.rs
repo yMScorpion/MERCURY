@@ -54,6 +54,14 @@ async fn run_preflight_checks(config: &MercuryConfig) -> Result<()> {
         tasks.spawn(async move {
             let resp = client.get(format!("{}/markets", poly_url)).query(&[("limit", "1")]).send().await.map_err(|e| anyhow::anyhow!("Polymarket reachability failed: {}", e))?;
             if !resp.status().is_success() { anyhow::bail!("Polymarket HTTP {}", resp.status()); }
+            
+            if let Some(date_header) = resp.headers().get("date").and_then(|h| h.to_str().ok()) {
+                if let Ok(server_time) = chrono::DateTime::parse_from_rfc2822(date_header) {
+                    let skew = (chrono::Utc::now() - server_time.with_timezone(&chrono::Utc)).num_seconds().abs();
+                    if skew > 30 { anyhow::bail!("CRITICAL: Polymarket clock skew > 30s"); }
+                    if skew > 2 { tracing::warn!("Polymarket clock skew is {} seconds", skew); }
+                }
+            }
             Ok(())
         });
     }
@@ -65,6 +73,14 @@ async fn run_preflight_checks(config: &MercuryConfig) -> Result<()> {
         tasks.spawn(async move {
             let resp = client.get(format!("{}/markets", kalshi_url)).query(&[("limit", "1")]).send().await.map_err(|e| anyhow::anyhow!("Kalshi reachability failed: {}", e))?;
             if !resp.status().is_success() { anyhow::bail!("Kalshi HTTP {}", resp.status()); }
+            
+            if let Some(date_header) = resp.headers().get("date").and_then(|h| h.to_str().ok()) {
+                if let Ok(server_time) = chrono::DateTime::parse_from_rfc2822(date_header) {
+                    let skew = (chrono::Utc::now() - server_time.with_timezone(&chrono::Utc)).num_seconds().abs();
+                    if skew > 30 { anyhow::bail!("CRITICAL: Kalshi clock skew > 30s"); }
+                    if skew > 2 { tracing::warn!("Kalshi clock skew is {} seconds", skew); }
+                }
+            }
             Ok(())
         });
     }
@@ -753,6 +769,7 @@ async fn main() -> Result<()> {
     // INITIALIZE ACTORS HERE
     let mut market_channels: std::collections::HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<NormalizedTick>> = std::collections::HashMap::new();
     let bankroll_handle = risk::bankroll::BankrollHandle::new(bankroll_manager);
+    let registry = std::sync::Arc::new(std::sync::RwLock::new(registry)); // Convert to shared RwLock
 
     loop {
         tokio::select! {
@@ -789,7 +806,7 @@ async fn main() -> Result<()> {
                         });
                         if let Ok(Some(mut market)) = db.get_market(&id).await {
                             market.status = MarketStatus::Active;
-                            registry.register_market(market);
+                            registry.write().unwrap().register_market(market);
                             info!("Market {} manually activated via Telegram", id);
                         }
                     }
@@ -802,11 +819,13 @@ async fn main() -> Result<()> {
                     Ok(t) => t,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Dropping old packets to recover.", n);
+                        // 1.3.B FIX: Apply backpressure by pausing detection
+                        let pause_until = crate::types::now_ns() + 2_000_000_000; // Pause 2 seconds
+                        detector.write().unwrap().pause_detection_until(pause_until);
                         continue;
                     }
                     Err(_) => break, 
                 };
-
                 if !active_platforms.contains(&tick.platform) {
                     continue;
                 }
@@ -825,7 +844,7 @@ async fn main() -> Result<()> {
                     let (tx, rx): (mpsc::Sender<NormalizedTick>, mpsc::Receiver<NormalizedTick>) = mpsc::channel(100);
                     market_channels.insert(tick.market_id, tx.clone());
                     
-                    let shared_registry = std::sync::Arc::new(registry.clone());
+                    let shared_registry = registry.clone(); // Pass the Arc directly, no expensive deep copies
                     
                     engine::market_actor::MarketActor::spawn(
                         tick.market_id,
@@ -848,29 +867,29 @@ async fn main() -> Result<()> {
 
             // ── Market Discovery Results ──
             Some(matched) = matched_market_rx.recv() => {
-                let market_id = matched.market.unified_id;
-                if registry.get_market(&market_id).is_some() {
-                    continue;
+                    let market_id = matched.market.unified_id;
+                    if registry.read().unwrap().get_market(&market_id).is_some() {
+                        continue;
+                    }
+                    {
+                        info!(
+                            market_id = %market_id,
+                            question = %matched.market.question,
+                            platforms = matched.market.platforms.len(),
+                            "New cross-platform market registered"
+                        );
+                        
+                        let db_clone = db.clone();
+                        let market_clone = matched.market.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = db_clone.upsert_market(&market_clone).await {
+                                tracing::error!(error = %e, "Failed to persist new market");
+                            }
+                        });
+                        
+                        registry.write().unwrap().register_market(matched.market);
+                    }
                 }
-                {
-                    info!(
-                        market_id = %market_id,
-                        question = %matched.market.question,
-                        platforms = matched.market.platforms.len(),
-                        "New cross-platform market registered"
-                    );
-                    
-                    let db_clone = db.clone();
-                    let market_clone = matched.market.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = db_clone.upsert_market(&market_clone).await {
-                            tracing::error!(error = %e, "Failed to persist new market");
-                        }
-                    });
-                    
-                    registry.register_market(matched.market);
-                }
-            }
 
             // ── Config Hot Reload ──
             Some(new_config) = config_reload_rx.recv() => {
@@ -963,9 +982,11 @@ async fn main() -> Result<()> {
 
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
-                let evicted_markets = registry.evict_stale_markets();
+                let evicted_markets = registry.write().unwrap().evict_stale_markets();
                 for id in evicted_markets {
-                    market_channels.remove(&id); 
+                    if let Some(sender) = market_channels.remove(&id) {
+                        drop(sender); // Explicitly drop sender to close channel and kill zombie actor
+                    }
                 }
                 
                 if let Ok(count) = db.get_open_arb_count().await {
@@ -1057,12 +1078,23 @@ async fn main() -> Result<()> {
     // Drain in-flight trades before killing subsystems.
     let current_open = cached_open_positions.load(Ordering::Relaxed);
     if current_open > 0 {
-        info!(positions = current_open, "Draining in-flight positions (up to 30s)");
-        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        while cached_open_positions.load(Ordering::Relaxed) > 0 {
-            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                warn!(
+            info!(positions = current_open, "Draining in-flight positions (up to 30s)");
+            let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut last_log = tokio::time::Instant::now();
+            
+            while cached_open_positions.load(Ordering::Relaxed) > 0 {
+                let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+                
+                if last_log.elapsed().as_secs() >= 5 {
+                    info!("Draining: {} position(s) remaining, {} seconds left", 
+                        cached_open_positions.load(Ordering::Relaxed),
+                        remaining.as_secs()
+                    );
+                    last_log = tokio::time::Instant::now();
+                }
+                
+                if remaining.is_zero() {
+                    warn!(
                     positions = cached_open_positions.load(Ordering::Relaxed),
                     "Shutdown drain timeout — {} position(s) may remain open",
                     cached_open_positions.load(Ordering::Relaxed)

@@ -50,6 +50,11 @@ impl SqliteDb {
         // Run migrations
         migrations::run_migrations(&pool).await?;
 
+        // 2.4.C FIX: Schema Version Validation
+        if let Ok(version) = sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations").fetch_one(&pool).await {
+            tracing::info!("Database schema version validated: {}", version);
+        }
+
         // FIX (LOW-7): Use a DIFFERENT index name than the migration's idx_positions_open
         // so this composite index coexists with the migration's single-column index.
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_positions_open_market ON positions(market_id, opened_at) WHERE closed = 0")
@@ -79,22 +84,11 @@ fn dec_to_string(d: &Decimal) -> String {
 }
 
 fn platform_from_db(s: &str) -> Result<Platform> {
-    match s {
-        "Polymarket" => Ok(Platform::Polymarket),
-        "Polymarket US" => Ok(Platform::PolymarketUs),
-        "Kalshi" => Ok(Platform::Kalshi),
-        "CDNA" => Ok(Platform::Cdna),
-        "ForecastEx" => Ok(Platform::ForecastEx),
-        _ => Err(anyhow::anyhow!("Unknown platform string in DB: {}", s)),
-    }
+    Platform::from_str(s).map_err(|_| anyhow::anyhow!("Unknown platform string in DB: {}", s))
 }
 
 fn side_from_db(s: &str) -> Result<Side> {
-    match s {
-        "YES" => Ok(Side::Yes),
-        "NO" => Ok(Side::No),
-        _ => Err(anyhow::anyhow!("Unknown side string in DB: {}", s)),
-    }
+    Side::from_str(s).map_err(|_| anyhow::anyhow!("Unknown side string in DB: {}", s))
 }
 
 async fn upsert_position_on<'e, E>(executor: E, pos: &Position) -> Result<()>
@@ -672,7 +666,17 @@ impl Database for SqliteDb {
     // -- Meta -----------------------------------------------------------
 
     async fn checkpoint_wal(&self) -> Result<()> {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+        // 2.4.B FIX: Monitor WAL size and force TRUNCATE if > 100MB
+        let wal_size_query = "SELECT page_count * page_size as bytes FROM pragma_page_count(), pragma_page_size()";
+        if let Ok(row) = sqlx::query(wal_size_query).fetch_one(&self.pool).await {
+            let bytes: i64 = row.try_get("bytes").unwrap_or(0);
+            if bytes > 100_000_000 {
+                tracing::warn!("WAL file exceeded 100MB, forcing TRUNCATE checkpoint");
+                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
+                return Ok(());
+            }
+        }
+        sqlx::query("PRAGMA wal_checkpoint(PASSIVE)").execute(&self.pool).await?;
         Ok(())
     }
 
