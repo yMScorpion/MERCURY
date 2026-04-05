@@ -169,7 +169,8 @@ impl ExecutionEngine {
                 delay_ms, 
                 "Opportunity TTL expired in execution queue — dropping to prevent slippage"
             );
-            
+
+            // Use send (not try_send) — we MUST release bankroll exposure even if slow.
             let trade_result = TradeResult {
                 trade_id: current_trade_id,
                 opp_id: opp.opp_id,
@@ -198,7 +199,9 @@ impl ExecutionEngine {
                 bankroll_change_pct: Decimal::ZERO,
                 approved_size: validated.approved_size,
             };
-            let _ = self.trade_result_tx.try_send(trade_result);
+            if let Err(e) = self.trade_result_tx.send(trade_result).await {
+                tracing::error!(error = %e, "Trade result channel closed during TTL drop — exposure may be locked");
+            }
             return Ok(());
         }
 
@@ -246,9 +249,13 @@ impl ExecutionEngine {
                 bankroll_after: Decimal::ZERO,
                 bankroll_change_pct: Decimal::ZERO,
             };
-            let _ = self.trade_result_tx.try_send(trade_result);
+            if let Err(e) = self.trade_result_tx.send(trade_result).await {
+                tracing::error!(opp_id = %opp.opp_id, error = %e, "CRITICAL: trade result channel closed — bankroll exposure may be permanently locked");
+            }
             return Ok(());
         }
+
+        // Note: The software pre-execution slippage guard was removed.
 
         let (first_leg, second_leg) = self.order_legs(opp);
 

@@ -102,8 +102,7 @@ impl MarketActor {
                     // Pre-flight TTL check before spending bankroll actor capacity
                     let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
                     if crate::types::now_ns() > expiration_ns {
-                        open_positions.fetch_sub(0, std::sync::atomic::Ordering::Relaxed); // no-op, just skip
-                        return;
+                        return; // TTL expired before capital reservation — nothing was committed
                     }
 
                     // 1. Fetch live exposure state from the Bankroll Actor

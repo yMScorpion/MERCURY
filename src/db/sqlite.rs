@@ -714,8 +714,7 @@ impl Database for SqliteDb {
         
         let canonical_str = canonical.to_string_lossy();
         anyhow::ensure!(
-            canonical_str.starts_with("/opt/mercury/data")
-            || canonical_str.starts_with("/opt/mercury/./data"),
+            canonical_str.starts_with("/opt/mercury/data"),
             "Backup path resolves outside /opt/mercury/data/: resolved to {}", canonical_str
         );
         

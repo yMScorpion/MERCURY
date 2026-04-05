@@ -261,7 +261,9 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                 }
                 _ = sync_interval.tick() => {
                     // CRITICAL FIX: Dynamically ingest newly discovered 15-min candles without rebooting
-                    if let Ok(markets) = self.db.get_active_markets().await {
+                    let poly_markets_result = self.db.get_active_markets().await;
+                    if let Err(ref e) = poly_markets_result { tracing::warn!(error = %e, "Polymarket feed: DB refresh failed, skipping subscription update"); }
+                    if let Ok(markets) = poly_markets_result {
                         let mut new_subs = Vec::new();
                         for m in markets {
                             if let Some(info) = m.platforms.get(&crate::types::Platform::Polymarket) {

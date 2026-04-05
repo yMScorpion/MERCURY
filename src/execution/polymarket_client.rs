@@ -216,9 +216,16 @@ impl PlatformOrderClient for PolymarketClient {
                         if let Ok(order_data) = fetch_resp.json::<serde_json::Value>().await {
                             if let Some(avg_price_str) = order_data.get("average_price").and_then(|v| v.as_str()) {
                                 if let Ok(parsed_price) = Decimal::from_str(avg_price_str) {
-                                    if parsed_price != assumed_price {
-                                        tracing::warn!("FillCorrection: Polymarket order {} filled at {} (assumed {})", order_id_clone, parsed_price, assumed_price);
-                                        // A FillCorrection channel would be invoked here to update the DB
+                                    if (parsed_price - assumed_price).abs() > rust_decimal_macros::dec!(0.01) {
+                                        tracing::error!(
+                                            order_id = %order_id_clone,
+                                            actual = %parsed_price,
+                                            assumed = %assumed_price,
+                                            "FILL PRICE DISCREPANCY: DB records assumed price, not actual fill price. \
+                                             PnL calculation will be inaccurate by ${:.4}. \
+                                             Implement FillCorrectionChannel to fix DB records.",
+                                            (parsed_price - assumed_price).abs()
+                                        );
                                     }
                                 }
                             }

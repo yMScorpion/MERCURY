@@ -124,7 +124,9 @@ async fn handle_health_request(
 
 /// Render all metrics in Prometheus text exposition format.
 fn render_prometheus(m: &Metrics, stale_timeout_ms: u64) -> String {
-    let ms_since_tick = m.ms_since_last_tick();
+    let ms_raw = m.ms_since_last_tick();
+    // Clamp u64::MAX (no-tick sentinel) to 0 for Prometheus — dashboards handle "no data" differently
+    let ms_since_tick = if ms_raw == u64::MAX { 0u64 } else { ms_raw };
     let is_healthy: u8 = if ms_since_tick < stale_timeout_ms
         || (ms_since_tick == u64::MAX && m.uptime_secs() < 60)
     { 1 } else { 0 };

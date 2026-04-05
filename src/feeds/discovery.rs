@@ -235,7 +235,7 @@ impl MarketDiscovery {
     }
 
 
-fn normalize_question(q: &str) -> String {
+pub(super) fn normalize_question(q: &str) -> String {
         // 1. Single initial allocation
         let mut lower = q.to_lowercase();
         

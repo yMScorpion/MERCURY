@@ -337,7 +337,7 @@ impl BankrollHandle {
                             rust_decimal::Decimal::ZERO
                         };
 
-                        if trade.status != TradeStatus::Success {
+                        if trade.status == TradeStatus::Fail {
                             let leg_a_exp = trade.approved_size * trade.leg_a_price;
                             let leg_b_exp = trade.approved_size * trade.leg_b_price;
                             manager.remove_exposure(trade.leg_a_platform, leg_a_exp);

@@ -140,6 +140,8 @@ impl MercuryConfig {
             "max_open_positions must be at least 1, got {}", t.max_open_positions);
         anyhow::ensure!(t.max_concurrent_arbs >= 1,
             "max_concurrent_arbs must be at least 1, got {}", t.max_concurrent_arbs);
+        anyhow::ensure!(t.gas_price_max_gwei > 0,
+            "gas_price_max_gwei must be > 0 (use a large value to effectively disable the check), got {}", t.gas_price_max_gwei);
         anyhow::ensure!(t.rebalance_threshold_pct > Decimal::ZERO && t.rebalance_threshold_pct <= Decimal::ONE,
             "rebalance_threshold_pct must be in (0, 1], got {}", t.rebalance_threshold_pct);
             

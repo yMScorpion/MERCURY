@@ -174,13 +174,19 @@ impl SettlementMonitor {
             for (id, settlement) in pending {
                 match self.settlement_tx.try_send(settlement.clone()) {
                     Ok(()) => {
-                        let _ = self.db.mark_settlement_resolved(id).await;
+                        // Mark resolved ONLY after successful send — ensures retry on restart
+                        if let Err(e) = self.db.mark_settlement_resolved(id).await {
+                            tracing::error!(error = %e, settlement_id = id, "Failed to mark settlement resolved in DB");
+                        }
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!("Bankroll actor saturated. Settlement {} retained in DB queue for backoff retry.", id);
-                        break; // Stop draining, try again next tick
+                        tracing::warn!(settlement_id = id, "Settlement channel full — will retry next tick (settlement remains pending in DB)");
+                        break; // Stop draining, try again next tick (NOT marked resolved)
                     }
-                    Err(_) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::error!("Settlement channel closed — main loop may have exited");
+                        break;
+                    }
                 }
             }
         }

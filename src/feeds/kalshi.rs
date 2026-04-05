@@ -247,7 +247,9 @@ impl FeedHandler for KalshiFeed {
                 }
                 _ = sync_interval.tick() => {
                     // CRITICAL FIX: Dynamically ingest newly discovered markets to prevent Kalshi blindspots
-                    if let Ok(markets) = self.db.get_active_markets().await {
+                    let kalshi_markets_result = self.db.get_active_markets().await;
+                    if let Err(ref e) = kalshi_markets_result { tracing::warn!(error = %e, "Kalshi feed: DB refresh failed, skipping subscription update"); }
+                    if let Ok(markets) = kalshi_markets_result {
                         let mut new_subs = Vec::new();
                         for m in markets {
                             if let Some(info) = m.platforms.get(&crate::types::Platform::Kalshi) {

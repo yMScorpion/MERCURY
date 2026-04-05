@@ -52,11 +52,6 @@ impl Metrics {
     }
 
     pub fn uptime_secs(&self) -> u64 { self.start_time.elapsed().as_secs() }
-    pub fn inc_ticks(&self) {
-        self.ticks_received.fetch_add(1, Ordering::Relaxed);
-        self.last_tick_ns.store(crate::types::now_ns(), Ordering::Relaxed);
-    }
-
     pub fn inc_ticks_for_platform(&self, platform: crate::types::Platform) {
         self.ticks_received.fetch_add(1, Ordering::Relaxed);
         let now = crate::types::now_ns();

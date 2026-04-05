@@ -268,6 +268,9 @@ async fn main() -> Result<()> {
         let report_service = telegram::reports::ReportService::new(bot, tg_report_chat.clone(), daily_report_rx, cmd_tx, db.clone());
         join_set.spawn(report_service.run());
         info!("Telegram daily reports & command polling enabled (MERCURY_DAILYBOT)");
+        if std::env::var("TELEGRAM_ADMIN_ID").unwrap_or_default().is_empty() {
+            warn!("TELEGRAM_ADMIN_ID not set — ALL users can send control commands to MERCURY. Set this to your Telegram user ID for security.");
+        }
     } else {
         warn!("Telegram reports disabled — set TELEGRAM_DAILY_TOKEN and TELEGRAM_REPORT_CHAT_ID");
         drop(daily_report_rx);
@@ -1008,13 +1011,19 @@ async fn main() -> Result<()> {
                 let evicted_markets = registry.write().unwrap().evict_stale_markets();
                 for id in evicted_markets {
                     if let Some(sender) = market_channels.remove(&id) {
-                        drop(sender); // Explicitly drop sender to close channel and kill zombie actor
+                        tracing::info!(market_id = %id, "Evicting stale market — closing actor channel");
+                        drop(sender); // Closing the sender causes the MarketActor's recv() to return None, ending its loop
                     }
                 }
                 
                 if let Ok(count) = db.get_open_arb_count().await {
+                    // DB count is ground truth for settled positions. In-flight trades are tracked
+                    // separately by in_flight_trades counter. We deliberately do NOT add in_flight
+                    // here because the trade result handler already adjusts cached_open_positions.
+                    // Only sync the DB-confirmed count to correct any drift from missed decrements.
                     let current_in_flight = in_flight_trades.load(Ordering::Relaxed);
-                    cached_open_positions.store(count + current_in_flight, Ordering::Relaxed);
+                    let total = count.saturating_add(current_in_flight);
+                    cached_open_positions.store(total, Ordering::Relaxed);
                 }
                 
                 let stats = detector.read().unwrap().stats.clone();
@@ -1131,8 +1140,9 @@ async fn main() -> Result<()> {
                     
                     cached_open_positions.fetch_sub(1, Ordering::Relaxed); 
                     
-                    if let Err(e) = trade_result_tx2.try_send(result) {
-                        error!(error = %e, "Position tracker channel full during drain");
+                    // Use send (blocking) during shutdown — we must ensure positions are tracked
+                    if let Err(e) = trade_result_tx2.send(result).await {
+                        error!(error = %e, "Position tracker channel closed during drain — positions may not be persisted");
                     }
                 }
                 _ => break,
