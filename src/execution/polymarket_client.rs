@@ -299,4 +299,39 @@ impl PolymarketClient {
         let balance_str = body.get("usdcBalance").and_then(|v| v.as_str()).unwrap_or("0");
         Ok(Decimal::from_str(balance_str).unwrap_or(Decimal::ZERO))
     }
+
+    /// Queries the Polymarket API for all active positions
+    pub async fn get_positions(&self) -> Result<Vec<(String, Decimal)>> {
+        let url = format!("{}/positions", self.rest_url);
+        let resp = self.http.get(&url)
+            .header("POLY_API_KEY", self.api_key.as_str())
+            .header("POLY_SECRET", self.api_secret.as_str())
+            .header("POLY_PASSPHRASE", self.api_passphrase.as_str())
+            .send()
+            .await?;
+        
+        if !resp.status().is_success() {
+            anyhow::bail!("Polymarket get_positions failed: {}", resp.status());
+        }
+        
+        let body: serde_json::Value = resp.json().await?;
+        let mut positions = Vec::new();
+        
+        if let Some(list) = body.as_array() {
+            for item in list {
+                if let (Some(id), Some(size_str)) = (
+                    item.get("asset_id").and_then(|v| v.as_str()),
+                    item.get("size").and_then(|v| v.as_str())
+                ) {
+                    if let Ok(size) = Decimal::from_str(size_str) {
+                        if size > Decimal::ZERO {
+                            positions.push((id.to_string(), size));
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(positions)
+    }
 }

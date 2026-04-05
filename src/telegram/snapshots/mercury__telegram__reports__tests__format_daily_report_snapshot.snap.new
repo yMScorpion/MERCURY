@@ -1,0 +1,38 @@
+---
+source: src/telegram/reports.rs
+assertion_line: 334
+expression: output
+---
+📈 <b>MERCURY DAILY REPORT — 2026-04-05</b>
+
+═══ P&amp;L Summary ═══
+Gross Profit:    +$200.0
+Total Fees:      -$50.0
+<b>Net Profit:      +$150.0</b>
+ROI Today:       +1.52%
+
+═══ Trading Activity ═══
+Opportunities Executed:  10
+Successful Trades:       8 (80.0%)
+Failed/Loss Trades:      2
+
+═══ Platform Breakdown ═══
+Polymarket: $1000.0 exposed │ 5 trades │ +$50.0
+
+═══ Risk Metrics ═══
+Bankroll:         $10050.0
+Peak Bankroll:    $10100.0
+Drawdown:         0.00%
+Kelly Utilization: 0.25
+
+═══ Top Trades ═══
+1. +$40.0 │ "Bitcoin hit 100k?" │ Polymarket↔Kalshi
+
+═══ Worst Trades ═══
+1. $-10.0 │ "ETH hit 10k?" │ Hedge failed
+
+═══ System Health ═══
+Uptime: 1h 1m
+WS Reconnects: 1
+API Errors: 0
+DB Size: 1.0MB

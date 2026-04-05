@@ -50,7 +50,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-const MIGRATION_V1: &str = r#"
+const MIGRATION_V1: &str = r"
 -- Markets
 CREATE TABLE IF NOT EXISTS markets (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,9 +163,9 @@ CREATE TABLE IF NOT EXISTS config_history (
     new_value TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_config_hist_ts ON config_history(changed_at);
-"#;
+";
 
-const MIGRATION_V2: &str = r#"
+const MIGRATION_V2: &str = r"
 -- Pending Settlements (Backpressure Queue)
 CREATE TABLE IF NOT EXISTS pending_settlements (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,4 +180,4 @@ CREATE TABLE IF NOT EXISTS pending_settlements (
     resolved_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pending_settlements_status ON pending_settlements(status);
-"#;
+";

@@ -40,9 +40,10 @@ impl fmt::Display for Usd {
 
 // ─── Platform ───
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
+    #[default]
     Polymarket,
     PolymarketUs,
     Kalshi,
@@ -64,9 +65,10 @@ impl fmt::Display for Platform {
 
 // ─── Side ───
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Side {
+    #[default]
     Yes,
     No,
 }
@@ -230,9 +232,10 @@ pub struct ValidatedOpportunity {
 
 // ─── Trade Status ───
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TradeStatus {
+    #[default]
     Success,
     Fail,
     Partial,
@@ -264,7 +267,7 @@ pub enum ExecutionState {
 
 // ─── Trade Result ───
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TradeResult {
     pub trade_id: i64,
     pub opp_id: Uuid,
@@ -338,7 +341,7 @@ pub struct PlatformBalance {
 
 // ─── Daily Snapshot ───
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DailySnapshot {
     pub date: NaiveDate,
     pub bankroll: Decimal,
@@ -369,7 +372,7 @@ pub struct AuditEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AlertMessage {
-    TradeComplete(TradeResult),
+    TradeComplete(Box<TradeResult>),
     CircuitBreaker {
         breaker_type: String,
         details: String,

@@ -56,6 +56,7 @@ impl NetSpreadEngine {
     }
 
     /// Compute spread for both directions of an arb pair
+    #[must_use]
     pub fn compute_spreads(
         &self,
         book_a: &PlatformBook,
@@ -242,10 +243,54 @@ impl NetSpreadEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use rust_decimal::prelude::FromPrimitive;
+
     #[test]
     fn test_gas_cost_offchain() {
         let engine = NetSpreadEngine::new(dec!(0.01));
         // Kalshi <-> CDNA trade uses zero gas
         assert_eq!(engine.gas_cost_if_onchain(Platform::Kalshi, Platform::Cdna), Decimal::ZERO);
+    }
+
+    proptest! {
+        #[test]
+        fn net_spread_never_exceeds_raw(
+            price_a in 0.01f64..0.99,
+            price_b_bid in 0.01f64..0.99,
+            size in 10.0f64..1000.0,
+        ) {
+            let engine = NetSpreadEngine::new(dec!(0.001));
+            let market_id = Uuid::new_v4();
+            
+            let mut book_a = PlatformBook::new(Platform::Kalshi, market_id);
+            book_a.asks.insert(Decimal::from_f64(price_a).unwrap(), Decimal::from_f64(size).unwrap());
+            
+            let mut book_b = PlatformBook::new(Platform::Cdna, market_id);
+            book_b.bids.insert(Decimal::from_f64(price_b_bid).unwrap(), Decimal::from_f64(size).unwrap());
+            
+            let spreads = engine.compute_spreads(&book_a, &book_b, dec!(100));
+            for s in spreads {
+                prop_assert!(s.net_spread <= s.raw_spread);
+            }
+        }
+
+        #[test]
+        fn zero_liquidity_produces_no_opportunities(
+            price_a in 0.01f64..0.99,
+            price_b_bid in 0.01f64..0.99,
+        ) {
+            let engine = NetSpreadEngine::new(dec!(0.001));
+            let market_id = Uuid::new_v4();
+            
+            let mut book_a = PlatformBook::new(Platform::Kalshi, market_id);
+            book_a.asks.insert(Decimal::from_f64(price_a).unwrap(), Decimal::ZERO);
+            
+            let mut book_b = PlatformBook::new(Platform::Cdna, market_id);
+            book_b.bids.insert(Decimal::from_f64(price_b_bid).unwrap(), Decimal::from_f64(10.0).unwrap());
+            
+            let spreads = engine.compute_spreads(&book_a, &book_b, dec!(100));
+            prop_assert!(spreads.is_empty());
+        }
     }
 }

@@ -1,8 +1,9 @@
-use crate::types::*;
+use crate::types::{AlertMessage, TradeResult, TradeStatus};
 use super::bot::TelegramBot;
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tracing::{error, info};
+use std::fmt::Write;
 
 pub struct AlertService {
     bot: TelegramBot,
@@ -80,7 +81,8 @@ fn format_trade_alert(trade: &TradeResult) -> String {
         fees_total = trade.leg_a_fee + trade.leg_b_fee,
     );
 
-    msg.push_str(&format!(
+    let _ = write!(
+        msg,
         "\n\n{profit_icon} <b>Profit: {profit_sign}${profit}</b>\n\
          📊 Bankroll: ${bankroll} ({pct_sign}{pct}%)\n\
          ⏱️ Execution: {exec_ms}ms",
@@ -88,10 +90,10 @@ fn format_trade_alert(trade: &TradeResult) -> String {
         bankroll = trade.bankroll_after.round_dp(2),
         pct = trade.bankroll_change_pct.round_dp(4),
         exec_ms = trade.execution_ms,
-    ));
+    );
 
     if let Some(reason) = &trade.failure_reason {
-        msg.push_str(&format!("\n🔍 Reason: {}", TelegramBot::escape_html(reason)));
+        let _ = write!(msg, "\n🔍 Reason: {}", TelegramBot::escape_html(reason));
     }
 
     msg
@@ -115,7 +117,7 @@ fn format_circuit_breaker(
     );
 
     if let Some(resume) = resume_at {
-        msg.push_str(&format!("\n<b>Resume:</b> {} UTC", resume.format("%Y-%m-%d %H:%M")));
+        let _ = write!(msg, "\n<b>Resume:</b> {} UTC", resume.format("%Y-%m-%d %H:%M"));
     }
 
     msg
@@ -130,9 +132,62 @@ fn format_system_alert(severity: &str, message: &str) -> String {
     };
 
     format!(
-        "{} <b>SYSTEM ALERT [{}]</b>\n\n{}",
-        icon,
-        TelegramBot::escape_html(severity),
-        TelegramBot::escape_html(message),
+    "{} <b>SYSTEM ALERT [{}]</b>\n\n{}",
+    icon,
+    TelegramBot::escape_html(severity),
+    TelegramBot::escape_html(message),
     )
-}
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use rust_decimal_macros::dec;
+        use chrono::{TimeZone, Utc};
+
+        #[test]    fn test_format_trade_alert_snapshot() {
+    let trade = TradeResult {
+        trade_id: 123,
+        opp_id: uuid::Uuid::nil(),
+        market_id: uuid::Uuid::nil(),
+        market_question: "Will Bitcoin hit $100k?".into(),
+        leg_a_platform: Platform::Polymarket,
+        leg_a_side: Side::Yes,
+        leg_a_price: dec!(0.60),
+        leg_a_size: dec!(100),
+        leg_a_fill_price: dec!(0.61),
+        leg_a_fee: dec!(0.5),
+        leg_b_platform: Platform::Kalshi,
+        leg_b_side: Side::No,
+        leg_b_price: dec!(0.35),
+        leg_b_size: dec!(100),
+        leg_b_fill_price: dec!(0.36),
+        leg_b_fee: dec!(0.1),
+        raw_spread: dec!(0.05),
+        net_spread: dec!(0.03),
+        profit: dec!(5.0),
+        status: TradeStatus::Success,
+        failure_reason: None,
+        execution_ms: 120,
+        executed_at: Utc::now(),
+        bankroll_after: dec!(1005.0),
+        bankroll_change_pct: dec!(0.005),
+        approved_size: dec!(100),
+    };
+
+    let alert = format_trade_alert(&trade);
+    insta::assert_snapshot!(alert);
+    }
+
+    #[test]
+    fn test_format_circuit_breaker_snapshot() {
+    let resume = Utc.with_ymd_and_hms(2026, 3, 27, 12, 0, 0).unwrap();
+    let alert = format_circuit_breaker(
+        "ExposureLimit",
+        "Total exposure exceeded $5000",
+        "Pausing all trading",
+        Some(&resume),
+    );
+    insta::assert_snapshot!(alert);
+    }
+    }

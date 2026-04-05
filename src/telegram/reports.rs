@@ -1,8 +1,9 @@
-use crate::types::*;
+use crate::types::{DailyReport, SystemCommand, Platform};
 use super::bot::TelegramBot;
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tracing::{error, info};
+use std::fmt::Write;
 use std::sync::Arc;
 use crate::db::Database;
 
@@ -98,11 +99,10 @@ impl ReportService {
                                 } else if data == "kalshi_off" {
                                     let _ = self.cmd_tx.send(SystemCommand::DisablePlatform(Platform::Kalshi)).await;
                                     let _ = self.bot.send_message(&self.chat_id, "❌ Kalshi routing disabled").await;
-                                } else if data.starts_with("activate_") {
-                                    let id_str = &data["activate_".len()..];
+                                } else if let Some(id_str) = data.strip_prefix("activate_") {
                                     if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                                         let _ = self.cmd_tx.send(SystemCommand::ActivateMarket(uuid)).await;
-                                        let _ = self.bot.send_message(&self.chat_id, &format!("✅ Activation command sent for:\n<code>{}</code>", id_str)).await;
+                                        let _ = self.bot.send_message(&self.chat_id, &format!("✅ Activation command sent for:\n<code>{id_str}</code>")).await;
                                     }
                                 }
                                 continue;
@@ -199,21 +199,23 @@ fn format_daily_report(report: &DailyReport) -> String {
     );
 
     // Platform breakdown
-    msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Platform Breakdown \u{2550}\u{2550}\u{2550}\n"));
+    let _ = write!(msg, "\n\u{2550}\u{2550}\u{2550} Platform Breakdown \u{2550}\u{2550}\u{2550}\n");
     for (platform, stats) in &report.platform_breakdown {
         let p_sign = if stats.pnl >= Decimal::ZERO { "+" } else { "" };
-        msg.push_str(&format!(
+        let _ = write!(
+            msg,
             "{}: ${} exposed \u{2502} {} trades \u{2502} {}${}\n",
             platform,
             stats.exposure.round_dp(2),
             stats.trade_count,
             p_sign,
             stats.pnl.round_dp(2),
-        ));
+        );
     }
 
     // Risk metrics
-    msg.push_str(&format!(
+    let _ = write!(
+        msg,
         "\n\u{2550}\u{2550}\u{2550} Risk Metrics \u{2550}\u{2550}\u{2550}\n\
          Bankroll:         ${bankroll}\n\
          Peak Bankroll:    ${peak}\n\
@@ -223,14 +225,15 @@ fn format_daily_report(report: &DailyReport) -> String {
         peak = s.peak_bankroll.round_dp(2),
         dd = s.drawdown_pct.round_dp(2),
         kelly = s.kelly_utilization.round_dp(2),
-    ));
+    );
 
     // Top trades
     if !report.top_trades.is_empty() {
-        msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Top Trades \u{2550}\u{2550}\u{2550}\n"));
+        let _ = write!(msg, "\n\u{2550}\u{2550}\u{2550} Top Trades \u{2550}\u{2550}\u{2550}\n");
         for (i, t) in report.top_trades.iter().enumerate() {
             let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
-            msg.push_str(&format!(
+            let _ = write!(
+                msg,
                 "{}. {}${} \u{2502} \"{}\" \u{2502} {}\u{2194}{}\n",
                 i + 1,
                 sign,
@@ -238,23 +241,24 @@ fn format_daily_report(report: &DailyReport) -> String {
                 truncate_question(&t.market_question, 30),
                 t.leg_a_platform,
                 t.leg_b_platform,
-            ));
+            );
         }
     }
 
     if !report.worst_trades.is_empty() {
-        msg.push_str(&format!("\n\u{2550}\u{2550}\u{2550} Worst Trades \u{2550}\u{2550}\u{2550}\n"));
+        let _ = write!(msg, "\n\u{2550}\u{2550}\u{2550} Worst Trades \u{2550}\u{2550}\u{2550}\n");
         for (i, t) in report.worst_trades.iter().enumerate() {
             let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
-            let reason = t.failure_reason.as_deref().unwrap_or("n/a");
-            msg.push_str(&format!(
+            let reason = t.failure_reason.as_deref().unwrap_or("Unknown");
+            let _ = write!(
+                msg,
                 "{}. {}${} \u{2502} \"{}\" \u{2502} {}\n",
                 i + 1,
                 sign,
                 t.profit.round_dp(2),
                 truncate_question(&t.market_question, 30),
                 reason,
-            ));
+            );
         }
     }
 
@@ -262,7 +266,8 @@ fn format_daily_report(report: &DailyReport) -> String {
     let hours = report.uptime_secs / 3600;
     let mins = (report.uptime_secs % 3600) / 60;
     let db_mb = report.db_size_bytes as f64 / 1_048_576.0;
-    msg.push_str(&format!(
+    let _ = write!(
+        msg,
         "\n\u{2550}\u{2550}\u{2550} System Health \u{2550}\u{2550}\u{2550}\n\
          Uptime: {}h {}m\n\
          WS Reconnects: {}\n\
@@ -272,9 +277,69 @@ fn format_daily_report(report: &DailyReport) -> String {
         report.ws_reconnects,
         report.api_errors,
         db_mb,
-    ));
+    );
 
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DailySnapshot, TradeResult, PlatformDayStats};
+    use rust_decimal_macros::dec;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_format_daily_report_snapshot() {
+        let mut platforms = HashMap::new();
+        platforms.insert(Platform::Polymarket, PlatformDayStats {
+            platform: Platform::Polymarket,
+            exposure: dec!(1000.0),
+            trade_count: 5,
+            pnl: dec!(50.0),
+        });
+
+        let report = DailyReport {
+            snapshot: DailySnapshot {
+                date: chrono::Utc::now().date_naive(),
+                bankroll: dec!(10050.0),
+                peak_bankroll: dec!(10100.0),
+                net_pnl: dec!(150.0),
+                gross_pnl: dec!(200.0),
+                fees_paid: dec!(50.0),
+                trades_count: 10,
+                success_count: 8,
+                fail_count: 2,
+                success_rate: dec!(0.8),
+                drawdown_pct: dec!(0.005),
+                kelly_utilization: dec!(0.25),
+                report_sent: false,
+            },
+            platform_breakdown: platforms,
+            top_trades: vec![TradeResult {
+                trade_id: 1,
+                market_question: "Bitcoin hit 100k?".into(),
+                profit: dec!(40.0),
+                leg_a_platform: Platform::Polymarket,
+                leg_b_platform: Platform::Kalshi,
+                ..Default::default()
+            }],
+            worst_trades: vec![TradeResult {
+                trade_id: 2,
+                market_question: "ETH hit 10k?".into(),
+                profit: dec!(-10.0),
+                failure_reason: Some("Hedge failed".into()),
+                ..Default::default()
+            }],
+            uptime_secs: 3661,
+            ws_reconnects: 1,
+            api_errors: 0,
+            db_size_bytes: 1048576,
+        };
+
+        let output = format_daily_report(&report);
+        insta::assert_snapshot!(output);
+    }
 }
 
 fn truncate_question(q: &str, max_len: usize) -> String {

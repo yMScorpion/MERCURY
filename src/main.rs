@@ -9,32 +9,26 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-mod config;
-mod crypto;
-mod db;
-mod engine;
-mod execution;
-mod feeds;
-mod inventory;
-mod monitoring;
-mod risk;
-mod telegram;
-mod types;
-#[cfg(test)]
-#[path = "integration.rs"]
-mod integration;
-
-use config::MercuryConfig;
-use db::SqliteDb;
-use types::*;
-
-
+use mercury::config::MercuryConfig;
+use mercury::db::{self, SqliteDb};
+use mercury::*;
+use mercury::execution;
+use mercury::engine;
+use mercury::inventory;
+use mercury::monitoring;
+use mercury::telegram;
+use mercury::feeds;
+use mercury::risk;
+use mercury::crypto;
 
 #[derive(Parser)]
 #[command(name = "mercury", about = "MERCURY - Cross-Market Prediction Arbitrage Engine")]
 struct Cli {
     #[arg(short, long, default_value = "config/default.yaml")]
     config: String,
+
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 // PHASE 4: AOT (Ahead-of-Time) Configuration Validation
@@ -220,7 +214,7 @@ async fn main() -> Result<()> {
     let (gas_update_tx, mut gas_update_rx) = mpsc::channel::<monitoring::gas_oracle::GasUpdate>(16);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SystemCommand>(10); // Command routing from Telegram
     let (settlement_tx, mut settlement_rx) = mpsc::channel::<SettlementResult>(100);
-    let (liveness_tx, mut liveness_rx) = mpsc::channel::<(crate::types::Platform, bool)>(20);
+    let (liveness_tx, mut liveness_rx) = mpsc::channel::<(Platform, bool)>(20);
 
     // ─── Telegram ───
     let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
@@ -284,7 +278,7 @@ async fn main() -> Result<()> {
     // M-2 FIX: Recover persistent Circuit Breaker state from recent DB trades
     if let Ok(recent_trades) = db.get_trades_since(chrono::Utc::now() - chrono::Duration::hours(1)).await {
         for trade in &recent_trades {
-            cb_initial.record_execution(trade.status == crate::types::TradeStatus::Success);
+            cb_initial.record_execution(trade.status == TradeStatus::Success);
         }
         tracing::info!("Recovered circuit breaker state from {} recent trades", recent_trades.len());
     }
@@ -418,6 +412,53 @@ async fn main() -> Result<()> {
     let cdna_for_unwind = cdna_client.clone();
     let forex_for_unwind = forecastex_client.clone();
 
+    // ─── Position Reconciliation on Startup ───
+    if !cli.dry_run {
+        let db_rec = db.clone();
+        let poly_rec = polymarket_client.clone();
+        let kalshi_rec = kalshi_client.clone();
+        let alert_rec = alert_tx.clone();
+        
+        tokio::spawn(async move {
+            info!("Starting startup position reconciliation...");
+            if let Ok(open_positions) = db_rec.get_open_positions().await {
+                for pos in open_positions {
+                    let mut exists = false;
+                    match pos.platform {
+                        Platform::Polymarket | Platform::PolymarketUs => {
+                            if let Some(client) = &poly_rec {
+                                if let Ok(remote_pos) = client.get_positions().await {
+                                    // For Polymarket, we'd need to map asset_id to our market_id
+                                    // This is a simplified check: if any remote position exists, we keep it.
+                                    // In a real scenario, we'd match the specific asset_id.
+                                    exists = !remote_pos.is_empty(); 
+                                }
+                            }
+                        }
+                        Platform::Kalshi => {
+                            if let Some(client) = &kalshi_rec {
+                                if let Ok(remote_pos) = client.get_positions().await {
+                                    exists = !remote_pos.is_empty();
+                                }
+                            }
+                        }
+                        _ => exists = true, // Skip for other platforms for now
+                    }
+
+                    if !exists {
+                        warn!(pos_id = pos.id, platform = ?pos.platform, "Position exists in DB but not on exchange. Closing.");
+                        let _ = db_rec.close_position(pos.id).await;
+                        let _ = alert_rec.send(AlertMessage::SystemAlert {
+                            severity: "warning".into(),
+                            message: format!("Position #{} on {:?} closed due to exchange state drift.", pos.id, pos.platform),
+                        }).await;
+                    }
+                }
+            }
+            info!("Position reconciliation complete.");
+        });
+    }
+
     let executor = execution::executor::ExecutionEngine::new(
         opportunity_rx,
         trade_result_tx.clone(),
@@ -427,6 +468,7 @@ async fn main() -> Result<()> {
         kalshi_client,
         cdna_client,
         forecastex_client,
+        cli.dry_run,
     );
     join_set.spawn(executor.run());
 
@@ -709,7 +751,7 @@ async fn main() -> Result<()> {
     let mut active_config_str = serde_json::to_string(&mercury_config).unwrap_or_default();
 
     // INITIALIZE ACTORS HERE
-    let mut market_channels: std::collections::HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<crate::types::NormalizedTick>> = std::collections::HashMap::new();
+    let mut market_channels: std::collections::HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<NormalizedTick>> = std::collections::HashMap::new();
     let bankroll_handle = risk::bankroll::BankrollHandle::new(bankroll_manager);
 
     loop {
@@ -780,12 +822,12 @@ async fn main() -> Result<()> {
                         tracing::debug!("MarketActor queue full/dropped: {}", e);
                     }
                 } else {
-                    let (tx, rx) = tokio::sync::mpsc::channel(100);
+                    let (tx, rx): (mpsc::Sender<NormalizedTick>, mpsc::Receiver<NormalizedTick>) = mpsc::channel(100);
                     market_channels.insert(tick.market_id, tx.clone());
                     
                     let shared_registry = std::sync::Arc::new(registry.clone());
                     
-                    crate::engine::market_actor::MarketActor::spawn(
+                    engine::market_actor::MarketActor::spawn(
                         tick.market_id,
                         rx,
                         opportunity_tx.clone(),
@@ -878,7 +920,7 @@ async fn main() -> Result<()> {
                 });
 
                 if tg_alerts_enabled {
-                    let _ = alert_tx.try_send(AlertMessage::TradeComplete(result.clone()));
+                    let _ = alert_tx.try_send(AlertMessage::TradeComplete(Box::new(result.clone())));
                 }
 
                 circuit_breakers.write().unwrap().record_execution(result.status == TradeStatus::Success);

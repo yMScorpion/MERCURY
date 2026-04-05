@@ -11,7 +11,9 @@
       "Bash(git add:*)",
       "Bash(cat C:/Users/ADRIANO/MERCURY/.serena/logs/health-checks/*.log)",
       "Bash(rtk ls:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(sed -n '180,210p' src/integration.rs)",
+      "Bash(sed -n '430,465p' src/integration.rs)"
     ]
   },
   "enableAllProjectMcpServers": true,

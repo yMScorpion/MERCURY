@@ -246,4 +246,36 @@ impl KalshiClient {
         let balance_cents = body.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
         Ok(Decimal::from(balance_cents) / Decimal::from(100))
     }
+
+    /// Queries the Kalshi API for all active positions
+    pub async fn get_positions(&self) -> Result<Vec<(String, Decimal)>> {
+        let url = format!("{}/portfolio/positions", self.rest_url);
+        let auth_header = self.auth.auth_header().await?;
+        let resp = self.http.get(&url)
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+            
+        if !resp.status().is_success() {
+            anyhow::bail!("Kalshi get_positions failed: {}", resp.status());
+        }
+        
+        let body: serde_json::Value = resp.json().await?;
+        let mut positions = Vec::new();
+        
+        if let Some(list) = body.get("positions").and_then(|v| v.as_array()) {
+            for item in list {
+                if let (Some(ticker), Some(size)) = (
+                    item.get("ticker").and_then(|v| v.as_str()),
+                    item.get("position").and_then(|v| v.as_i64())
+                ) {
+                    if size > 0 {
+                        positions.push((ticker.to_string(), Decimal::from(size)));
+                    }
+                }
+            }
+        }
+        
+        Ok(positions)
+    }
 }

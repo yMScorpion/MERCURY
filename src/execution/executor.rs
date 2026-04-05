@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -14,6 +15,18 @@ use super::polymarket_client::PolymarketClient;
 use super::kalshi_client::KalshiClient;
 use super::cdna_client::CdnaClient;
 use super::forecastex_client::ForecastExClient;
+
+#[derive(Debug, Clone)]
+struct RateLimitState {
+    consecutive_429s: u32,
+    backoff_until: Option<Instant>,
+}
+
+impl Default for RateLimitState {
+    fn default() -> Self {
+        Self { consecutive_429s: 0, backoff_until: None }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OrderResult {
@@ -56,6 +69,8 @@ pub struct ExecutionEngine {
     cdna_client: Option<CdnaClient>,
     forecastex_client: Option<ForecastExClient>,
     executed_opps: lru::LruCache<uuid::Uuid, ()>,
+    rate_limits: HashMap<Platform, RateLimitState>,
+    dry_run: bool,
 }
 
 impl ExecutionEngine {
@@ -68,6 +83,7 @@ impl ExecutionEngine {
         kalshi_client: Option<KalshiClient>,
         cdna_client: Option<CdnaClient>,
         forecastex_client: Option<ForecastExClient>,
+        dry_run: bool,
     ) -> Self {
         Self {
             rx,
@@ -79,6 +95,8 @@ impl ExecutionEngine {
             cdna_client,
             forecastex_client,
             executed_opps: lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
+            rate_limits: HashMap::new(),
+            dry_run,
         }
     }
 
@@ -192,8 +210,43 @@ impl ExecutionEngine {
             market = %opp.market_question,
             net_spread = %opp.net_spread,
             size = %validated.approved_size,
+            dry_run = self.dry_run,
             "Executing arbitrage"
         );
+
+        if self.dry_run {
+            info!("DRY RUN: Bypassing order submission");
+            let trade_result = TradeResult {
+                trade_id: current_trade_id,
+                opp_id: opp.opp_id,
+                market_id: opp.market_id,
+                market_question: opp.market_question.clone(),
+                approved_size: validated.approved_size,
+                leg_a_platform: opp.leg_a.platform,
+                leg_a_side: opp.leg_a.side,
+                leg_a_price: opp.leg_a.price,
+                leg_a_size: validated.approved_size,
+                leg_a_fill_price: opp.leg_a.price,
+                leg_a_fee: opp.leg_a.fee_estimate,
+                leg_b_platform: opp.leg_b.platform,
+                leg_b_side: opp.leg_b.side,
+                leg_b_price: opp.leg_b.price,
+                leg_b_size: validated.approved_size,
+                leg_b_fill_price: opp.leg_b.price,
+                leg_b_fee: opp.leg_b.fee_estimate,
+                raw_spread: opp.raw_spread,
+                net_spread: opp.net_spread,
+                profit: opp.net_spread * validated.approved_size,
+                status: TradeStatus::Success,
+                failure_reason: Some("[DRY RUN]".into()),
+                execution_ms: 1,
+                executed_at: Utc::now(),
+                bankroll_after: Decimal::ZERO,
+                bankroll_change_pct: Decimal::ZERO,
+            };
+            let _ = self.trade_result_tx.try_send(trade_result);
+            return Ok(());
+        }
 
         let (first_leg, second_leg) = self.order_legs(opp);
 
@@ -362,7 +415,7 @@ impl ExecutionEngine {
     }
 
     async fn execute_leg(
-        &self,
+        &mut self,
         platform: &Platform,
         market_id: &str,
         action: OrderAction,
@@ -371,6 +424,15 @@ impl ExecutionEngine {
         size: Contracts,
         fee_rate_bps: BasisPoints,
     ) -> Result<OrderResult> {
+        // Check rate limit backoff
+        if let Some(state) = self.rate_limits.get(platform) {
+            if let Some(backoff) = state.backoff_until {
+                if Instant::now() < backoff {
+                    anyhow::bail!("Platform {:?} is rate limited until {:?}", platform, backoff);
+                }
+            }
+        }
+
         let fut = async {
             match platform {
                 Platform::Polymarket | Platform::PolymarketUs => {
@@ -403,9 +465,34 @@ impl ExecutionEngine {
                 }
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(8), fut)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), fut)
             .await
-            .map_err(|_| anyhow::anyhow!("execute_leg timeout after 8s (platform={:?})", platform))?
+            .map_err(|_| anyhow::anyhow!("execute_leg timeout after 8s (platform={:?})", platform))?;
+
+        // Handle 429 logic
+        match &result {
+            Err(e) if e.to_string().contains("429") || e.to_string().contains("Too Many Requests") => {
+                let state = self.rate_limits.entry(*platform).or_default();
+                state.consecutive_429s += 1;
+                if state.consecutive_429s >= 3 {
+                    let backoff_duration = std::time::Duration::from_secs(60);
+                    state.backoff_until = Some(Instant::now() + backoff_duration);
+                    warn!(platform = ?platform, "3 consecutive 429s — pausing for 60s");
+                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                        severity: "warning".into(),
+                        message: format!("Platform {:?} rate limited. Pausing for 60s.", platform),
+                    });
+                }
+            }
+            _ => {
+                if let Some(state) = self.rate_limits.get_mut(platform) {
+                    state.consecutive_429s = 0;
+                    state.backoff_until = None;
+                }
+            }
+        }
+
+        result
     }
 
 
@@ -413,7 +500,7 @@ impl ExecutionEngine {
     /// By natively SELLING the stranded contracts back to the resting bids, 
     /// we cap our risk instantly and free up capital without locking collateral.
     async fn attempt_unwind(
-        &self,
+        &mut self,
         stranded_leg: &LegDetail,
         original_fill: &OrderResult,
     ) -> Result<OrderResult> {
