@@ -291,7 +291,7 @@ impl ArbitrageDetector {
         }
 
         opportunities.sort_by(|a, b| b.score.cmp(&a.score));
-        let slots = self.max_concurrent.saturating_sub(self.active_arbs);
+        let slots = self.max_concurrent.saturating_sub(self.active_arbs.load(std::sync::atomic::Ordering::Relaxed));
         opportunities.truncate(slots);
 
         // M-9 FIX: Allocate strings only for the opportunities that actually made the cut
@@ -349,7 +349,7 @@ impl ArbitrageDetector {
         }
 
         if confidence < 0.95 {
-            self.stats.gate4_rejected += 1;
+            self.stats.gate4_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(RejectionReason::CorrelationExposure {
                 current: Decimal::ZERO,
                 max: Decimal::ZERO,
@@ -357,7 +357,7 @@ impl ArbitrageDetector {
         }
 
         if self.active_arbs >= self.max_concurrent {
-            self.stats.gate5_rejected += 1;
+            self.stats.gate5_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(RejectionReason::RiskBudgetExceeded {
                 reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
             });

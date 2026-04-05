@@ -3352,6 +3352,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "dashmap",
  "dotenvy",
  "futures-util",
  "hex",
