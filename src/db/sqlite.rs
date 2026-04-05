@@ -68,6 +68,26 @@ impl SqliteDb {
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
         Ok(())
     }
+
+    pub async fn checkpoint_wal(&self) -> Result<()> {
+        // Rely on SQLite's autocheckpoint limit, but issue a PASSIVE checkpoint periodically
+        // to encourage log recycling without blocking readers/writers.
+        sqlx::query("PRAGMA wal_checkpoint(PASSIVE)").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn db_size_bytes(&self) -> Result<u64> {
+        // Checking filesystem directly to avoid full SQLite page counting blocking
+        let metadata = std::fs::metadata("/opt/mercury/data/mercury.db")?;
+        let wal_metadata = std::fs::metadata("/opt/mercury/data/mercury.db-wal").ok();
+        
+        let mut size = metadata.len();
+        if let Some(wal) = wal_metadata {
+            size += wal.len();
+        }
+        
+        Ok(size)
+    }
 }
 
 // ---------------------------------------------------------------------------

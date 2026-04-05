@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::signers::Signer;
+use alloy::signers::{Signer, SignerSync};
 use alloy::sol_types::{sol, Eip712Domain};
 use std::str::FromStr;
 use tracing::info;
@@ -112,12 +112,17 @@ impl PolymarketSigner {
             signingScheme: signing_scheme,
         };
 
-        // CRITICAL FIX: Alloy typed data signing is asynchronous. 
-        // We use `sign_typed_data` and `.await` it.
-        let signature = self.wallet
-            .sign_typed_data(&order, &self.domain)
-            .await
-            .context("Failed to sign EIP-712 order")?;
+        // CRITICAL FIX: Alloy typed data signing is CPU-intensive.
+        // Offload ECDSA math to a blocking thread to avoid starving the tokio reactor.
+        let wallet = self.wallet.clone();
+        let domain = self.domain.clone();
+        
+        let signature = tokio::task::spawn_blocking(move || {
+            wallet.sign_typed_data_sync(&order, &domain)
+        })
+        .await
+        .context("Spawn blocking failed for ECDSA signature")?
+        .context("Failed to sign EIP-712 order")?;
 
         Ok(format!("0x{}", hex::encode(signature.as_bytes())))
     }

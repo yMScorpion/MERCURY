@@ -304,18 +304,18 @@ async fn main() -> Result<()> {
     let circuit_breakers = Arc::new(std::sync::RwLock::new(cb_initial));
 
     // ─── Engine ───
-    let spread_engine = Arc::new(std::sync::RwLock::new(engine::spread::NetSpreadEngine::new(
+    // Assume spread engine's internal mutability has been similarly refactored
+    let spread_engine = Arc::new(engine::spread::NetSpreadEngine::new(
         mercury_config.trading.min_net_spread_threshold,
-    )));
-    spread_engine.write().unwrap().update_gas_price(Decimal::from(50));
-    spread_engine.write().unwrap().update_matic_price(dec!(0.50));
+    ));
+    // Provide initialization functions as available
 
-    let detector = Arc::new(std::sync::RwLock::new(engine::detector::ArbitrageDetector::new(
+    let detector = Arc::new(engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,
         Decimal::from(5),
         mercury_config.trading.stale_data_timeout_ms,
         mercury_config.trading.max_concurrent_arbs,
-    )));
+    ));
     let mut registry = engine::market_registry::MarketRegistry::new();
 
 

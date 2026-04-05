@@ -27,6 +27,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 arrayvec = { version = "0.7", features = ["serde"] }
 lru = "0.12.5"
+dashmap = "6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

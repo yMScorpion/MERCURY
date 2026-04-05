@@ -44,6 +44,8 @@ pub async fn run_with_reconnect(
     loop {
         info!(%platform, "Connecting feed handler");
         let _ = liveness_tx.send((platform, true)).await; // Mark Alive
+        
+        let connect_time = std::time::Instant::now();
 
         tokio::select! {
             _ = token.cancelled() => {
@@ -54,12 +56,16 @@ pub async fn run_with_reconnect(
                 handler.clear_books();
                 let _ = liveness_tx.send((platform, false)).await; // Mark Dead
 
+                // Reset backoff only if the connection survived for at least 60 seconds
+                if connect_time.elapsed().as_secs() > 60 {
+                    backoff_secs = 1;
+                    consecutive_failures = 0;
+                    max_backoff = 5;
+                }
+
                 match result {
                     Ok(()) => {
                         info!(%platform, "Feed handler disconnected cleanly — books cleared");
-                        backoff_secs = 1;
-                        consecutive_failures = 0;
-                        max_backoff = 5;
                     }
                     Err(e) => {
                         error!(%platform, error = %e, "Feed handler error — books cleared");

@@ -150,20 +150,31 @@ impl UnwindWatchdog {
 
                         if let Some(plat) = target_platform {
                             if let Some(info) = market.platforms.get(&plat) {
+                                // Prevent dumping at 0.01 by querying recent BBO or Mid and setting max 15% slippage.
+                                let mut limit_price = rust_decimal_macros::dec!(0.01);
+                                if let Some(uob_ref) = &self.uob {
+                                    if let Ok(uob) = uob_ref.read() {
+                                        if let Some(pb) = uob.get_book(market_id, &plat) {
+                                            limit_price = pb.mid_price() * rust_decimal_macros::dec!(0.85);
+                                            limit_price = limit_price.max(rust_decimal_macros::dec!(0.01)); // Floor at $0.01
+                                        }
+                                    }
+                                }
+
                                 let result = match plat {
                                     Platform::Polymarket | Platform::PolymarketUs => {
                                         if let Some(c) = &self.polymarket {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(rust_decimal_macros::dec!(0.01)), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(limit_price), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
                                         } else { None }
                                     },
                                     Platform::Kalshi => {
                                         if let Some(c) = &self.kalshi {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(rust_decimal_macros::dec!(0.01)), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(limit_price), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
                                         } else { None }
                                     },
                                     Platform::Cdna => {
                                         if let Some(c) = &self.cdna {
-                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(rust_decimal_macros::dec!(0.01)), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
+                                            Some(c.submit_order(&info.platform_market_id, OrderAction::Sell, target_side, Usd(limit_price), Contracts(unhedged_diff), BasisPoints(info.fee_rate_bps as u32)).await)
                                         } else { None }
                                     },
                                     Platform::ForecastEx => None,
@@ -178,7 +189,17 @@ impl UnwindWatchdog {
                                         for pos in legs {
                                             let _ = self.db.close_position(pos.id).await;
                                         }
+                                    } else {
+                                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                            severity: "critical".into(),
+                                            message: format!("🚨 Automated liquidation FAILED due to slippage guard on {}. Manual intervention required for market {}.", plat, market_id),
+                                        });
                                     }
+                                } else {
+                                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                                        severity: "critical".into(),
+                                        message: format!("🚨 Automated liquidation submission error on {}. Manual intervention required for market {}.", plat, market_id),
+                                    });
                                 }
                             }
                         }

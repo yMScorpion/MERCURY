@@ -18,8 +18,8 @@ pub struct MarketActor {
     uob_shard: UnifiedOrderBook,
     rx: mpsc::Receiver<NormalizedTick>,
     execution_tx: mpsc::Sender<ValidatedOpportunity>,
-    detector: Arc<RwLock<ArbitrageDetector>>,
-    spread_engine: Arc<RwLock<NetSpreadEngine>>,
+    detector: Arc<ArbitrageDetector>,
+    spread_engine: Arc<NetSpreadEngine>,
     bankroll: BankrollHandle,
     registry: Arc<RwLock<MarketRegistry>>,
     circuit_breakers: Arc<RwLock<CircuitBreakers>>,
@@ -34,8 +34,8 @@ impl MarketActor {
         market_id: Uuid,
         rx: mpsc::Receiver<NormalizedTick>,
         execution_tx: mpsc::Sender<ValidatedOpportunity>,
-        detector: Arc<RwLock<ArbitrageDetector>>,
-        spread_engine: Arc<RwLock<NetSpreadEngine>>,
+        detector: Arc<ArbitrageDetector>,
+        spread_engine: Arc<NetSpreadEngine>,
         bankroll: BankrollHandle,
         registry: Arc<RwLock<MarketRegistry>>,
         circuit_breakers: Arc<RwLock<CircuitBreakers>>,
@@ -72,19 +72,14 @@ impl MarketActor {
             self.uob_shard.update(&tick);
 
             // Update volatility before detection so the gate uses current vol multiplier
-            {
-                let mut d = self.detector.write().unwrap();
-                d.update_volatility(market_id, mid);
-            }
+            self.detector.update_volatility(market_id, mid);
 
             let opps = {
-                let mut d = self.detector.write().unwrap();
-                let se = self.spread_engine.read().unwrap();
-                d.detect_for_market(
+                self.detector.detect_for_market(
                     &self.market_id,
                     &self.registry.read().unwrap(),
                     &self.uob_shard,
-                    &se,
+                    &self.spread_engine,
                     rust_decimal_macros::dec!(10.0)
                 )
             };

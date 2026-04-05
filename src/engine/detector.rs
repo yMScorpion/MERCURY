@@ -48,31 +48,32 @@ fn decimal_ln(mut x: Decimal) -> Decimal {
     (sum * two) + (Decimal::from(shifts) * rust_decimal_macros::dec!(0.6931471805599453))
 }
 
-#[derive(Debug, Default, Clone)]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+#[derive(Debug, Default)]
 pub struct DetectorStats {
-    pub opportunities_detected: u64,
-    pub gate1_rejected: u64,
-    pub gate2_rejected: u64,
-    pub gate3_rejected: u64,
-    pub gate4_rejected: u64,
-    pub gate5_rejected: u64,
-    pub opportunities_passed: u64,
+    pub opportunities_detected: AtomicU64,
+    pub gate1_rejected: AtomicU64,
+    pub gate2_rejected: AtomicU64,
+    pub gate3_rejected: AtomicU64,
+    pub gate4_rejected: AtomicU64,
+    pub gate5_rejected: AtomicU64,
+    pub opportunities_passed: AtomicU64,
 }
 
-#[derive(Clone)]
 pub struct ArbitrageDetector {
     min_spread: Decimal,
     min_order_size: Decimal,
     stale_timeout_ms: u64,
     max_concurrent: usize,
-    active_arbs: usize,
+    active_arbs: AtomicUsize,
     pub stats: DetectorStats,
-    paused_until_ns: u64,
-    platform_liveness: std::collections::HashMap<Platform, bool>,
+    paused_until_ns: AtomicU64,
+    platform_liveness: dashmap::DashMap<Platform, bool>,
     /// Rolling 1-minute mid-price samples per market for volatility calculation
-    price_history: std::collections::HashMap<Uuid, std::collections::VecDeque<(u64, Decimal)>>,
+    price_history: dashmap::DashMap<Uuid, std::collections::VecDeque<(u64, Decimal)>>,
     /// Cached per-market volatility multiplier (1.0 = normal, 1.5 = high vol)
-    volatility_multipliers: std::collections::HashMap<Uuid, Decimal>,
+    volatility_multipliers: dashmap::DashMap<Uuid, Decimal>,
 }
 
 impl ArbitrageDetector {
@@ -87,45 +88,48 @@ impl ArbitrageDetector {
             min_order_size,
             stale_timeout_ms,
             max_concurrent,
-            active_arbs: 0,
+            active_arbs: AtomicUsize::new(0),
             stats: DetectorStats::default(),
-            paused_until_ns: 0,
-            platform_liveness: std::collections::HashMap::new(),
-            price_history: std::collections::HashMap::new(),
-            volatility_multipliers: std::collections::HashMap::new(),
+            paused_until_ns: AtomicU64::new(0),
+            platform_liveness: dashmap::DashMap::new(),
+            price_history: dashmap::DashMap::new(),
+            volatility_multipliers: dashmap::DashMap::new(),
         }
     }
 
-    pub fn set_platform_liveness(&mut self, platform: Platform, is_alive: bool) {
+    pub fn set_platform_liveness(&self, platform: Platform, is_alive: bool) {
         self.platform_liveness.insert(platform, is_alive);
     }
 
-    pub fn pause_detection_until(&mut self, ns: u64) {
-        self.paused_until_ns = ns;
+    pub fn pause_detection_until(&self, ns: u64) {
+        self.paused_until_ns.store(ns, Ordering::Relaxed);
     }
 
+    // Refactored to require mutable access if updating core thresholds.
     pub fn update_thresholds(&mut self, min_spread: Decimal, stale_timeout_ms: u64, max_concurrent: usize) {
         self.min_spread = min_spread;
         self.stale_timeout_ms = stale_timeout_ms;
         self.max_concurrent = max_concurrent;
     }
 
-    pub fn set_active_arbs(&mut self, count: usize) {
-        self.active_arbs = count;
+    pub fn set_active_arbs(&self, count: usize) {
+        self.active_arbs.store(count, Ordering::Relaxed);
     }
 
     /// Evaluates spreads ONLY for the specific market that just updated.
     /// Update rolling volatility for a market based on the current mid-price.
     /// Call this every time a tick arrives for a market.
-    pub fn update_volatility(&mut self, market_id: Uuid, mid_price: Decimal) {
+    pub fn update_volatility(&self, market_id: Uuid, mid_price: Decimal) {
         let now = crate::types::now_ns();
-        let history = self.price_history.entry(market_id).or_default();
+        let mut history = self.price_history.entry(market_id).or_default();
         history.push_back((now, mid_price));
+
         // Keep only last 60 minutes of data
         let cutoff = now.saturating_sub(3_600_000_000_000);
         while history.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
             history.pop_front();
         }
+
         // Compute 1-minute return standard deviation if we have enough data (≥10 samples)
         if history.len() < 10 {
             self.volatility_multipliers.insert(market_id, rust_decimal_macros::dec!(1.0));
