@@ -9,6 +9,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::base::FeedHandler;
+use super::common::LocalBookOps;
 use crate::config::ForecastExConfig;
 use crate::types::*;
 
@@ -31,27 +32,11 @@ struct FexOrderBook {
 
 impl FexOrderBook {
     fn new() -> Self { Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new() } }
+}
 
-    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
-    }
-
-    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(&p, &s)| (p, s))
-    }
-
-    fn mid_price(&self) -> Option<Decimal> {
-        let (b, _) = self.best_bid()?;
-        let (a, _) = self.best_ask()?;
-        Some((b + a) / rust_decimal::Decimal::from(2))
-    }
-    
-    fn depth(&self) -> arrayvec::ArrayVec<PriceLevel, 20> {
-        let mut levels = arrayvec::ArrayVec::new();
-        for (&p, &s) in self.bids.iter().rev().take(10) { levels.push(PriceLevel { price: p, size: s }); }
-        for (&p, &s) in self.asks.iter().take(10) { levels.push(PriceLevel { price: p, size: s }); }
-        levels
-    }
+impl super::common::LocalBookOps for FexOrderBook {
+    fn bids(&self) -> &std::collections::BTreeMap<Decimal, Decimal> { &self.bids }
+    fn asks(&self) -> &std::collections::BTreeMap<Decimal, Decimal> { &self.asks }
 }
 
 const SOH: char = '\x01';

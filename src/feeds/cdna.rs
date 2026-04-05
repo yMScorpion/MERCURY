@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::base::FeedHandler;
+use super::common::LocalBookOps;
 use crate::config::CdnaConfig;
 use crate::types::*;
 
@@ -29,27 +30,11 @@ struct CdnaOrderBook {
 
 impl CdnaOrderBook {
     fn new() -> Self { Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new() } }
+}
 
-    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
-    }
-
-    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(&p, &s)| (p, s))
-    }
-
-    fn mid_price(&self) -> Option<Decimal> {
-        let (b, _) = self.best_bid()?;
-        let (a, _) = self.best_ask()?;
-        Some((b + a) / rust_decimal::Decimal::from(2))
-    }
-    
-    fn depth(&self) -> arrayvec::ArrayVec<PriceLevel, 20> {
-        let mut levels = arrayvec::ArrayVec::new();
-        for (&p, &s) in self.bids.iter().rev().take(10) { levels.push(PriceLevel { price: p, size: s }); }
-        for (&p, &s) in self.asks.iter().take(10) { levels.push(PriceLevel { price: p, size: s }); }
-        levels
-    }
+impl super::common::LocalBookOps for CdnaOrderBook {
+    fn bids(&self) -> &std::collections::BTreeMap<Decimal, Decimal> { &self.bids }
+    fn asks(&self) -> &std::collections::BTreeMap<Decimal, Decimal> { &self.asks }
 }
 
 #[derive(Serialize)]
@@ -130,15 +115,8 @@ impl FeedHandler for CdnaFeed {
         let url = &self.config.ws_url;
         info!(url, "Connecting to CDNA WebSocket");
 
-        let mut tls_builder = native_tls::TlsConnector::builder();
-        tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
-                tls_builder.add_root_certificate(cert);
-            }
-        }
-        let tls_connector = tls_builder.build().context("Failed to build CDNA TLS connector")?;
+        let tls_connector = crate::crypto::tls::build_tls_connector()
+            .context("Failed to build CDNA TLS connector")?;
         let (ws_stream, _) = connect_async_tls_with_config(
             url, None, false, Some(Connector::NativeTls(tls_connector)),
         )

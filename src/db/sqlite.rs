@@ -134,22 +134,11 @@ where
 }
 
 fn trade_status_from_db(s: &str) -> TradeStatus {
-    match s {
-        "success" => TradeStatus::Success,
-        "fail" => TradeStatus::Fail,
-        "partial" => TradeStatus::Partial,
-        _ => TradeStatus::Fail,
-    }
+    TradeStatus::from_str(s).unwrap_or(TradeStatus::Fail)
 }
 
 fn market_status_from_db(s: &str) -> MarketStatus {
-    match s {
-        "active" => MarketStatus::Active,
-        "suspended" => MarketStatus::Suspended,
-        "resolved" => MarketStatus::Resolved,
-        "expired" => MarketStatus::Expired,
-        _ => MarketStatus::Active,
-    }
+    MarketStatus::from_str(s).unwrap_or(MarketStatus::Active)
 }
 
 fn category_from_db(s: &str) -> MarketCategory {

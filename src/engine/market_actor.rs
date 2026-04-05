@@ -66,8 +66,16 @@ impl MarketActor {
     }
 
     async fn run(&mut self) {
-        while let Some(tick) = self.rx.recv().await {
+         while let Some(tick) = self.rx.recv().await {
+            let mid = tick.mid_price;
+            let market_id = tick.market_id;
             self.uob_shard.update(&tick);
+
+            // Update volatility before detection so the gate uses current vol multiplier
+            {
+                let mut d = self.detector.write().unwrap();
+                d.update_volatility(market_id, mid);
+            }
 
             let opps = {
                 let mut d = self.detector.write().unwrap();

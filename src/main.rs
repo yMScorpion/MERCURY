@@ -512,6 +512,7 @@ async fn main() -> Result<()> {
         kalshi_for_unwind,
         cdna_for_unwind,
         forex_for_unwind,
+        None, // UOB not shared globally; stop-loss uses per-market books in actor shards
     );
     join_set.spawn(unwind_watchdog.run());
 
@@ -541,6 +542,15 @@ async fn main() -> Result<()> {
         6 * 3600,
     );
     join_set.spawn(backup_task.run());
+
+    // ─── Metric Alert Checker ───
+    let metric_checker = monitoring::metrics::MetricAlertChecker::new(
+        metrics.clone(),
+        alert_tx.clone(),
+        mercury_config.trading.stale_data_timeout_ms,
+    );
+    let db_for_alerts = db.clone();
+    join_set.spawn(metric_checker.run(db_for_alerts));
 
     // ─── Config Hot-Reload Watcher ───
     let (config_reload_tx, mut config_reload_rx) = mpsc::channel::<MercuryConfig>(5);

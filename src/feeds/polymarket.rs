@@ -11,6 +11,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::base::FeedHandler;
+use super::common::LocalBookOps;
 use crate::config::PolymarketConfig;
 use crate::types::*;
 
@@ -35,27 +36,6 @@ impl LocalOrderBook {
         Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new(), last_trade_price: Decimal::ZERO, sequence: 0 }
     }
 
-    fn best_bid(&self) -> Option<(Decimal, Decimal)> {
-        self.bids.iter().next_back().map(|(&p, &s)| (p, s))
-    }
-
-    fn best_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.asks.iter().next().map(|(&p, &s)| (p, s))
-    }
-
-    fn mid_price(&self) -> Option<Decimal> {
-        let (bid, _) = self.best_bid()?;
-        let (ask, _) = self.best_ask()?;
-        Some((bid + ask) / rust_decimal::Decimal::from(2))
-    }
-
-    fn depth(&self) -> arrayvec::ArrayVec<PriceLevel, 20> {
-        let mut levels = arrayvec::ArrayVec::new();
-        for (&p, &s) in self.bids.iter().rev().take(10) { levels.push(PriceLevel { price: p, size: s }); }
-        for (&p, &s) in self.asks.iter().take(10) { levels.push(PriceLevel { price: p, size: s }); }
-        levels
-    }
-
     fn apply_update(&mut self, side: &str, price: Decimal, size: Decimal) {
         let book = if side == "BUY" || side == "bid" { &mut self.bids } else { &mut self.asks };
         if size == Decimal::ZERO {
@@ -72,6 +52,11 @@ impl LocalOrderBook {
         for (p, s) in bids { self.bids.insert(*p, *s); }
         for (p, s) in asks { self.asks.insert(*p, *s); }
     }
+}
+
+impl super::common::LocalBookOps for LocalOrderBook {
+    fn bids(&self) -> &std::collections::BTreeMap<Decimal, Decimal> { &self.bids }
+    fn asks(&self) -> &std::collections::BTreeMap<Decimal, Decimal> { &self.asks }
 }
 
 #[derive(Deserialize)]
@@ -196,15 +181,8 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
         let url = &self.config.ws_url;
         info!(url, "Connecting to Polymarket WebSocket");
 
-        let mut tls_builder = native_tls::TlsConnector::builder();
-        tls_builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = native_tls::Certificate::from_pem(&cert_pem) {
-                tls_builder.add_root_certificate(cert);
-            }
-        }
-        let tls_connector = tls_builder.build().context("Failed to build TLS connector")?;
+        let tls_connector = crate::crypto::tls::build_tls_connector()
+            .context("Failed to build Polymarket TLS connector")?;
         let connector = Connector::NativeTls(tls_connector);
         let (ws_stream, _) = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -247,8 +225,12 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
         loop {
-            tokio::select! {
-                msg_opt = read.next() => {
+             tokio::select! {
+                msg_timeout = tokio::time::timeout(std::time::Duration::from_secs(30), read.next()) => {
+                    let msg_opt = match msg_timeout {
+                        Ok(m) => m,
+                        Err(_) => return Err(anyhow::anyhow!("No message for 30s — Polymarket heartbeat timeout")),
+                    };
                     let msg = match msg_opt {
                         Some(m) => m,
                         None => continue,

@@ -19,19 +19,16 @@ impl CdnaClient {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::CONNECTION, reqwest::header::HeaderValue::from_static("keep-alive"));
 
-        let mut builder = reqwest::Client::builder()
+        let base = crate::crypto::tls::build_reqwest_client()
+            .expect("Failed to build CDNA HTTP client");
+        // Rebuild with keep-alive headers on top of the pinned-cert base
+        let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
-            .default_headers(headers);
-
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-            
-        let http = builder.build().expect("Failed to build CDNA HTTP client");
+            .default_headers(headers)
+            .build()
+            .expect("Failed to build CDNA HTTP client");
+        drop(base); // we just needed the build to not let mut headers = reqwest::header::HeaderMap::new();panic; CDNA needs its own headers
         Self { http, rest_url, api_key, api_secret }
     }
 

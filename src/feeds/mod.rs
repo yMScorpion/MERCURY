@@ -1,5 +1,6 @@
 //! Market data feeds: WebSocket and FIX connections to all supported platforms.
 pub mod base;
+pub mod common;
 pub mod polymarket;
 pub mod kalshi;
 pub mod cdna;

@@ -69,6 +69,10 @@ pub struct ArbitrageDetector {
     pub stats: DetectorStats,
     paused_until_ns: u64,
     platform_liveness: std::collections::HashMap<Platform, bool>,
+    /// Rolling 1-minute mid-price samples per market for volatility calculation
+    price_history: std::collections::HashMap<Uuid, std::collections::VecDeque<(u64, Decimal)>>,
+    /// Cached per-market volatility multiplier (1.0 = normal, 1.5 = high vol)
+    volatility_multipliers: std::collections::HashMap<Uuid, Decimal>,
 }
 
 impl ArbitrageDetector {
@@ -87,6 +91,8 @@ impl ArbitrageDetector {
             stats: DetectorStats::default(),
             paused_until_ns: 0,
             platform_liveness: std::collections::HashMap::new(),
+            price_history: std::collections::HashMap::new(),
+            volatility_multipliers: std::collections::HashMap::new(),
         }
     }
 
@@ -109,6 +115,57 @@ impl ArbitrageDetector {
     }
 
     /// Evaluates spreads ONLY for the specific market that just updated.
+    /// Update rolling volatility for a market based on the current mid-price.
+    /// Call this every time a tick arrives for a market.
+    pub fn update_volatility(&mut self, market_id: Uuid, mid_price: Decimal) {
+        let now = crate::types::now_ns();
+        let history = self.price_history.entry(market_id).or_default();
+        history.push_back((now, mid_price));
+        // Keep only last 60 minutes of data
+        let cutoff = now.saturating_sub(3_600_000_000_000);
+        while history.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+            history.pop_front();
+        }
+        // Compute 1-minute return standard deviation if we have enough data (≥10 samples)
+        if history.len() < 10 {
+            self.volatility_multipliers.insert(market_id, rust_decimal_macros::dec!(1.0));
+            return;
+        }
+        // Sample at 1-minute intervals
+        let minute_ns: u64 = 60_000_000_000;
+        let mut returns: Vec<Decimal> = Vec::new();
+        let mut prev: Option<(u64, Decimal)> = None;
+        for &(t, p) in history.iter() {
+            if let Some((pt, pp)) = prev {
+                if t.saturating_sub(pt) >= minute_ns && pp > Decimal::ZERO {
+                    let ret = (p - pp) / pp;
+                    returns.push(ret);
+                    prev = Some((t, p));
+                }
+            } else {
+                prev = Some((t, p));
+            }
+        }
+        if returns.len() < 5 {
+            self.volatility_multipliers.insert(market_id, rust_decimal_macros::dec!(1.0));
+            return;
+        }
+        let n = Decimal::from(returns.len() as u64);
+        let mean = returns.iter().sum::<Decimal>() / n;
+        let variance = returns.iter().map(|r| {
+            let diff = *r - mean;
+            diff * diff
+        }).sum::<Decimal>() / n;
+        // Historical average volatility baseline: ~0.005 std dev per minute for prediction markets
+        let baseline_variance = rust_decimal_macros::dec!(0.000025); // 0.005^2
+        let multiplier = if variance > baseline_variance * rust_decimal_macros::dec!(4.0) {
+            rust_decimal_macros::dec!(1.5) // High vol: raise threshold 50%
+        } else {
+            rust_decimal_macros::dec!(1.0)
+        };
+        self.volatility_multipliers.insert(market_id, multiplier);
+    }
+
     pub fn detect_for_market(
         &mut self,
         market_id: &Uuid,
@@ -161,10 +218,15 @@ impl ArbitrageDetector {
 
             let spreads = spread_engine.compute_spreads(book_a, book_b, target_size);
 
+            let vol_multiplier = self.volatility_multipliers
+                .get(&pair.market_id)
+                .copied()
+                .unwrap_or(rust_decimal_macros::dec!(1.0));
+
             for spread in spreads {
                 self.stats.opportunities_detected += 1;
 
-                match self.run_gates(&spread, book_a, book_b, pair.confidence) {
+                match self.run_gates_with_vol(&spread, book_a, book_b, pair.confidence, vol_multiplier) {
                     Ok(()) => {
                         self.stats.opportunities_passed += 1;
 
@@ -238,14 +300,16 @@ impl ArbitrageDetector {
         opportunities
     }
 
-    fn run_gates(
+        fn run_gates_with_vol(
         &mut self,
         spread: &SpreadResult,
         book_a: &crate::engine::order_book::PlatformBook,
         book_b: &crate::engine::order_book::PlatformBook,
         confidence: f64,
+        vol_multiplier: Decimal,
     ) -> Result<(), RejectionReason> {
-        if spread.net_spread < self.min_spread {
+        let effective_min_spread = self.min_spread * vol_multiplier;
+        if spread.net_spread < effective_min_spread {
             self.stats.gate1_rejected += 1;
             return Err(RejectionReason::BelowSpreadThreshold(spread.net_spread));
         }

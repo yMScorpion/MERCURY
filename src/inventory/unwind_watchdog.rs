@@ -100,19 +100,20 @@ impl UnwindWatchdog {
                 let mut loss_exceeds_threshold = false;
                 if let Some(uob_ref) = &self.uob {
                     if let Ok(uob) = uob_ref.read() {
-                        if let Some(market_book) = uob.get_market(market_id) {
-                            let mut unrealized_pnl = Decimal::ZERO;
-                            let mut cost_basis = Decimal::ZERO;
-                            for pos in legs {
-                                if let Some(pb) = market_book.platforms.get(&pos.platform) {
-                                    let current_price = pb.mid_price();
-                                    cost_basis += pos.quantity * pos.avg_entry_price;
-                                    unrealized_pnl += pos.quantity * (current_price - pos.avg_entry_price);
-                                }
+                        let mut unrealized_pnl = Decimal::ZERO;
+                        let mut cost_basis = Decimal::ZERO;
+                        for pos in legs {
+                            if let Some(pb) = uob.get_book(market_id, &pos.platform) {
+                                let current_price = pb.mid_price();
+                                cost_basis += pos.quantity * pos.avg_entry_price;
+                                unrealized_pnl += pos.quantity * (current_price - pos.avg_entry_price);
                             }
-                            if cost_basis > Decimal::ZERO && (unrealized_pnl < Decimal::ZERO) && (unrealized_pnl.abs() / cost_basis) > rust_decimal_macros::dec!(0.05) {
-                                loss_exceeds_threshold = true;
-                            }
+                        }
+                        if cost_basis > Decimal::ZERO
+                            && unrealized_pnl < Decimal::ZERO
+                            && (unrealized_pnl.abs() / cost_basis) > rust_decimal_macros::dec!(0.05)
+                        {
+                            loss_exceeds_threshold = true;
                         }
                     }
                 }

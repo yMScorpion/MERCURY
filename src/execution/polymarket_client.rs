@@ -57,18 +57,15 @@ impl PolymarketClient {
         api_secret: String,
         api_passphrase: String,
     ) -> Self {
-        let mut builder = reqwest::Client::builder()
+        let http = crate::crypto::tls::build_reqwest_client()
+            .expect("failed to build Polymarket HTTP client")
+            .into();
+        // Apply timeout via a new builder wrapping the base client config
+        let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5));
-        
-        // M-8 FIX: Explicit TLS Cert Pinning
-        if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
-            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-            
-        let http = builder.build().expect("failed to build Polymarket HTTP client");
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build Polymarket HTTP client");
         Self {
             http,
             rest_url,

@@ -63,6 +63,20 @@ impl fmt::Display for Platform {
     }
 }
 
+impl std::str::FromStr for Platform {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Polymarket" | "polymarket" => Ok(Platform::Polymarket),
+            "Polymarket US" | "polymarket_us" | "PolymarketUs" => Ok(Platform::PolymarketUs),
+            "Kalshi" | "kalshi" => Ok(Platform::Kalshi),
+            "CDNA" | "cdna" | "Cdna" => Ok(Platform::Cdna),
+            "ForecastEx" | "forecastex" => Ok(Platform::ForecastEx),
+            _ => Err(anyhow::anyhow!("Unknown platform: {}", s)),
+        }
+    }
+}
+
 // ─── Side ───
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -82,6 +96,17 @@ impl fmt::Display for Side {
     }
 }
 
+impl std::str::FromStr for Side {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "YES" | "yes" | "Yes" => Ok(Side::Yes),
+            "NO" | "no" | "No" => Ok(Side::No),
+            _ => Err(anyhow::anyhow!("Unknown side: {}", s)),
+        }
+    }
+}
+
 // ─── Market Category ───
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -94,6 +119,35 @@ pub enum MarketCategory {
     Weather,
     Culture,
     Other,
+}
+
+impl std::str::FromStr for MarketCategory {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "sports" => Ok(MarketCategory::Sports),
+            "politics" => Ok(MarketCategory::Politics),
+            "finance" => Ok(MarketCategory::Finance),
+            "crypto" => Ok(MarketCategory::Crypto),
+            "weather" => Ok(MarketCategory::Weather),
+            "culture" => Ok(MarketCategory::Culture),
+            "other" | _ => Ok(MarketCategory::Other),
+        }
+    }
+}
+
+impl fmt::Display for MarketCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MarketCategory::Sports => write!(f, "sports"),
+            MarketCategory::Politics => write!(f, "politics"),
+            MarketCategory::Finance => write!(f, "finance"),
+            MarketCategory::Crypto => write!(f, "crypto"),
+            MarketCategory::Weather => write!(f, "weather"),
+            MarketCategory::Culture => write!(f, "culture"),
+            MarketCategory::Other => write!(f, "other"),
+        }
+    }
 }
 
 // ─── Market Status ───
@@ -118,6 +172,18 @@ impl fmt::Display for MarketStatus {
     }
 }
 
+impl std::str::FromStr for MarketStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(MarketStatus::Active),
+            "suspended" => Ok(MarketStatus::Suspended),
+            "resolved" => Ok(MarketStatus::Resolved),
+            "expired" => Ok(MarketStatus::Expired),
+            _ => Err(anyhow::anyhow!("Unknown market status: {}", s)),
+        }
+    }
+}
 // ─── Platform Health ───
 // Removed dead enum
 
@@ -238,6 +304,18 @@ impl fmt::Display for TradeStatus {
             TradeStatus::Success => write!(f, "success"),
             TradeStatus::Fail => write!(f, "fail"),
             TradeStatus::Partial => write!(f, "partial"),
+        }
+    }
+}
+
+impl std::str::FromStr for TradeStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "success" => Ok(TradeStatus::Success),
+            "fail" => Ok(TradeStatus::Fail),
+            "partial" => Ok(TradeStatus::Partial),
+            _ => Err(anyhow::anyhow!("Unknown trade status: {}", s)),
         }
     }
 }
