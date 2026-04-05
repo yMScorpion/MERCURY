@@ -776,13 +776,23 @@ async fn main() -> Result<()> {
 
     let mut active_config_str = serde_json::to_string(&mercury_config).unwrap_or_default();
 
+    // Seed registry with active markets from DB so restart scenarios preserve arb detection
+    // (previously, persisted markets were only used to build feed subscriptions but never
+    // registered, meaning no arbs would fire until the discovery loop re-matched them).
+    {
+        if let Ok(db_markets) = db.get_active_markets().await {
+            let count = db_markets.len();
+            for m in db_markets {
+                registry.register_market(m);
+            }
+            info!(count, "Seeded market registry from DB");
+        }
+    }
+
     // INITIALIZE ACTORS HERE
     let mut market_channels: std::collections::HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<NormalizedTick>> = std::collections::HashMap::new();
     let bankroll_handle = risk::bankroll::BankrollHandle::new(bankroll_manager);
     let registry = std::sync::Arc::new(std::sync::RwLock::new(registry)); // Convert to shared RwLock
-
-    loop {
-        tokio::select! {
             // ── Telegram Control Commands ──
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {

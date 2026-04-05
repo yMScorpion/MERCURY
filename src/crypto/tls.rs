@@ -21,26 +21,11 @@ pub fn build_tls_connector() -> Result<TlsConnector> {
 }
 
 /// Build a `reqwest::Client` with cert pinning, connect timeout, and request timeout.
-use std::net::{SocketAddr, ToSocketAddrs};
-
-fn resolve_ip_on_boot(domain: &str) -> SocketAddr {
-    let addr_str = format!("{}:443", domain);
-    addr_str.to_socket_addrs()
-        .expect(&format!("Falha ao resolver DNS inicial para {}", domain))
-        .next()
-        .expect("Nenhum IP retornado")
-}
-
 pub fn build_reqwest_client_with_timeouts(
     request_timeout: Duration,
     connect_timeout: Duration,
 ) -> Result<reqwest::Client> {
-    let poly_ip = resolve_ip_on_boot("clob.polymarket.com");
-    let kalshi_ip = resolve_ip_on_boot("trading-api.kalshi.com");
-
     let mut builder = reqwest::Client::builder()
-        .resolve("clob.polymarket.com", poly_ip)
-        .resolve("trading-api.kalshi.com", kalshi_ip)
         .tcp_keepalive(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(300))
         .pool_max_idle_per_host(10)
@@ -67,12 +52,7 @@ pub fn build_reqwest_client() -> Result<reqwest::Client> {
 pub fn build_reqwest_client_with_headers(
     headers: reqwest::header::HeaderMap,
 ) -> Result<reqwest::Client> {
-    let poly_ip = resolve_ip_on_boot("clob.polymarket.com");
-    let kalshi_ip = resolve_ip_on_boot("trading-api.kalshi.com");
-
     let mut builder = reqwest::Client::builder()
-        .resolve("clob.polymarket.com", poly_ip)
-        .resolve("trading-api.kalshi.com", kalshi_ip)
         .tcp_keepalive(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(300))
         .pool_max_idle_per_host(10)

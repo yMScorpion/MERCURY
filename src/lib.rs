@@ -10,4 +10,7 @@ pub mod risk;
 pub mod telegram;
 pub mod types;
 
+#[cfg(test)]
+mod integration;
+
 pub use types::*;

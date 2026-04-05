@@ -17,18 +17,13 @@ pub struct CdnaClient {
 impl CdnaClient {
     pub fn new(rest_url: String, api_key: String, api_secret: String) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::CONNECTION, reqwest::header::HeaderValue::from_static("keep-alive"));
+        headers.insert(
+            reqwest::header::CONNECTION,
+            reqwest::header::HeaderValue::from_static("keep-alive"),
+        );
 
-        let base = crate::crypto::tls::build_reqwest_client()
+        let http = crate::crypto::tls::build_reqwest_client_with_headers(headers)
             .expect("Failed to build CDNA HTTP client");
-        // Rebuild with keep-alive headers on top of the pinned-cert base
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .default_headers(headers)
-            .build()
-            .expect("Failed to build CDNA HTTP client");
-        drop(base); // we just needed the build to not let mut headers = reqwest::header::HeaderMap::new();panic; CDNA needs its own headers
         Self { http, rest_url, api_key, api_secret }
     }
 
