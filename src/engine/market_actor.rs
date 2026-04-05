@@ -21,7 +21,7 @@ pub struct MarketActor {
     detector: Arc<RwLock<ArbitrageDetector>>,
     spread_engine: Arc<RwLock<NetSpreadEngine>>,
     bankroll: BankrollHandle,
-    registry: Arc<MarketRegistry>,
+    registry: Arc<RwLock<MarketRegistry>>,
     circuit_breakers: Arc<RwLock<CircuitBreakers>>,
     kelly: Arc<RwLock<KellyCalculator>>,
     open_positions: Arc<AtomicUsize>,
@@ -37,7 +37,7 @@ impl MarketActor {
         detector: Arc<RwLock<ArbitrageDetector>>,
         spread_engine: Arc<RwLock<NetSpreadEngine>>,
         bankroll: BankrollHandle,
-        registry: Arc<MarketRegistry>,
+        registry: Arc<RwLock<MarketRegistry>>,
         circuit_breakers: Arc<RwLock<CircuitBreakers>>,
         kelly: Arc<RwLock<KellyCalculator>>,
         open_positions: Arc<AtomicUsize>,
@@ -74,7 +74,7 @@ impl MarketActor {
                 let se = self.spread_engine.read().unwrap();
                 d.detect_for_market(
                     &self.market_id,
-                    &self.registry,
+                    &self.registry.read().unwrap(),
                     &self.uob_shard,
                     &se,
                     rust_decimal_macros::dec!(10.0)

@@ -1,10 +1,15 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::HashMap;
+use crate::types::Platform;
 
 #[derive(Debug)]
 pub struct Metrics {
     pub ticks_received: AtomicU64,
+    pub ticks_per_platform: std::sync::RwLock<HashMap<Platform, AtomicU64>>,
+    pub last_tick_ns_per_platform: std::sync::RwLock<HashMap<Platform, AtomicU64>>,
+    pub reconnects_per_platform: std::sync::RwLock<HashMap<Platform, AtomicU32>>,
     pub spreads_evaluated: AtomicU64,
     pub opportunities_detected: AtomicU64,
     pub opportunities_executed: AtomicU64,
@@ -13,15 +18,26 @@ pub struct Metrics {
     pub ws_reconnects: AtomicU32,
     pub api_errors: AtomicU32,
     pub start_time: Instant,
-    /// Nanosecond timestamp of the most recent tick received on any feed.
-    /// Used by the health endpoint to determine liveness.
     pub last_tick_ns: AtomicU64,
 }
 
 impl Metrics {
     pub fn new() -> Arc<Self> {
+        let platforms = vec![Platform::Polymarket, Platform::Kalshi, Platform::Cdna, Platform::ForecastEx];
+        let mut ticks = HashMap::new();
+        let mut last_ticks = HashMap::new();
+        let mut reconnects = HashMap::new();
+        for p in platforms {
+            ticks.insert(p, AtomicU64::new(0));
+            last_ticks.insert(p, AtomicU64::new(0));
+            reconnects.insert(p, AtomicU32::new(0));
+        }
+
         Arc::new(Self {
             ticks_received: AtomicU64::new(0),
+            ticks_per_platform: std::sync::RwLock::new(ticks),
+            last_tick_ns_per_platform: std::sync::RwLock::new(last_ticks),
+            reconnects_per_platform: std::sync::RwLock::new(reconnects),
             spreads_evaluated: AtomicU64::new(0),
             opportunities_detected: AtomicU64::new(0),
             opportunities_executed: AtomicU64::new(0),

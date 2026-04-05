@@ -20,6 +20,8 @@ use crate::execution::polymarket_client::PolymarketClient;
 use crate::execution::kalshi_client::KalshiClient;
 use crate::execution::cdna_client::CdnaClient;
 use crate::execution::forecastex_client::ForecastExClient;
+use crate::engine::order_book::UnifiedOrderBook;
+use std::sync::RwLock;
 
 pub struct UnwindWatchdog {
     db: Arc<dyn Database>,
@@ -29,6 +31,7 @@ pub struct UnwindWatchdog {
     kalshi: Option<KalshiClient>,
     cdna: Option<CdnaClient>,
     forecastex: Option<ForecastExClient>,
+    uob: Option<Arc<RwLock<UnifiedOrderBook>>>,
 }
 
 impl UnwindWatchdog {
@@ -40,6 +43,7 @@ impl UnwindWatchdog {
         kalshi: Option<KalshiClient>,
         cdna: Option<CdnaClient>,
         forecastex: Option<ForecastExClient>,
+        uob: Option<Arc<RwLock<UnifiedOrderBook>>>,
     ) -> Self {
         Self {
             db,
@@ -49,6 +53,7 @@ impl UnwindWatchdog {
             kalshi,
             cdna,
             forecastex,
+            uob,
         }
     }
 
@@ -88,11 +93,31 @@ impl UnwindWatchdog {
             let unhedged_diff = (total_yes - total_no).abs();
 
             if unhedged_diff > Decimal::ZERO {
-                // Find the oldest position to correctly calculate the age of the imbalance
                 let oldest = legs.iter().map(|p| p.opened_at).min().unwrap_or_else(chrono::Utc::now);
                 let age = chrono::Utc::now() - oldest;
+                
+                // 1.2 EXECUTION SAFETY: Stop-Loss via UOB
+                let mut loss_exceeds_threshold = false;
+                if let Some(uob_ref) = &self.uob {
+                    if let Ok(uob) = uob_ref.read() {
+                        if let Some(market_book) = uob.get_market(market_id) {
+                            let mut unrealized_pnl = Decimal::ZERO;
+                            let mut cost_basis = Decimal::ZERO;
+                            for pos in legs {
+                                if let Some(pb) = market_book.platforms.get(&pos.platform) {
+                                    let current_price = pb.mid_price();
+                                    cost_basis += pos.quantity * pos.avg_entry_price;
+                                    unrealized_pnl += pos.quantity * (current_price - pos.avg_entry_price);
+                                }
+                            }
+                            if cost_basis > Decimal::ZERO && (unrealized_pnl < Decimal::ZERO) && (unrealized_pnl.abs() / cost_basis) > rust_decimal_macros::dec!(0.05) {
+                                loss_exceeds_threshold = true;
+                            }
+                        }
+                    }
+                }
 
-                if age.num_minutes() > 5 {
+                if age.num_minutes() > 5 || loss_exceeds_threshold {
                     error!(
                         market_id = %market_id,
                         unhedged_quantity = %unhedged_diff,

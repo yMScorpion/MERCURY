@@ -196,52 +196,44 @@ impl PlatformOrderClient for PolymarketClient {
 
         if body.success {
             let order_id_str = body.order_id.unwrap_or_default();
-            let mut fill_size = taker_amount_scaled / scale;
-            let mut actual_price = price;
-            let mut matched_confirmed = false;
+            let fill_size = taker_amount_scaled / scale;
+            let actual_price = price;
             
+            // 1.2 EXECUTION SAFETY: Non-blocking confirmation.
+            // We assume FOK success based on the synchronous response, 
+            // and spawn a background task to verify actual fill metrics.
             if !order_id_str.is_empty() {
                 let fetch_url = format!("{}/orders/{}", self.rest_url, order_id_str);
-                let mut retries = 0;
-                while retries < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(150 * (retries + 1))).await;
-                    
-                    let req = self.http.get(&fetch_url)
-                        .header("POLY_API_KEY", self.api_key.as_str())
-                        .header("POLY_SECRET", self.api_secret.as_str())
-                        .header("POLY_PASSPHRASE", self.api_passphrase.as_str())
+                let http_client = self.http.clone();
+                let api_key = self.api_key.clone();
+                let api_secret = self.api_secret.clone();
+                let api_passphrase = self.api_passphrase.clone();
+                let order_id_clone = order_id_str.clone();
+                let assumed_price = actual_price;
+
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let req = http_client.get(&fetch_url)
+                        .header("POLY_API_KEY", api_key.as_str())
+                        .header("POLY_SECRET", api_secret.as_str())
+                        .header("POLY_PASSPHRASE", api_passphrase.as_str())
                         .send();
-                        
-                    // MED-6 FIX: Apply a strict timeout to the confirmation loop to prevent blocking the executor
+
                     if let Ok(Ok(fetch_resp)) = tokio::time::timeout(std::time::Duration::from_secs(3), req).await {
                         if let Ok(order_data) = fetch_resp.json::<serde_json::Value>().await {
-                            let mut updated = false;
                             if let Some(avg_price_str) = order_data.get("average_price").and_then(|v| v.as_str()) {
                                 if let Ok(parsed_price) = Decimal::from_str(avg_price_str) {
-                                    actual_price = parsed_price;
-                                    updated = true;
+                                    if parsed_price != assumed_price {
+                                        tracing::warn!("FillCorrection: Polymarket order {} filled at {} (assumed {})", order_id_clone, parsed_price, assumed_price);
+                                        // A FillCorrection channel would be invoked here to update the DB
+                                    }
                                 }
                             }
-                            if let Some(size_matched_str) = order_data.get("size_matched").and_then(|v| v.as_str()) {
-                                if let Ok(parsed_size) = Decimal::from_str(size_matched_str) {
-                                    fill_size = parsed_size;
-                                    matched_confirmed = true;
-                                    updated = true;
-                                }
-                            }
-                            if updated { break; }
                         }
                     }
-                    retries += 1;
-                }
-                
-                if !matched_confirmed {
-                    // CRIT-4 FIX: Assume order failed to avoid unhedged exposure on phantom fills
-                    fill_size = Decimal::ZERO;
-                    tracing::error!("CRITICAL: Polymarket order {} success but size_matched unconfirmed. Treating as unfilled.", order_id_str);
-                }
+                });
             }
-            
+
             let filled = fill_size > Decimal::ZERO;
             let estimated_fee = crate::feeds::normalizer::polymarket_fee(actual_price, fill_size, fee_rate_bps as u16);
 

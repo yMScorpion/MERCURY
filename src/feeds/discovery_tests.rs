@@ -85,6 +85,27 @@ fn test_70_percent_threshold_filters_dissimilar() {
     assert!(sim < 0.70, "50-60% similar questions should fail 70% threshold, got {}", sim);
 }
 
+// ─── Proptests ────────────────────────────────────────────────────────────────
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn test_jaccard_similarity_properties(
+        q1 in "[a-zA-Z0-9 ]{10,50}",
+        q2 in "[a-zA-Z0-9 ]{10,50}"
+    ) {
+        let sim = jaccard(&q1, &q2);
+        prop_assert!(sim >= 0.0 && sim <= 1.0, "Jaccard similarity must be between 0 and 1");
+    }
+
+    #[test]
+    fn test_normalize_question_is_idempotent(q in "[a-zA-Z0-9$?,. ]{10,50}") {
+        let norm1 = MarketDiscovery::normalize_question(&q);
+        let norm2 = MarketDiscovery::normalize_question(&norm1);
+        prop_assert_eq!(norm1, norm2, "Normalization should be idempotent");
+    }
+}
+
 // ─── Expiration logic tests ───────────────────────────────────────────────────
 
 #[test]
