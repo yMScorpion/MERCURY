@@ -194,8 +194,8 @@ impl ArbitrageDetector {
         for pair in pairs {
             // PHASE 3 FIX: Enhanced Feed Health Guard
             // Invalidate the pair if either platform feed is currently offline
-            let a_alive = self.platform_liveness.get(&pair.platform_a).copied().unwrap_or(true);
-            let b_alive = self.platform_liveness.get(&pair.platform_b).copied().unwrap_or(true);
+            let a_alive = self.platform_liveness.get(&pair.platform_a).map(|v| *v).unwrap_or(true);
+            let b_alive = self.platform_liveness.get(&pair.platform_b).map(|v| *v).unwrap_or(true);
             if !a_alive || !b_alive {
                 continue;
             }
@@ -224,7 +224,7 @@ impl ArbitrageDetector {
 
             let vol_multiplier = self.volatility_multipliers
                 .get(&pair.market_id)
-                .copied()
+                .map(|v| *v)
                 .unwrap_or(rust_decimal_macros::dec!(1.0));
 
             for spread in spreads {
@@ -341,7 +341,7 @@ impl ArbitrageDetector {
 
         let age_b = now.saturating_sub(book_b.last_update_ns);
         if age_b > stale_timeout_ns {
-            self.stats.gate3_rejected += 1;
+            self.stats.gate3_rejected.fetch_add(1, Ordering::Relaxed);
             return Err(RejectionReason::StaleData {
                 age_ms: age_b / 1_000_000,
                 max_ms: self.stale_timeout_ms,
@@ -356,7 +356,7 @@ impl ArbitrageDetector {
             });
         }
 
-        if self.active_arbs >= self.max_concurrent {
+        if self.active_arbs.load(Ordering::Relaxed) >= self.max_concurrent {
             self.stats.gate5_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(RejectionReason::RiskBudgetExceeded {
                 reason: format!("Max concurrent arbs reached: {}", self.max_concurrent),
