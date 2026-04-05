@@ -78,27 +78,28 @@ impl ForecastExClient {
                         None => return Ok(()), // Channel closed
                     };
                     
-                    let _side_val = match (req.action, req.side) {
+                    let side_val = match (req.action, req.side) {
                         (OrderAction::Buy, Side::Yes) => "1",
                         (OrderAction::Sell, Side::Yes) => "2",
                         (OrderAction::Buy, Side::No) => "2", // Invert for NO token
                         (OrderAction::Sell, Side::No) => "1",
                     };
-                    
+
                     let exec_price = match req.side {
                         Side::Yes => req.price,
                         Side::No => Decimal::ONE - req.price,
                     };
-                    
+
                     let id_str = format!("MERC-{}", cl_ord_id);
                     cl_ord_id += 1;
-                    
+
                     // Send NewOrderSingle (35=D)
+                    let transact_time = chrono::Utc::now().format("%Y%m%d-%H:%M:%S%.3f").to_string();
                     let order = Self::build_fix_message("D", &sender_comp, &target_comp, seq_num, &[
                         (11, &id_str),             // ClOrdID
                         (55, &req.market_id),      // Symbol
-                        (54, "1"),                 // Side
-                        (60, "20240101-00:00:00"), // TransactTime placeholder
+                        (54, side_val),            // Side
+                        (60, &transact_time),      // TransactTime
                         (38, &req.size.to_string()), // OrderQty
                         (40, "2"),                 // OrdType = Limit
                         (44, &exec_price.to_string()), // Price
@@ -210,7 +211,10 @@ impl PlatformOrderClient for ForecastExClient {
         };
         
         self.req_tx.send(req).await.context("ForecastEx FIX session down")?;
-        reply_rx.await.context("ForecastEx FIX session dropped response")?
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .context("ForecastEx FIX order timeout")?
+            .context("ForecastEx FIX session dropped response")?
     }
 
     async fn cancel_order(&self, _order_id: &str) -> Result<()> {

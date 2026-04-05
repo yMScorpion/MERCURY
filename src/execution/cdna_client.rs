@@ -16,10 +16,14 @@ pub struct CdnaClient {
 
 impl CdnaClient {
     pub fn new(rest_url: String, api_key: String, api_secret: String) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::CONNECTION, reqwest::header::HeaderValue::from_static("keep-alive"));
+
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5));
-            
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .default_headers(headers);
+
         // M-8 FIX: Explicit TLS Cert Pinning
         if let Ok(cert_pem) = std::fs::read("/opt/mercury/keys/pinned_certs.pem") {
             if let Ok(cert) = reqwest::tls::Certificate::from_pem(&cert_pem) {
@@ -125,15 +129,19 @@ impl PlatformOrderClient for CdnaClient {
 
         let result: serde_json::Value = resp.json().await.unwrap_or_default();
 
-        let filled = result.get("result").and_then(|r| r.get("status"))
-            .and_then(|s| s.as_str()).map(|s| s == "FILLED").unwrap_or(false);
-        let fill_price = result.get("result").and_then(|r| r.get("avg_price"))
-            .and_then(|p| p.as_str()).and_then(|s| s.parse::<Decimal>().ok()).unwrap_or(price);
-
         let api_status = result.get("result").and_then(|r| r.get("status"))
             .and_then(|s| s.as_str()).unwrap_or("UNKNOWN").to_string();
 
-        let fill_size = if filled { size } else { Decimal::ZERO };
+        let filled = api_status == "FILLED" || api_status == "PARTIALLY_FILLED";
+        let fill_price = result.get("result").and_then(|r| r.get("avg_price"))
+            .and_then(|p| p.as_str()).and_then(|s| s.parse::<Decimal>().ok()).unwrap_or(price);
+
+        let mut fill_size = if filled { size } else { Decimal::ZERO };
+        if api_status == "PARTIALLY_FILLED" {
+            if let Some(actual_size) = result.get("result").and_then(|r| r.get("filled_quantity")).and_then(|s| s.as_str()).and_then(|s| s.parse::<Decimal>().ok()) {
+                fill_size = actual_size;
+            }
+        }
         // Compute taker fee from the bps rate supplied by the caller.
         let fee = Decimal::from(fee_rate_bps) / Decimal::from(10_000) * fill_price * fill_size;
         Ok(OrderResult {

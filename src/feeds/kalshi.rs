@@ -248,10 +248,14 @@ impl FeedHandler for KalshiFeed {
 
         loop {
             tokio::select! {
-                msg_opt = read.next() => {
+                msg_opt_res = tokio::time::timeout(std::time::Duration::from_secs(30), read.next()) => {
+                    let msg_opt = match msg_opt_res {
+                        Ok(m) => m,
+                        Err(_) => return Err(anyhow::anyhow!("No message for 30s — heartbeat timeout")),
+                    };
                     let msg = match msg_opt {
                         Some(m) => m,
-                        None => continue,
+                        None => return Ok(()),
                     };
                     match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {

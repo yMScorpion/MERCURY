@@ -56,6 +56,7 @@ pub trait Database: Send + Sync + 'static {
     async fn log_config_change(&self, key: &str, old_val: &str, new_val: &str) -> Result<()>;
 
     // Utility
+    async fn health_check(&self) -> Result<()>;
     async fn prune_audit_log(&self, keep_days: u32) -> Result<()>;
     async fn checkpoint_wal(&self) -> Result<()>;
     async fn db_size_bytes(&self) -> Result<u64>;

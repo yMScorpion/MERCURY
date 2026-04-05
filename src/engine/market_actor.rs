@@ -103,12 +103,18 @@ impl MarketActor {
                         
                         let combined_price = opp.leg_a.price + opp.leg_b.price;
                         let contracts = if combined_price > rust_decimal::Decimal::ZERO { ideal_usd / combined_price } else { rust_decimal::Decimal::ZERO };
-                        
-                        let size = if opp.leg_a.platform == Platform::Kalshi || opp.leg_b.platform == Platform::Kalshi {
+
+                        let mut size = if opp.leg_a.platform == Platform::Kalshi || opp.leg_b.platform == Platform::Kalshi {
                             contracts.min(opp.recommended_size).floor() // Strict integers for Kalshi
                         } else {
                             contracts.min(opp.recommended_size).trunc_with_scale(2) // Max 2 decimal places to prevent balance rounding rejections
                         };
+
+                        let max_notional = rust_decimal_macros::dec!(500.0);
+                        if combined_price > rust_decimal::Decimal::ZERO {
+                            size = size.min(max_notional / combined_price);
+                        }
+
                         (size, fraction)
                     };
 

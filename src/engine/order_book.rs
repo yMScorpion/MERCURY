@@ -130,6 +130,14 @@ impl PlatformBook {
             drop(invalid_bids);
         }
 
+        if let (Some((bb, _)), Some((ba, _))) = (self.best_bid(), self.best_ask()) {
+            if bb >= ba {
+                tracing::error!("POST-CONDITION VIOLATION: crossed book after tick");
+                self.bids.clear();
+                self.asks.clear();
+            }
+        }
+
         self.last_update_ns = tick.timestamp_ns;
         self.fee_rate_bps = tick.fee_rate_bps;
         self.sequence = tick.sequence;
