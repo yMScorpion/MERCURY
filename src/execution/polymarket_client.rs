@@ -57,9 +57,6 @@ impl PolymarketClient {
         api_secret: String,
         api_passphrase: String,
     ) -> Self {
-        let http = crate::crypto::tls::build_reqwest_client()
-            .expect("failed to build Polymarket HTTP client")
-            .into();
         // Apply timeout via a new builder wrapping the base client config
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))

@@ -690,6 +690,11 @@ impl Database for SqliteDb {
         Ok((page_count * page_size) as u64)
     }
 
+    async fn health_check(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn backup_to_file(&self, dest_path: &str) -> Result<()> {
         // Comprehensive path validation to prevent SQL injection via VACUUM INTO.
         // SQLite's VACUUM INTO does not support parameterized paths, so we must validate rigorously.
@@ -728,14 +733,6 @@ impl Database for SqliteDb {
         Ok(())
     }
 
-}
-
-impl SqliteDb {
-    /// Verify the database is reachable and responsive.
-    pub async fn health_check(&self) -> Result<()> {
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------

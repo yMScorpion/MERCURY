@@ -74,27 +74,31 @@ async fn handle_health_request(
             let status_text = if is_healthy { "ok" } else { "degraded" };
             let http_status = if is_healthy { "200 OK" } else { "503 Service Unavailable" };
 
-            // Per-platform health breakdown
+            // Per-platform health breakdown — collect all data while holding the lock,
+            // then drop the guard BEFORE any .await so the future stays Send.
             use crate::types::Platform;
             let platforms = [Platform::Polymarket, Platform::Kalshi, Platform::Cdna, Platform::ForecastEx];
-            let mut platform_json = String::from("{");
-            let last_ticks = metrics.last_tick_ns_per_platform.read().unwrap();
-            let now_ns = crate::types::now_ns();
-            for (i, plat) in platforms.iter().enumerate() {
-                let ms = if let Some(last) = last_ticks.get(plat) {
-                    let last_val = last.load(std::sync::atomic::Ordering::Relaxed);
-                    if last_val == 0 { u64::MAX } else { now_ns.saturating_sub(last_val) / 1_000_000 }
-                } else { u64::MAX };
-                let plat_status = if ms < stale_timeout_ms || ms == u64::MAX { "healthy" } else { "degraded" };
-                let ms_str = if ms == u64::MAX { "null".to_string() } else { ms.to_string() };
-                let plat_name = format!("{}", plat).to_lowercase().replace(' ', "_");
-                if i > 0 { platform_json.push(','); }
-                platform_json.push_str(&format!(
-                    r#""{}": {{"status": "{}", "ms_since_tick": {}}}"#,
-                    plat_name, plat_status, ms_str
-                ));
-            }
-            platform_json.push('}');
+            let platform_json = {
+                let last_ticks = metrics.last_tick_ns_per_platform.read().unwrap();
+                let now_ns = crate::types::now_ns();
+                let mut json = String::from("{");
+                for (i, plat) in platforms.iter().enumerate() {
+                    let ms = if let Some(last) = last_ticks.get(plat) {
+                        let last_val = last.load(std::sync::atomic::Ordering::Relaxed);
+                        if last_val == 0 { u64::MAX } else { now_ns.saturating_sub(last_val) / 1_000_000 }
+                    } else { u64::MAX };
+                    let plat_status = if ms < stale_timeout_ms || ms == u64::MAX { "healthy" } else { "degraded" };
+                    let ms_str = if ms == u64::MAX { "null".to_string() } else { ms.to_string() };
+                    let plat_name = format!("{}", plat).to_lowercase().replace(' ', "_");
+                    if i > 0 { json.push(','); }
+                    json.push_str(&format!(
+                        r#""{}": {{"status": "{}", "ms_since_tick": {}}}"#,
+                        plat_name, plat_status, ms_str
+                    ));
+                }
+                json.push('}');
+                json
+            }; // RwLockReadGuard dropped here, before any .await
 
             let body = format!(
                 r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{},"platforms":{}}}"#,

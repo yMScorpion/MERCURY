@@ -142,6 +142,7 @@ fn format_system_alert(severity: &str, message: &str) -> String {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::types::{Platform, Side, TradeStatus};
         use rust_decimal_macros::dec;
         use chrono::{TimeZone, Utc};
 

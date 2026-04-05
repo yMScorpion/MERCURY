@@ -38,6 +38,7 @@ impl crate::db::Database for MockDb {
     async fn append_audit(&self, _: &crate::types::AuditEntry) -> anyhow::Result<()> { Ok(()) }
     async fn append_audit_batch(&self, _: &[crate::types::AuditEntry]) -> anyhow::Result<()> { Ok(()) }
     async fn log_config_change(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn health_check(&self) -> anyhow::Result<()> { Ok(()) }
     async fn prune_audit_log(&self, _: u32) -> anyhow::Result<()> { Ok(()) }
     async fn checkpoint_wal(&self) -> anyhow::Result<()> { Ok(()) }
     async fn db_size_bytes(&self) -> anyhow::Result<u64> { Ok(0) }
