@@ -14,4 +14,6 @@ keys/
 CLAUDE.md
 repomix-output.md
 .mcp.json
+kalshi_key.pem
+node_modules/
 

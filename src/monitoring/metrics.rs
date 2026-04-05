@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::collections::HashMap;
 use crate::types::Platform;
-use crate::db::Database;
 
 #[derive(Debug)]
 pub struct Metrics {

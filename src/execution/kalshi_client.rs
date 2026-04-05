@@ -80,7 +80,7 @@ impl PlatformOrderClient for KalshiClient {
         // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
 
         // Avoid string parsing panics by directly safely converting rounded decimals
-        let mut price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
+        let price_cents = (price * Decimal::from(100)).round().to_i64().unwrap_or(50);
         
         // Kalshi rejects prices of 0 or 100 cents. If we reach these extremes the
         // market is essentially resolved — abort rather than execute at a mutated price

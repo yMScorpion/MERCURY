@@ -382,7 +382,7 @@ impl PolymarketFeed {
             }
             "price_change" | "book_update" => {
                 if let Some(changes) = &msg.changes {
-                    let mut seq_to_emit = None;
+                    let seq_to_emit;
                     {
                         let book = self.books.entry(asset_id.to_string()).or_insert_with(LocalOrderBook::new);
                         if let Some(msg_seq) = msg.sequence {

@@ -304,21 +304,21 @@ async fn main() -> Result<()> {
     let circuit_breakers = Arc::new(std::sync::RwLock::new(cb_initial));
 
     // ─── Engine ───
-    let spread_engine = Arc::new(engine::spread::NetSpreadEngine::new(
+    let spread_engine = Arc::new(std::sync::RwLock::new(engine::spread::NetSpreadEngine::new(
         mercury_config.trading.min_net_spread_threshold,
-    ));
+    )));
     
     // Inject the startup gas threshold. 
     // Ensure you also wire `gas_update_rx` in your event loop to continuously call 
     // spread_engine.update_gas_price() as the Oracle pushes updates.
-    spread_engine.update_gas_price(mercury_config.trading.gas_price_max_gwei);
+    spread_engine.write().unwrap().update_gas_price(Decimal::from(mercury_config.trading.gas_price_max_gwei));
 
-    let detector = Arc::new(engine::detector::ArbitrageDetector::new(
+    let detector = Arc::new(std::sync::RwLock::new(engine::detector::ArbitrageDetector::new(
         mercury_config.trading.min_net_spread_threshold,
         Decimal::from(5),
         mercury_config.trading.stale_data_timeout_ms,
         mercury_config.trading.max_concurrent_arbs,
-    ));
+    )));
     let mut registry = engine::market_registry::MarketRegistry::new();
 
 
@@ -1029,15 +1029,26 @@ async fn main() -> Result<()> {
                     cached_open_positions.store(total, Ordering::Relaxed);
                 }
                 
-                let stats = detector.read().unwrap().stats.clone();
+                let (detected, passed, gate1, gate2, gate3, gate4, gate5) = {
+                    let guard = detector.read().unwrap();
+                    (
+                        guard.stats.opportunities_detected.load(std::sync::atomic::Ordering::Relaxed),
+                        guard.stats.opportunities_passed.load(std::sync::atomic::Ordering::Relaxed),
+                        guard.stats.gate1_rejected.load(std::sync::atomic::Ordering::Relaxed),
+                        guard.stats.gate2_rejected.load(std::sync::atomic::Ordering::Relaxed),
+                        guard.stats.gate3_rejected.load(std::sync::atomic::Ordering::Relaxed),
+                        guard.stats.gate4_rejected.load(std::sync::atomic::Ordering::Relaxed),
+                        guard.stats.gate5_rejected.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                };
                 tracing::info!(
-                    detected = stats.opportunities_detected,
-                    passed = stats.opportunities_passed,
-                    gate1_spread = stats.gate1_rejected,
-                    gate2_liquidity = stats.gate2_rejected,
-                    gate3_stale = stats.gate3_rejected,
-                    gate4_correlation = stats.gate4_rejected,
-                    gate5_capacity = stats.gate5_rejected,
+                    detected = detected,
+                    passed = passed,
+                    gate1_spread = gate1,
+                    gate2_liquidity = gate2,
+                    gate3_stale = gate3,
+                    gate4_correlation = gate4,
+                    gate5_capacity = gate5,
                     "Detector pipeline statistics"
                 );
             }

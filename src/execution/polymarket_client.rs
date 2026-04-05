@@ -49,6 +49,8 @@ struct OrderResponse {
     error_msg: Option<String>,
 }
 
+use base64::Engine;
+
 impl PolymarketClient {
     pub fn new(
         rest_url: String,
@@ -69,6 +71,26 @@ impl PolymarketClient {
             api_secret: zeroize::Zeroizing::new(api_secret),
             api_passphrase: zeroize::Zeroizing::new(api_passphrase),
         }
+    }
+
+    fn l2_auth_headers(&self, method: &str, path: &str, body: &str) -> Result<Vec<(&'static str, String)>> {
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let payload = format!("{}{}{}{}", timestamp, method, path, body);
+        
+        let secret_decoded = base64::engine::general_purpose::STANDARD
+            .decode(self.api_secret.as_bytes())
+            .context("Invalid base64 in POLYMARKET_API_SECRET")?;
+            
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &secret_decoded);
+        let tag = ring::hmac::sign(&key, payload.as_bytes());
+        let signature = base64::engine::general_purpose::STANDARD.encode(tag.as_ref());
+
+        Ok(vec![
+            ("POLY_TIMESTAMP", timestamp),
+            ("POLY_SIGNATURE", signature),
+            ("POLY_API_KEY", self.api_key.to_string()),
+            ("POLY_PASSPHRASE", self.api_passphrase.to_string()),
+        ])
     }
 }
 
@@ -170,12 +192,17 @@ impl PlatformOrderClient for PolymarketClient {
             order_type: "FOK".to_string(),
         };
 
-        let resp = self.http
-            .post(&url)
-            .header("POLY_API_KEY", self.api_key.as_str())
-            .header("POLY_SECRET", self.api_secret.as_str())
-            .header("POLY_PASSPHRASE", self.api_passphrase.as_str())
-            .json(&CreateOrderRequest { order: payload })
+        let req_body = CreateOrderRequest { order: payload };
+        let body_str = serde_json::to_string(&req_body).unwrap_or_default();
+        let headers = self.l2_auth_headers("POST", "/order", &body_str)?;
+
+        let mut req = self.http.post(&url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req
+            .json(&req_body)
             .send()
             .await
             .context("Polymarket order submission failed")?;
@@ -196,23 +223,22 @@ impl PlatformOrderClient for PolymarketClient {
             // We assume FOK success based on the synchronous response, 
             // and spawn a background task to verify actual fill metrics.
             if !order_id_str.is_empty() {
-                let fetch_url = format!("{}/orders/{}", self.rest_url, order_id_str);
-                let http_client = self.http.clone();
-                let api_key = self.api_key.clone();
-                let api_secret = self.api_secret.clone();
-                let api_passphrase = self.api_passphrase.clone();
                 let order_id_clone = order_id_str.clone();
                 let assumed_price = actual_price;
+                let client_clone = self.clone();
 
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let req = http_client.get(&fetch_url)
-                        .header("POLY_API_KEY", api_key.as_str())
-                        .header("POLY_SECRET", api_secret.as_str())
-                        .header("POLY_PASSPHRASE", api_passphrase.as_str())
-                        .send();
+                    let path = format!("/orders/{}", order_id_clone);
+                    let fetch_url = format!("{}{}", client_clone.rest_url, path);
+                    
+                    if let Ok(headers) = client_clone.l2_auth_headers("GET", &path, "") {
+                        let mut req = client_clone.http.get(&fetch_url);
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
 
-                    if let Ok(Ok(fetch_resp)) = tokio::time::timeout(std::time::Duration::from_secs(3), req).await {
+                        if let Ok(Ok(fetch_resp)) = tokio::time::timeout(std::time::Duration::from_secs(3), req.send()).await {
                         if let Ok(order_data) = fetch_resp.json::<serde_json::Value>().await {
                             if let Some(avg_price_str) = order_data.get("average_price").and_then(|v| v.as_str()) {
                                 if let Ok(parsed_price) = Decimal::from_str(avg_price_str) {
@@ -230,6 +256,7 @@ impl PlatformOrderClient for PolymarketClient {
                                 }
                             }
                         }
+                    }
                     }
                 });
             }
@@ -258,12 +285,15 @@ impl PlatformOrderClient for PolymarketClient {
     }
 
     async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let url = format!("{}/order/{}", self.rest_url, order_id);
-        let resp = self.http.delete(&url)
-            .header("POLY_API_KEY", self.api_key.as_str())
-            .header("POLY_SECRET", self.api_secret.as_str())
-            .header("POLY_PASSPHRASE", self.api_passphrase.as_str())
-            .send()
+        let path = format!("/order/{}", order_id);
+        let url = format!("{}{}", self.rest_url, path);
+        let headers = self.l2_auth_headers("DELETE", &path, "")?;
+        
+        let mut req = self.http.delete(&url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send()
             .await
             .context("Polymarket cancel failed")?;
         if !resp.status().is_success() {
