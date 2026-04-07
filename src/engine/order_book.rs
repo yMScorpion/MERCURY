@@ -149,6 +149,12 @@ pub struct UnifiedOrderBook {
     books: HashMap<(Uuid, Platform), PlatformBook>,
 }
 
+impl Default for UnifiedOrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UnifiedOrderBook {
     pub fn new() -> Self {
         Self { books: HashMap::new() }

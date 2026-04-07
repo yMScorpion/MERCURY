@@ -344,7 +344,7 @@ pub(super) fn normalize_question(q: &str) -> String {
                 
                 // Polymarket CTF requires buying the specific NO token ID to short the market.
                 // We extract both YES (index 0) and NO (index 1) token IDs and store them as a pair.
-                let yes_token = item.get("tokens").and_then(|v| v.as_array()).and_then(|arr| arr.get(0)).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("");
+                let yes_token = item.get("tokens").and_then(|v| v.as_array()).and_then(|arr| arr.first()).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("");
                 let no_token = item.get("tokens").and_then(|v| v.as_array()).and_then(|arr| arr.get(1)).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("");
                 
                 if yes_token.is_empty() || yes_token.starts_with("0x") || no_token.is_empty() {

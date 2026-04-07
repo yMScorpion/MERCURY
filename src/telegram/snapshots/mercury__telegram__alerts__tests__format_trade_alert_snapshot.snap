@@ -1,6 +1,5 @@
 ---
 source: src/telegram/alerts.rs
-assertion_line: 180
 expression: alert
 ---
 ✅ <b>ARBITRAGE #123 — PROFIT</b>

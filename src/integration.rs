@@ -119,7 +119,7 @@ mod pipeline_tests {
 
         let mut uob = UnifiedOrderBook::new();
         let spread_engine = NetSpreadEngine::new(dec!(0.01));
-        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
+        let detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
 
         // Polymarket: Ask YES at 0.40 (cheap YES)
         uob.update(&make_tick(Platform::Polymarket, market_id, dec!(0.38), dec!(100), dec!(0.40), dec!(100), 200, 1));
@@ -144,7 +144,7 @@ mod pipeline_tests {
 
         let mut uob = UnifiedOrderBook::new();
         let spread_engine = NetSpreadEngine::new(dec!(0.02));
-        let mut detector = ArbitrageDetector::new(dec!(0.02), dec!(1.0), 5000, 3);
+        let detector = ArbitrageDetector::new(dec!(0.02), dec!(1.0), 5000, 3);
 
         // Both platforms at essentially the same price — no arb
         uob.update(&make_tick(Platform::Polymarket, market_id, dec!(0.49), dec!(100), dec!(0.51), dec!(100), 200, 1));
@@ -165,7 +165,7 @@ mod pipeline_tests {
         let mut uob = UnifiedOrderBook::new();
         let spread_engine = NetSpreadEngine::new(dec!(0.01));
         // 100ms stale timeout — ticks will be stale by the time we detect
-        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 100, 3);
+        let detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 100, 3);
 
         // Insert ticks with old timestamps
         let mut tick_a = make_tick(Platform::Polymarket, market_id, dec!(0.30), dec!(100), dec!(0.32), dec!(100), 200, 1);
@@ -178,7 +178,7 @@ mod pipeline_tests {
 
         let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(10.0));
         assert!(opps.is_empty(), "Stale ticks should be rejected by gate 3");
-        assert!(detector.stats.gate3_rejected > 0, "Gate 3 should have rejected");
+        assert!(detector.stats.gate3_rejected.load(std::sync::atomic::Ordering::Relaxed) > 0, "Gate 3 should have rejected");
     }
 
     // ─── Test 4: Circuit breaker halts trading ───
@@ -414,7 +414,7 @@ mod pipeline_tests {
 
         let mut uob = UnifiedOrderBook::new();
         let spread_engine = NetSpreadEngine::new(dec!(0.01));
-        let mut detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
+        let detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 5000, 3);
 
         uob.update(&make_tick(Platform::Polymarket, market_id, dec!(0.30), dec!(100), dec!(0.32), dec!(100), 200, 1));
         uob.update(&make_tick(Platform::Kalshi, market_id, dec!(0.60), dec!(100), dec!(0.62), dec!(100), 175, 1));

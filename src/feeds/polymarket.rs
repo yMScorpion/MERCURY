@@ -203,8 +203,7 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
 
         // We only subscribe to the YES token (the first token in the comma-separated pair) 
         // because the spread engine automatically derives the NO price from the YES orderbook.
-        let asset_ids: Vec<String> = self.subscriptions.iter()
-            .map(|(a, _)| a.split(',').next().unwrap_or(a).to_string())
+        let asset_ids: Vec<String> = self.subscriptions.keys().map(|a| a.split(',').next().unwrap_or(a).to_string())
             .collect();
             
         if !asset_ids.is_empty() {
@@ -213,11 +212,11 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                 assets_ids: asset_ids.clone(),
             };
             let msg_text = serde_json::to_string(&sub_msg)?;
-            write.send(Message::Text(msg_text.into())).await?;
+            write.send(Message::Text(msg_text)).await?;
             info!(count = asset_ids.len(), "Subscribed to Polymarket markets");
         }
 
-        for (asset_id, _) in &self.subscriptions {
+        for asset_id in self.subscriptions.keys() {
             // WS events arrive keyed by the YES token (first element of comma pair).
             // Books must be keyed the same way or lookups will always miss.
             let ws_key = asset_id.split(',').next().unwrap_or(asset_id).to_string();
@@ -294,7 +293,7 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                             }
                             let sub_msg = SubscribeMessage { msg_type: "subscribe".into(), assets_ids: new_subs.clone() };
                             if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
-                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text.into())).await;
+                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text)).await;
                                 tracing::info!(count = new_subs.len(), "Dynamically subscribed to new Polymarket markets");
                             }
                         }

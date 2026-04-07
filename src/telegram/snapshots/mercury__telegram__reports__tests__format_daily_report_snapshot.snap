@@ -1,6 +1,5 @@
 ---
 source: src/telegram/reports.rs
-assertion_line: 351
 expression: output
 ---
 📈 <b>MERCURY DAILY REPORT — 2026-04-05</b>

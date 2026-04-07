@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::too_many_arguments, clippy::large_enum_variant, clippy::needless_range_loop, clippy::unnecessary_get_then_check)]
+
 pub mod config;
 pub mod crypto;
 pub mod db;

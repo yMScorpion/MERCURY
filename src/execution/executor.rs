@@ -17,16 +17,12 @@ use super::cdna_client::CdnaClient;
 use super::forecastex_client::ForecastExClient;
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 struct RateLimitState {
     consecutive_429s: u32,
     backoff_until: Option<Instant>,
 }
 
-impl Default for RateLimitState {
-    fn default() -> Self {
-        Self { consecutive_429s: 0, backoff_until: None }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct OrderResult {

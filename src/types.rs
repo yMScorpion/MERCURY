@@ -131,7 +131,7 @@ impl std::str::FromStr for MarketCategory {
             "crypto" => Ok(MarketCategory::Crypto),
             "weather" => Ok(MarketCategory::Weather),
             "culture" => Ok(MarketCategory::Culture),
-            "other" | _ => Ok(MarketCategory::Other),
+            _ => Ok(MarketCategory::Other),
         }
     }
 }

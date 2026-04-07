@@ -18,6 +18,12 @@ pub struct ArbPair {
     pub confidence: f64,
 }
 
+impl Default for MarketRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MarketRegistry {
     pub fn new() -> Self {
         Self {

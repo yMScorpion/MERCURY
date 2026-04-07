@@ -21,6 +21,10 @@ pub struct KalshiAuth {
 }
 
 impl KalshiAuth {
+    pub fn api_key_id(&self) -> &str {
+        &self.api_key_id
+    }
+
     /// Create from RSA private key PEM and API key ID
     pub fn new(api_key_id: String, rsa_private_key_pem: &[u8]) -> Result<Self> {
         let encoding_key = EncodingKey::from_rsa_pem(rsa_private_key_pem)
@@ -41,13 +45,13 @@ impl KalshiAuth {
             .as_secs()
     }
 
-    /// Generate a fresh JWT token (valid for 10 minutes)
+    /// Generate a fresh JWT token
     pub fn generate_token(&self) -> Result<String> {
         let now = Self::now_secs();
         let claims = KalshiClaims {
             sub: self.api_key_id.clone(),
-            iat: now,
-            exp: now + 600,
+            iat: now - 10,
+            exp: now + 300,
         };
         let header = Header::new(Algorithm::RS256);
         let token = encode(&header, &claims, &self.encoding_key)
@@ -68,7 +72,7 @@ impl KalshiAuth {
         }
 
         let token = self.generate_token()?;
-        let expiry = now + 600;
+        let expiry = now + 290;
         {
             let mut cache = self.token_cache.lock().await;
             *cache = Some((token.clone(), expiry));

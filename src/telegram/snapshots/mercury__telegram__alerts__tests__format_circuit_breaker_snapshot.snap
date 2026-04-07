@@ -1,6 +1,5 @@
 ---
 source: src/telegram/alerts.rs
-assertion_line: 192
 expression: alert
 ---
 🚨 <b>CIRCUIT BREAKER TRIGGERED</b>

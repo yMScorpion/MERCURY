@@ -38,7 +38,7 @@ impl SqliteDb {
 
         // C-3 FIX: Support encryption-at-rest via PRAGMA key if DB_ENCRYPTION_KEY is provided
         if let Ok(key) = std::env::var("DB_ENCRYPTION_KEY") {
-            conn_opts = conn_opts.pragma("key", key);
+            conn_opts = conn_opts.pragma("key", format!("'{}'", key.replace('\'', "''")));
         }
 
         let pool = SqlitePoolOptions::new()

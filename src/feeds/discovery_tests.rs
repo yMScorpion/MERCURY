@@ -95,7 +95,7 @@ proptest! {
         q2 in "[a-zA-Z0-9 ]{10,50}"
     ) {
         let sim = jaccard(&q1, &q2);
-        prop_assert!(sim >= 0.0 && sim <= 1.0, "Jaccard similarity must be between 0 and 1");
+        prop_assert!((0.0..=1.0).contains(&sim), "Jaccard similarity must be between 0 and 1");
     }
 
     #[test]
@@ -147,10 +147,10 @@ fn test_numerical_target_mismatch_in_normalize() {
     let q70k = MarketDiscovery::normalize_question("Will Bitcoin exceed $70,000?");
 
     let nums_60k: Vec<f64> = q60k.split_whitespace()
-        .filter_map(|w| w.replace('$', "").replace(',', "").parse::<f64>().ok())
+        .filter_map(|w| w.replace(['$', ','], "").parse::<f64>().ok())
         .collect();
     let nums_70k: Vec<f64> = q70k.split_whitespace()
-        .filter_map(|w| w.replace('$', "").replace(',', "").parse::<f64>().ok())
+        .filter_map(|w| w.replace(['$', ','], "").parse::<f64>().ok())
         .collect();
 
     // They should have different numerical targets

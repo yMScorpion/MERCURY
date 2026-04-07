@@ -309,41 +309,38 @@ impl ForecastExFeed {
                     // Look ahead for 270 and 271
                     let price = Self::find_next_tag(&parts, i + 1, 270);
                     let size = Self::find_next_tag(&parts, i + 1, 271);
-                    match (price, size) {
-                        (Some(p_str), Some(s_str)) => {
-                            let price = match Decimal::from_str(p_str) {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    tracing::error!(symbol, raw = p_str,
-                                        "ForecastEx: bad price in repeating group — skipping entry");
-                                    i += 1;
-                                    continue;
-                                }
-                            };
-                            let size = match Decimal::from_str(s_str) {
-                                Ok(s) => s,
-                                Err(_) => {
-                                    tracing::error!(symbol, raw = s_str,
-                                        "ForecastEx: bad size in repeating group — skipping entry");
-                                    i += 1;
-                                    continue;
-                                }
-                            };
-                            match entry_type {
-                                "0" => { // Bid
-                                    if size == Decimal::ZERO { book.bids.remove(&price); }
-                                    else { book.bids.insert(price, size); }
-                                    updated = true;
-                                }
-                                "1" => { // Offer
-                                    if size == Decimal::ZERO { book.asks.remove(&price); }
-                                    else { book.asks.insert(price, size); }
-                                    updated = true;
-                                }
-                                _ => {}
+                    if let (Some(p_str), Some(s_str)) = (price, size) {
+                        let price = match Decimal::from_str(p_str) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::error!(symbol, raw = p_str,
+                                    "ForecastEx: bad price in repeating group — skipping entry");
+                                i += 1;
+                                continue;
                             }
+                        };
+                        let size = match Decimal::from_str(s_str) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                tracing::error!(symbol, raw = s_str,
+                                    "ForecastEx: bad size in repeating group — skipping entry");
+                                i += 1;
+                                continue;
+                            }
+                        };
+                        match entry_type {
+                            "0" => { // Bid
+                                if size == Decimal::ZERO { book.bids.remove(&price); }
+                                else { book.bids.insert(price, size); }
+                                updated = true;
+                            }
+                            "1" => { // Offer
+                                if size == Decimal::ZERO { book.asks.remove(&price); }
+                                else { book.asks.insert(price, size); }
+                                updated = true;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }

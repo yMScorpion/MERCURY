@@ -202,9 +202,9 @@ fn format_daily_report(report: &DailyReport) -> String {
     let _ = write!(msg, "\n\u{2550}\u{2550}\u{2550} Platform Breakdown \u{2550}\u{2550}\u{2550}\n");
     for (platform, stats) in &report.platform_breakdown {
         let p_sign = if stats.pnl >= Decimal::ZERO { "+" } else { "" };
-        let _ = write!(
+        let _ = writeln!(
             msg,
-            "{}: ${} exposed \u{2502} {} trades \u{2502} {}${}\n",
+            "{}: ${} exposed \u{2502} {} trades \u{2502} {}${}",
             platform,
             stats.exposure.round_dp(2),
             stats.trade_count,
@@ -232,9 +232,9 @@ fn format_daily_report(report: &DailyReport) -> String {
         let _ = write!(msg, "\n\u{2550}\u{2550}\u{2550} Top Trades \u{2550}\u{2550}\u{2550}\n");
         for (i, t) in report.top_trades.iter().enumerate() {
             let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
-            let _ = write!(
+            let _ = writeln!(
                 msg,
-                "{}. {}${} \u{2502} \"{}\" \u{2502} {}\u{2194}{}\n",
+                "{}. {}${} \u{2502} \"{}\" \u{2502} {}\u{2194}{}",
                 i + 1,
                 sign,
                 t.profit.round_dp(2),
@@ -250,9 +250,9 @@ fn format_daily_report(report: &DailyReport) -> String {
         for (i, t) in report.worst_trades.iter().enumerate() {
             let sign = if t.profit >= Decimal::ZERO { "+" } else { "" };
             let reason = t.failure_reason.as_deref().unwrap_or("Unknown");
-            let _ = write!(
+            let _ = writeln!(
                 msg,
-                "{}. {}${} \u{2502} \"{}\" \u{2502} {}\n",
+                "{}. {}${} \u{2502} \"{}\" \u{2502} {}",
                 i + 1,
                 sign,
                 t.profit.round_dp(2),
@@ -280,6 +280,16 @@ fn format_daily_report(report: &DailyReport) -> String {
     );
 
     msg
+}
+
+fn truncate_question(q: &str, max_len: usize) -> String {
+    if max_len <= 3 || q.len() <= max_len { 
+        return TelegramBot::escape_html(q); 
+    }
+    let mut end = max_len - 3;
+    while end > 0 && !q.is_char_boundary(end) { end -= 1; }
+    let truncated = format!("{}...", &q[..end]);
+    TelegramBot::escape_html(&truncated)
 }
 
 #[cfg(test)]
@@ -340,14 +350,4 @@ mod tests {
         let output = format_daily_report(&report);
         insta::assert_snapshot!(output);
     }
-}
-
-fn truncate_question(q: &str, max_len: usize) -> String {
-    if max_len <= 3 || q.len() <= max_len { 
-        return TelegramBot::escape_html(q); 
-    }
-    let mut end = max_len - 3;
-    while end > 0 && !q.is_char_boundary(end) { end -= 1; }
-    let truncated = format!("{}...", &q[..end]);
-    TelegramBot::escape_html(&truncated)
 }

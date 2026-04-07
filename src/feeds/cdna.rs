@@ -137,7 +137,7 @@ impl FeedHandler for CdnaFeed {
             };
             self.request_id += 1;
             let msg_text = serde_json::to_string(&sub)?;
-            write.send(Message::Text(msg_text.into())).await?;
+            write.send(Message::Text(msg_text)).await?;
             info!(count = channels.len(), "Subscribed to CDNA channels");
         }
 
