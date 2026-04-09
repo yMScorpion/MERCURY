@@ -96,8 +96,10 @@ struct BookChange {
 
 #[derive(Serialize)]
 struct SubscribeMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    msg_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
     assets_ids: Vec<String>,
 }
 
@@ -207,13 +209,32 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
             .collect();
             
         if !asset_ids.is_empty() {
-            let sub_msg = SubscribeMessage {
-                msg_type: "subscribe".into(),
-                assets_ids: asset_ids.clone(),
-            };
-            let msg_text = serde_json::to_string(&sub_msg)?;
-            write.send(Message::Text(msg_text)).await?;
-            info!(count = asset_ids.len(), "Subscribed to Polymarket markets");
+            let mut chunks = asset_ids.chunks(50);
+            
+            // First chunk initializes the connection
+            if let Some(first_chunk) = chunks.next() {
+                let init_msg = SubscribeMessage {
+                    msg_type: Some("market".into()),
+                    operation: None,
+                    assets_ids: first_chunk.to_vec(),
+                };
+                let msg_text = serde_json::to_string(&init_msg)?;
+                write.send(Message::Text(msg_text)).await?;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            // Subsequent chunks add to the subscription
+            for chunk in chunks {
+                let sub_msg = SubscribeMessage {
+                    msg_type: None,
+                    operation: Some("subscribe".into()),
+                    assets_ids: chunk.to_vec(),
+                };
+                let msg_text = serde_json::to_string(&sub_msg)?;
+                write.send(Message::Text(msg_text)).await?;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            info!(count = asset_ids.len(), "Subscribed to Polymarket markets in chunks");
         }
 
         for asset_id in self.subscriptions.keys() {
@@ -224,14 +245,20 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
         }
 
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         loop {
              tokio::select! {
-                msg_timeout = tokio::time::timeout(std::time::Duration::from_secs(30), read.next()) => {
-                    let msg_opt = match msg_timeout {
-                        Ok(m) => m,
-                        Err(_) => return Err(anyhow::anyhow!("No message for 30s — Polymarket heartbeat timeout")),
-                    };
+                _ = ping_interval.tick() => {
+                    if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![].into())).await {
+                        tracing::warn!(error = %e, "Failed to send Polymarket ping");
+                        return Err(e.into());
+                    }
+                }
+                msg_timeout = tokio::time::timeout(std::time::Duration::from_secs(300), read.next()) => {
+                   let msg_opt = match msg_timeout {
+                       Ok(m) => m,
+                       Err(_) => return Err(anyhow::anyhow!("No message for 300s — Polymarket heartbeat timeout")),                    };
                     let msg = match msg_opt {
                         Some(m) => m,
                         None => continue,
@@ -291,7 +318,7 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                                     self.yes_token_to_market.insert(ws_key.clone(), market_id);
                                 }
                             }
-                            let sub_msg = SubscribeMessage { msg_type: "subscribe".into(), assets_ids: new_subs.clone() };
+                            let sub_msg = SubscribeMessage { msg_type: None, operation: Some("subscribe".into()), assets_ids: new_subs.clone() };
                             if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
                                 let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text)).await;
                                 tracing::info!(count = new_subs.len(), "Dynamically subscribed to new Polymarket markets");
@@ -327,7 +354,7 @@ impl PolymarketFeed {
                 self.process_event(&msg, tick_tx)?;
             }
             Err(e) => {
-                tracing::debug!(error = %e, "Failed to parse Polymarket WS message");
+                tracing::error!(error = %e, text = %text, "Failed to parse Polymarket WS message");
             }
         }
         Ok(())

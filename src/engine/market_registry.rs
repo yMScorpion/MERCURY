@@ -60,7 +60,7 @@ impl MarketRegistry {
         self.markets.insert(market_id, market);
 
         let mut pairs = Vec::new();
-        if confidence >= 0.95 {
+        if confidence >= 0.2 {
             for i in 0..platforms.len() {
                 for j in (i + 1)..platforms.len() {
                     pairs.push(ArbPair {

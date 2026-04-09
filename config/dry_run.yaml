@@ -21,7 +21,7 @@ platforms:
   kalshi:
     enabled: true
     rest_url: "https://api.elections.kalshi.com/trade-api/v2"
-    ws_url: "wss://trading-api.kalshi.com/trade-api/ws/v2"
+    ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
   cdna:
     enabled: false
     rest_url: ""

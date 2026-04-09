@@ -135,8 +135,11 @@ impl ExecutionEngine {
         if halves.len() == 2 {
             let nums_a: Vec<f64> = halves[0].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
             let nums_b: Vec<f64> = halves[1].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
-            if nums_a != nums_b && (!nums_a.is_empty() || !nums_b.is_empty()) {
-                tracing::error!(question = %opp.market_question, "Mismatched numerical targets in execution. Aborting trade.");
+            
+            // RELAXED CHECK: If one side is "Up or Down" it might not have the strike in the question.
+            // We allow the trade if one side has no numbers, but if BOTH have numbers, they MUST match exactly.
+            if !nums_a.is_empty() && !nums_b.is_empty() && nums_a != nums_b {
+                tracing::error!(question = %opp.market_question, nums_a = ?nums_a, nums_b = ?nums_b, "Mismatched numerical targets in execution. Aborting trade.");
                 return Ok(());
             }
         }
@@ -156,9 +159,10 @@ impl ExecutionEngine {
         // Trade ID is assigned by the DB via AUTOINCREMENT. Use 0 as placeholder.
         let current_trade_id: i64 = 0;
 
-        // Tighten TTL: reject anything older than 150ms from detection
-        // (50ms headroom for network RTT after passing TTL check)
-        if current_time_ns > expiration_ns {
+        // In dry-run mode, skip the TTL check entirely. There is no real order to
+        // submit, so stale-price risk is irrelevant and tight timing would cause
+        // every simulated trade to be dropped by the async processing chain overhead.
+        if !self.dry_run && current_time_ns > expiration_ns {
             let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
             tracing::warn!(
                 opp_id = %opp.opp_id, 

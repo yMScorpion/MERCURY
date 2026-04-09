@@ -58,11 +58,13 @@ sha2 = "0.10"
 ring = "0.17"
 jsonwebtoken = "9"
 rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22.1"
 hmac = "0.13.0"
+regex = "1.12.3"
 
 [dev-dependencies]
 proptest = "1.4"

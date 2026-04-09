@@ -1,0 +1,2 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running `target/debug/mercury --dry-run -c config/dry_run.yaml`

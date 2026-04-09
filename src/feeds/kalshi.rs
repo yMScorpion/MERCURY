@@ -208,6 +208,12 @@ impl FeedHandler for KalshiFeed {
     }
 
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
+        if self.auth.is_none() {
+            tracing::error!("CRITICAL: Kalshi WebSocket requires authentication. Disabling feed because no credentials were provided in .env.");
+            // Sleep forever to keep the task alive without spamming reconnects
+            tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+            return Ok(());
+        }
         info!("Connecting to Kalshi WebSocket");
 
         let mut request = self.config.ws_url.as_str()
@@ -220,11 +226,14 @@ impl FeedHandler for KalshiFeed {
         );
 
         if let Some(auth) = &self.auth {
-            let token = auth.generate_token()?;
-            request.headers_mut().insert(
-                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-                token.try_into().context("Failed to build Kalshi auth header")?,
-            );
+            let headers = auth.generate_ws_headers()?;
+            for (key, val) in headers {
+                use std::str::FromStr;
+                request.headers_mut().insert(
+                    tokio_tungstenite::tungstenite::http::header::HeaderName::from_str(&key).context("Invalid Kalshi Header")?,
+                    tokio_tungstenite::tungstenite::http::header::HeaderValue::from_str(&val).context("Invalid Kalshi Header Value")?,
+                );
+            }
         }
 
         let tls = crate::crypto::tls::build_tls_connector()
@@ -246,7 +255,7 @@ impl FeedHandler for KalshiFeed {
                 id: 1,
                 cmd: "subscribe".into(),
                 params: KalshiSubParams {
-                    channels: vec!["orderbook_snapshot".into(), "orderbook_delta".into(), "trade".into()],
+                    channels: vec!["orderbook_delta".into(), "trade".into()],
                     market_tickers: tickers.clone(),
                 },
             };
@@ -259,22 +268,74 @@ impl FeedHandler for KalshiFeed {
             self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
         }
 
-        while let Some(msg_res) = read.next().await {
-            match msg_res {
-                Ok(Message::Text(text)) => {
-                    if let Err(e) = self.handle_message(&text, &tick_tx) {
-                        warn!(error = %e, "Failed to process Kalshi message");
+        // Periodically refresh subscriptions from DB to pick up newly discovered
+        // 15-minute crypto markets without requiring a full WS reconnect.
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+        loop {
+            tokio::select! {
+                msg_opt = read.next() => {
+                    let msg_res = match msg_opt {
+                        Some(m) => m,
+                        None => break,
+                    };
+                    match msg_res {
+                        Ok(Message::Text(text)) => {
+                            if let Err(e) = self.handle_message(&text, &tick_tx) {
+                                warn!(error = %e, "Failed to process Kalshi message");
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
+                        Ok(Message::Close(_)) => {
+                            info!("Kalshi WebSocket closed");
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                        _ => {}
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    let _ = write.send(Message::Pong(data)).await;
+                _ = ping_interval.tick() => {
+                    if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                        warn!(error = %e, "Failed to send Kalshi ping");
+                        return Err(e.into());
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    info!("Kalshi WebSocket closed");
-                    break;
+                _ = sync_interval.tick() => {
+                    // Dynamically subscribe to newly discovered markets (e.g. fresh 15-min candles)
+                    match self.db.get_active_markets().await {
+                        Ok(markets) => {
+                            let mut new_tickers = Vec::new();
+                            for m in markets {
+                                if let Some(info) = m.platforms.get(&Platform::Kalshi) {
+                                    let ticker = info.platform_market_id.clone();
+                                    if !self.subscriptions.contains_key(&ticker) {
+                                        self.subscriptions.insert(ticker.clone(), m.unified_id);
+                                        self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
+                                        new_tickers.push(ticker);
+                                    }
+                                }
+                            }
+                            if !new_tickers.is_empty() {
+                                let sub = KalshiSubscribe {
+                                    id: 2,
+                                    cmd: "subscribe".into(),
+                                    params: KalshiSubParams {
+                                        channels: vec!["orderbook_delta".into(), "trade".into()],
+                                        market_tickers: new_tickers.clone(),
+                                    },
+                                };
+                                if let Ok(msg_text) = serde_json::to_string(&sub) {
+                                    let _ = write.send(Message::Text(msg_text.into())).await;
+                                    info!(count = new_tickers.len(), "Dynamically subscribed to new Kalshi markets");
+                                }
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "Kalshi feed: DB refresh failed, skipping subscription update"),
+                    }
                 }
-                Err(e) => return Err(e.into()),
-                _ => {}
             }
         }
 

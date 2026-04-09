@@ -278,9 +278,10 @@ impl ArbitrageDetector {
                             recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
                             score,
                             detected_at: now_ns(),
-                            // FIX: Reduce Time-to-Live to 200ms. If the execution queue backs up,
-                            // prices will move. Drops stale arbs before they execute at a loss.
-                            ttl_ms: 200,
+                            // TTL: 500ms gives enough headroom for the async processing chain
+                            // (bankroll actor, Kelly sizing, circuit-breaker lock, capital
+                            // reservation) while still rejecting truly stale prices.
+                            ttl_ms: 500,
                         });
                     }
                     Err(reason) => {

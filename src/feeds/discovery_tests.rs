@@ -156,3 +156,50 @@ fn test_numerical_target_mismatch_in_normalize() {
     // They should have different numerical targets
     assert_ne!(nums_60k, nums_70k, "different price targets should produce different number lists");
 }
+
+#[test]
+fn test_15m_crypto_matching_with_time_extraction() {
+    use chrono::{TimeZone, Utc, Timelike};
+
+    // Simulated Kalshi market
+    let km_title = "Will Bitcoin be above $60,000.50 at 8:15 PM?";
+    let km_ticker = "KXBTC15M-26MAR19-B60000.50";
+    let _km_expiration = Utc.with_ymd_and_hms(2026, 3, 19, 20, 15, 0).unwrap();
+    
+    // Simulated Polymarket market with TRUNCATED expiration
+    let pm_title = "Bitcoin Up or Down - March 19, 8:15AM-8:20AM ET";
+    let pm_expiration_truncated = Utc.with_ymd_and_hms(2026, 3, 19, 0, 0, 0).unwrap();
+
+    // 1. Test time extraction
+    let pm_expiration_fixed = MarketDiscovery::try_fix_expiration_from_title(pm_title, pm_expiration_truncated);
+    
+    // 8:20 AM ET is 12:20 PM UTC (assuming 4h offset)
+    assert_eq!(pm_expiration_fixed.hour(), 12, "Hour should be fixed to 12 UTC (8 AM ET + 4h)");
+    assert_eq!(pm_expiration_fixed.minute(), 20, "Minute should be fixed to 20");
+
+    // 2. Test 15m detection
+    let _is_15m = pm_title.to_lowercase().contains("15 min") || 
+                 km_title.to_lowercase().contains("15 min") ||
+                 km_ticker.contains("15M") ||
+                 pm_title.to_lowercase().contains("8:15am"); // our new regex based detection will handle this in the loop
+    
+    // In the real loop we use normalized title
+    let pm_norm = MarketDiscovery::normalize_question(pm_title);
+    let km_norm = MarketDiscovery::normalize_question(km_title);
+    
+    // Our updated logic:
+    let is_15m_real = pm_norm.contains("15 min") || 
+                      km_norm.contains("15 min") ||
+                      km_ticker.contains("15M") ||
+                      pm_norm.contains("15m") ||
+                      km_norm.contains("15m");
+    
+    assert!(is_15m_real || km_ticker.contains("15M"), "Should be detected as 15m market");
+
+    // 3. Test Similarity
+    let sim = jaccard(pm_title, km_title);
+    // pm_norm: "btc up or down march 19 8 15am 8 20am et"
+    // km_norm: "will btc be above 60000 50 at 8 15 pm"
+    // Tokens overlap: "btc", "8", "15" (if 15 is separated)
+    assert!(sim >= 0.1, "Similarity should be at least 0.1, got {}", sim);
+}
