@@ -27,7 +27,6 @@ pub struct KalshiFeed {
 #[derive(Debug, Serialize, Deserialize)]
 struct KalshiSubscribe {
     id: u64,
-    #[serde(rename = "type")]
     cmd: String,
     params: KalshiSubParams,
 }
@@ -103,33 +102,56 @@ impl KalshiFeed {
             "orderbook_snapshot" => self.handle_snapshot(&msg, tick_tx),
             "orderbook_delta" => self.handle_delta(&msg, tick_tx),
             "error" => {
-                let err_msg = msg.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                anyhow::bail!("Kalshi WS error: {}", err_msg);
-            }
-            _ => Ok(()),
+                let err_detail = msg.get("msg");
+                let err_code = err_detail
+                    .and_then(|v| v.get("code"))
+                    .and_then(|c| c.as_i64())
+                    .unwrap_or(-1);
+                let err_msg = err_detail
+                    .and_then(|v| v.get("msg").and_then(|m| m.as_str()).or_else(|| v.as_str()))
+                    .unwrap_or("unknown error");
+                anyhow::bail!("Kalshi WS error (code {}): {}", err_code, err_msg);
+            }            _ => Ok(()),
         }
     }
 
-    fn handle_snapshot(&mut self, msg: &serde_json::Value, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
+    fn handle_snapshot(&mut self, root_msg: &serde_json::Value, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
+        let parse_dec = |v: Option<&serde_json::Value>| -> Result<Decimal> {
+            match v {
+                Some(serde_json::Value::String(s)) => Decimal::from_str(s).map_err(Into::into),
+                Some(serde_json::Value::Number(n)) => Decimal::from_str(&n.to_string()).map_err(Into::into),
+                _ => Ok(Decimal::ZERO),
+            }
+        };
+
+        let msg = root_msg.get("msg").context("missing msg object")?;
         let ticker = msg.get("market_ticker").and_then(|v| v.as_str()).context("missing ticker")?;
         let book = self.books.entry(ticker.to_string()).or_insert_with(KalshiOrderBook::new);
         
         book.bids.clear();
         book.asks.clear();
 
-        if let Some(bids) = msg.get("bids").and_then(|v| v.as_array()) {
-            for b in bids {
-                let p = Decimal::from_str(b.get(0).and_then(|v| v.as_str()).unwrap_or("0"))?;
-                let s = Decimal::from_str(b.get(1).and_then(|v| v.as_str()).unwrap_or("0"))?;
+        let yes_arr = msg.get("yes").and_then(|v| v.as_array())
+            .or_else(|| msg.get("yes_dollars").and_then(|v| v.as_array()));
+        if let Some(yes) = yes_arr {
+            for b in yes {
+                let p = parse_dec(b.get(0))?;
+                let s = parse_dec(b.get(1))?;
                 if s > Decimal::ZERO { book.bids.insert(p, s); }
             }
         }
 
-        if let Some(asks) = msg.get("asks").and_then(|v| v.as_array()) {
-            for a in asks {
-                let p = Decimal::from_str(a.get(0).and_then(|v| v.as_str()).unwrap_or("0"))?;
-                let s = Decimal::from_str(a.get(1).and_then(|v| v.as_str()).unwrap_or("0"))?;
-                if s > Decimal::ZERO { book.asks.insert(p, s); }
+        // Kalshi's "NO" bids must be inverted into "YES" asks for the unified spread engine
+        let no_arr = msg.get("no").and_then(|v| v.as_array())
+            .or_else(|| msg.get("no_dollars").and_then(|v| v.as_array()));
+        if let Some(no) = no_arr {
+            for a in no {
+                let no_bid_price = parse_dec(a.get(0))?;
+                let s = parse_dec(a.get(1))?;
+                if s > Decimal::ZERO { 
+                    let yes_ask_price = Decimal::ONE - no_bid_price;
+                    book.asks.insert(yes_ask_price, s); 
+                }
             }
         }
 
@@ -140,21 +162,50 @@ impl KalshiFeed {
         Ok(())
     }
 
-    fn handle_delta(&mut self, msg: &serde_json::Value, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
+    fn handle_delta(&mut self, root_msg: &serde_json::Value, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
+        let parse_dec = |v: Option<&serde_json::Value>| -> Result<Decimal> {
+            match v {
+                Some(serde_json::Value::String(s)) => Decimal::from_str(s).map_err(Into::into),
+                Some(serde_json::Value::Number(n)) => Decimal::from_str(&n.to_string()).map_err(Into::into),
+                _ => Ok(Decimal::ZERO),
+            }
+        };
+
+        let msg = root_msg.get("msg").context("missing msg object")?;
         let ticker = msg.get("market_ticker").and_then(|v| v.as_str()).context("missing ticker")?;
         let book = self.books.entry(ticker.to_string()).or_insert_with(KalshiOrderBook::new);
         
         if !book.is_initialized { return Ok(()); }
 
-        let side = msg.get("side").and_then(|v| v.as_str()).context("missing side")?;
-        let p = Decimal::from_str(msg.get("price").and_then(|v| v.as_str()).unwrap_or("0"))?;
-        let s = Decimal::from_str(msg.get("delta").and_then(|v| v.as_str()).unwrap_or("0"))?;
+        if let Some(price_deltas) = msg.get("price_deltas") {
+            let yes_deltas = price_deltas.get("yes").and_then(|v| v.as_array())
+                .or_else(|| price_deltas.get("yes_dollars").and_then(|v| v.as_array()));
+            if let Some(yes) = yes_deltas {
+                for b in yes {
+                    let p = parse_dec(b.get(0))?;
+                    let s = parse_dec(b.get(1))?;
+                    if s == Decimal::ZERO {
+                        book.bids.remove(&p);
+                    } else {
+                        book.bids.insert(p, s);
+                    }
+                }
+            }
 
-        let map = if side == "yes" { &mut book.bids } else { &mut book.asks };
-        if s == Decimal::ZERO {
-            map.remove(&p);
-        } else {
-            map.insert(p, s);
+            let no_deltas = price_deltas.get("no").and_then(|v| v.as_array())
+                .or_else(|| price_deltas.get("no_dollars").and_then(|v| v.as_array()));
+            if let Some(no) = no_deltas {
+                for a in no {
+                    let no_bid_price = parse_dec(a.get(0))?;
+                    let s = parse_dec(a.get(1))?;
+                    let yes_ask_price = Decimal::ONE - no_bid_price;
+                    if s == Decimal::ZERO {
+                        book.asks.remove(&yes_ask_price);
+                    } else {
+                        book.asks.insert(yes_ask_price, s);
+                    }
+                }
+            }
         }
 
         if let Some(tick) = self.create_tick(ticker) {
@@ -167,12 +218,18 @@ impl KalshiFeed {
         let market_id = *self.subscriptions.get(ticker)?;
         let book = self.books.get(ticker)?;
         
+        // Push 0-price ticks to keep the heartbeat alive
         let bid = book.bids.iter().next_back().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ZERO, Decimal::ZERO));
         let ask = book.asks.iter().next().map(|(p, s)| (*p, *s)).unwrap_or((Decimal::ZERO, Decimal::ZERO));
         
-        if bid.0 == Decimal::ZERO || ask.0 == Decimal::ZERO { return None; }
+        let mid = if bid.0 > Decimal::ZERO && ask.0 > Decimal::ZERO {
+            (bid.0 + ask.0) / Decimal::TWO
+        } else if bid.0 > Decimal::ZERO { 
+            bid.0 
+        } else { 
+            ask.0 
+        };
 
-        let mid = (bid.0 + ask.0) / Decimal::TWO;
         let fee_bps = if ticker.contains("PRES") { 50 } else { 10 };
 
         Some(NormalizedTick {
@@ -251,17 +308,20 @@ impl FeedHandler for KalshiFeed {
 
         let tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
         if !tickers.is_empty() {
-            let sub = KalshiSubscribe {
-                id: 1,
-                cmd: "subscribe".into(),
-                params: KalshiSubParams {
-                    channels: vec!["orderbook_delta".into(), "trade".into()],
-                    market_tickers: tickers.clone(),
-                },
-            };
-            let msg_text = serde_json::to_string(&sub)?;
-            write.send(Message::Text(msg_text.into())).await?;
-            info!(count = tickers.len(), "Subscribed to Kalshi markets");
+            for chunk in tickers.chunks(50) {
+                let sub = KalshiSubscribe {
+                    id: 1,
+                    cmd: "subscribe".into(),
+                    params: KalshiSubParams {
+                        channels: vec!["orderbook_delta".into(), "trade".into()],
+                        market_tickers: chunk.to_vec(),
+                    },
+                };
+                let msg_text = serde_json::to_string(&sub)?;
+                write.send(Message::Text(msg_text.into())).await?;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            info!(count = tickers.len(), "Subscribed to Kalshi markets in chunks");
         }
 
         for ticker in self.subscriptions.keys() {
@@ -270,7 +330,8 @@ impl FeedHandler for KalshiFeed {
 
         // Periodically refresh subscriptions from DB to pick up newly discovered
         // 15-minute crypto markets without requiring a full WS reconnect.
-        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // 15s sync: short-lived 15-min crypto candles need fast subscription uptake.
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         loop {

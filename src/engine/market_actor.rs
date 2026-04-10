@@ -12,6 +12,7 @@ use crate::risk::bankroll::BankrollHandle;
 use crate::risk::circuit_breaker::{CircuitBreakers, CheckParams};
 use crate::risk::kelly::KellyCalculator;
 use crate::monitoring::metrics::Metrics;
+use tracing::{debug, info, warn};
 
 pub struct MarketActor {
     market_id: Uuid,
@@ -66,10 +67,22 @@ impl MarketActor {
     }
 
     async fn run(&mut self) {
+        debug!(market_id = %self.market_id, "MarketActor started");
          while let Some(tick) = self.rx.recv().await {
             let mid = tick.mid_price;
             let market_id = tick.market_id;
             self.uob_shard.update(&tick);
+
+            debug!(
+                market_id = %market_id,
+                platform = ?tick.platform,
+                bid = %tick.bid_price,
+                ask = %tick.ask_price,
+                mid = %mid,
+                bid_size = %tick.bid_size,
+                ask_size = %tick.ask_size,
+                "Tick received — running arb detection"
+            );
 
             // Update volatility before detection so the gate uses current vol multiplier
             self.detector.write().unwrap().update_volatility(market_id, mid);
@@ -80,7 +93,7 @@ impl MarketActor {
                     &self.registry.read().unwrap(),
                     &self.uob_shard,
                     &self.spread_engine.read().unwrap(),
-                    rust_decimal_macros::dec!(10.0)
+                    rust_decimal_macros::dec!(10_000.0) // Evaluate deep liquidity, sizing capped downstream by Kelly
                 )
             };
 
@@ -127,15 +140,49 @@ impl MarketActor {
                     };
 
                     let mut too_small = false;
-                    if matches!(opp.leg_a.platform, Platform::Polymarket | Platform::PolymarketUs) && (approved_size * opp.leg_a.price) < rust_decimal_macros::dec!(5.0) { too_small = true; }
-                    if matches!(opp.leg_b.platform, Platform::Polymarket | Platform::PolymarketUs) && (approved_size * opp.leg_b.price) < rust_decimal_macros::dec!(5.0) { too_small = true; }
-                    if too_small || approved_size <= rust_decimal::Decimal::ZERO { return; }
+                    let mut scaled_size = approved_size;
+                    
+                    if matches!(opp.leg_a.platform, Platform::Polymarket | Platform::PolymarketUs) {
+                        let required_usd = rust_decimal_macros::dec!(5.0);
+                        let current_usd = scaled_size * opp.leg_a.price;
+                        if current_usd < required_usd {
+                            let min_size = (required_usd / opp.leg_a.price).ceil();
+                            if min_size <= opp.recommended_size {
+                                scaled_size = scaled_size.max(min_size);
+                            } else {
+                                too_small = true;
+                            }
+                        }
+                    }
+                    if matches!(opp.leg_b.platform, Platform::Polymarket | Platform::PolymarketUs) {
+                        let required_usd = rust_decimal_macros::dec!(5.0);
+                        let current_usd = scaled_size * opp.leg_b.price;
+                        if current_usd < required_usd {
+                            let min_size = (required_usd / opp.leg_b.price).ceil();
+                            if min_size <= opp.recommended_size {
+                                scaled_size = scaled_size.max(min_size);
+                            } else {
+                                too_small = true;
+                            }
+                        }
+                    }
+                    
+                    // Re-apply Kalshi strict integer rule if size was scaled
+                    if opp.leg_a.platform == Platform::Kalshi || opp.leg_b.platform == Platform::Kalshi {
+                        scaled_size = scaled_size.ceil(); // round up to ensure we still meet the 5.0 minimum
+                    }
+
+                    if too_small || scaled_size <= rust_decimal::Decimal::ZERO { return; }
+                    
+                    // Use the potentially scaled size for circuit breakers and execution
+                    let approved_size = scaled_size;
 
                     // 3. Evaluate 10-Gate Circuit Breakers
+                    let combined_price = opp.leg_a.price + opp.leg_b.price;
                     let passed_cbs = {
                         let mut cb_guard = cbs.write().unwrap();
                         let params = CheckParams {
-                            trade_size: approved_size,
+                            trade_size: approved_size * combined_price, // Convert contracts to USD notional
                             bankroll: state.bankroll,
                             daily_loss_pct: state.daily_loss_pct,
                             drawdown_pct: state.drawdown_pct,
@@ -149,7 +196,15 @@ impl MarketActor {
                         cb_guard.check_all(&params).is_empty()
                     };
 
-                    if !passed_cbs { return; }
+                    if !passed_cbs {
+                        warn!(
+                            opp_id = %opp.opp_id,
+                            market_id = %opp.market_id,
+                            approved_size = %approved_size,
+                            "Opportunity BLOCKED by circuit breakers"
+                        );
+                        return;
+                    }
 
                     // 4. Reserve Exact Capital and Execute
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -165,19 +220,39 @@ impl MarketActor {
                         reply: reply_tx,
                     }).await;
 
-                    if let Ok(true) = reply_rx.await {
-                        // Immediately increment the trackers so the next check respects the new capacity
-                        open_positions.fetch_add(1, Ordering::Relaxed);
-                        in_flight_trades.fetch_add(1, Ordering::Relaxed);
-                        let validated = ValidatedOpportunity { 
-                            opportunity: opp, 
-                            approved_size, 
-                            risk_score 
-                        };
-                        if let Err(e) = exec_tx.try_send(validated) {
-                            tracing::warn!("Execution queue full, dropping opportunity: {}", e);
-                            open_positions.fetch_sub(1, Ordering::Relaxed);
-                            in_flight_trades.fetch_sub(1, Ordering::Relaxed);
+                    match reply_rx.await {
+                        Ok(true) => {
+                            // Immediately increment the trackers so the next check respects the new capacity
+                            open_positions.fetch_add(1, Ordering::Relaxed);
+                            in_flight_trades.fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                opp_id = %opp.opp_id,
+                                market_id = %opp.market_id,
+                                approved_size = %approved_size,
+                                risk_score = %risk_score,
+                                net_spread = %opp.net_spread,
+                                "Capital reserved — forwarding opportunity to executor"
+                            );
+                            let validated = ValidatedOpportunity {
+                                opportunity: opp,
+                                approved_size,
+                                risk_score
+                            };
+                            if let Err(e) = exec_tx.try_send(validated) {
+                                warn!("Execution queue full, dropping opportunity: {}", e);
+                                open_positions.fetch_sub(1, Ordering::Relaxed);
+                                in_flight_trades.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(false) => {
+                            warn!(
+                                opp_id = %opp.opp_id,
+                                approved_size = %approved_size,
+                                "Capital reservation DENIED by bankroll manager"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(opp_id = %opp.opp_id, error = %e, "Bankroll reply channel error");
                         }
                     }
                 });

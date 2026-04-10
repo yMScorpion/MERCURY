@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use tracing::{debug};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::engine::market_registry::MarketRegistry;
@@ -188,7 +188,10 @@ impl ArbitrageDetector {
 
         let pairs = match registry.get_arb_pairs_for_market(market_id) {
             Some(p) => p,
-            None => return opportunities,
+            None => {
+                debug!(market_id = %market_id, "No arb pairs registered for market — skipping detection");
+                return opportunities;
+            }
         };
 
         for pair in pairs {
@@ -285,7 +288,15 @@ impl ArbitrageDetector {
                         });
                     }
                     Err(reason) => {
-                        debug!(?reason, market_id = %spread.market_id, "Opportunity rejected");
+                        debug!(
+                            reason = ?reason,
+                            market_id = %spread.market_id,
+                            raw_spread = %spread.raw_spread,
+                            net_spread = %spread.net_spread,
+                            leg_a_platform = ?spread.leg_a_platform,
+                            leg_b_platform = ?spread.leg_b_platform,
+                            "Opportunity rejected by gate"
+                        );
                     }
                 }
             }
@@ -294,6 +305,23 @@ impl ArbitrageDetector {
         opportunities.sort_by(|a, b| b.score.cmp(&a.score));
         let slots = self.max_concurrent.saturating_sub(self.active_arbs.load(std::sync::atomic::Ordering::Relaxed));
         opportunities.truncate(slots);
+
+        if !opportunities.is_empty() {
+            for opp in &opportunities {
+                info!(
+                    market_id = %opp.market_id,
+                    net_spread = %opp.net_spread,
+                    raw_spread = %opp.raw_spread,
+                    score = %opp.score,
+                    leg_a = ?opp.leg_a.platform,
+                    leg_b = ?opp.leg_b.platform,
+                    leg_a_price = %opp.leg_a.price,
+                    leg_b_price = %opp.leg_b.price,
+                    available_size = %opp.recommended_size,
+                    "ARB OPPORTUNITY DETECTED — passing to execution pipeline"
+                );
+            }
+        }
 
         // M-9 FIX: Allocate strings only for the opportunities that actually made the cut
         for opp in &mut opportunities {
@@ -331,22 +359,28 @@ impl ArbitrageDetector {
         let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
         let now = now_ns();
 
-        let age_a = now.saturating_sub(book_a.last_update_ns);
-        if age_a > stale_timeout_ns {
-            self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(RejectionReason::StaleData {
-                age_ms: age_a / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
+        // Stale data check: only reject if the timestamp difference exceeds the timeout.
+        // We use platform_liveness to avoid punishing valid resting orders.
+        if self.platform_liveness.get(&Platform::Polymarket).map(|v| *v).unwrap_or(true) {
+            let age_a = now.saturating_sub(book_a.last_update_ns);
+            if age_a > stale_timeout_ns {
+                self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(RejectionReason::StaleData {
+                    age_ms: age_a / 1_000_000,
+                    max_ms: self.stale_timeout_ms,
+                });
+            }
         }
 
-        let age_b = now.saturating_sub(book_b.last_update_ns);
-        if age_b > stale_timeout_ns {
-            self.stats.gate3_rejected.fetch_add(1, Ordering::Relaxed);
-            return Err(RejectionReason::StaleData {
-                age_ms: age_b / 1_000_000,
-                max_ms: self.stale_timeout_ms,
-            });
+        if self.platform_liveness.get(&Platform::Kalshi).map(|v| *v).unwrap_or(true) {
+            let age_b = now.saturating_sub(book_b.last_update_ns);
+            if age_b > stale_timeout_ns {
+                self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(RejectionReason::StaleData {
+                    age_ms: age_b / 1_000_000,
+                    max_ms: self.stale_timeout_ms,
+                });
+            }
         }
 
         if confidence < 0.95 {

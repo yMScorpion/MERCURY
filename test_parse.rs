@@ -1,10 +1,29 @@
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    Polymarket,
+    Kalshi,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlatformMarketInfo {
+    pub platform: Platform,
+    pub platform_market_id: String,
+}
+
 fn main() {
-    let raw = r#"[{"question":"Test","clobTokenIds":["123","456"]}]"#;
-    let val: serde_json::Value = serde_json::from_str(raw).unwrap();
-    let item = val.as_array().unwrap().get(0).unwrap();
-    let raw_str = item.get("clobTokenIds").and_then(|v| v.as_str());
-    println!("as_str: {:?}", raw_str);
+    let mut map = HashMap::new();
+    map.insert(Platform::Polymarket, PlatformMarketInfo {
+        platform: Platform::Polymarket,
+        platform_market_id: "test".into(),
+    });
     
-    let arr = item.get("clobTokenIds").and_then(|v| v.as_array());
-    println!("as_array: {:?}", arr);
+    let json = serde_json::to_string(&map).unwrap();
+    println!("JSON: {}", json);
+    
+    let parsed: Result<HashMap<Platform, PlatformMarketInfo>, _> = serde_json::from_str(&json);
+    println!("Parsed: {:?}", parsed.is_ok());
 }

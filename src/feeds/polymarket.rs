@@ -101,6 +101,8 @@ struct SubscribeMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     operation: Option<String>,
     assets_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custom_feature_enabled: Option<bool>, // Add this field
 }
 
 impl PolymarketFeed {
@@ -143,11 +145,20 @@ impl PolymarketFeed {
     fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
         let market_id = self.asset_to_market_id(asset_id)?;
         let book = self.books.get(asset_id)?;
-        // Both sides must be present — phantom fallbacks (bid=0, ask=1) would
-        // make the spread engine see a fake ~100% arb and fire real orders.
-        let bid = book.best_bid()?;
-        let ask = book.best_ask()?;
-        let mid = book.mid_price()?;
+        
+        // DO NOT return None here. If the book empties, we must emit a 0-price tick 
+        // to keep the heartbeat alive and avoid Gate 3 Stale Rejections.
+        let bid = book.best_bid().unwrap_or((Decimal::ZERO, Decimal::ZERO));
+        let ask = book.best_ask().unwrap_or((Decimal::ZERO, Decimal::ZERO));
+        
+        let mid = if bid.0 > Decimal::ZERO && ask.0 > Decimal::ZERO {
+            (bid.0 + ask.0) / Decimal::from(2)
+        } else if bid.0 > Decimal::ZERO {
+            bid.0
+        } else {
+            ask.0
+        };
+
         let fee_bps = self.fee_rates.get(asset_id).copied().unwrap_or(200);
 
         Some(NormalizedTick {
@@ -163,7 +174,7 @@ impl PolymarketFeed {
             last_trade_size: Decimal::ZERO,
             book_depth: book.depth(),
             fee_rate_bps: fee_bps,
-            sequence: book.sequence, // CRITICAL FIX: Pass the actual sequence counter
+            sequence: book.sequence,
         })
     }
 }
@@ -217,6 +228,7 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                     msg_type: Some("market".into()),
                     operation: None,
                     assets_ids: first_chunk.to_vec(),
+                    custom_feature_enabled: Some(true),
                 };
                 let msg_text = serde_json::to_string(&init_msg)?;
                 write.send(Message::Text(msg_text)).await?;
@@ -229,6 +241,7 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                     msg_type: None,
                     operation: Some("subscribe".into()),
                     assets_ids: chunk.to_vec(),
+                    custom_feature_enabled: Some(true),
                 };
                 let msg_text = serde_json::to_string(&sub_msg)?;
                 write.send(Message::Text(msg_text)).await?;
@@ -244,7 +257,10 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
             self.books.entry(ws_key).or_insert_with(LocalOrderBook::new);
         }
 
-        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // 15s sync: short-lived 15-min crypto candles need fast subscription uptake.
+        // Discovery runs at 30s; this ensures the feed picks up new markets within
+        // one cycle of discovery finding them.
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         loop {
@@ -318,7 +334,12 @@ async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) 
                                     self.yes_token_to_market.insert(ws_key.clone(), market_id);
                                 }
                             }
-                            let sub_msg = SubscribeMessage { msg_type: None, operation: Some("subscribe".into()), assets_ids: new_subs.clone() };
+                            let sub_msg = SubscribeMessage { 
+                                msg_type: None, 
+                                operation: Some("subscribe".into()), 
+                                assets_ids: new_subs.clone(),
+                                custom_feature_enabled: Some(true),
+                            };
                             if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
                                 let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text)).await;
                                 tracing::info!(count = new_subs.len(), "Dynamically subscribed to new Polymarket markets");

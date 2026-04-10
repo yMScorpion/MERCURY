@@ -173,20 +173,32 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mercury_config = MercuryConfig::load(&cli.config)?;
     
-    // L-2 FIX: Structured JSON logging to file for production
+    // L-2 FIX: Dual logging — JSON to file for production, human-readable to stderr for live debugging
     let log_file_path = std::path::Path::new(&mercury_config.logging.file);
     let log_dir = log_file_path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let log_name = log_file_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("mercury.log"));
     let file_appender = tracing_appender::rolling::daily(log_dir, log_name);
-    let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(mercury_config.logging.level.parse().unwrap_or_else(|_| "mercury=info".parse().unwrap())),
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(mercury_config.logging.level.parse().unwrap_or_else(|_| "mercury=info,info".parse().unwrap()));
+
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(
+            // Stderr layer: human-readable for live monitoring
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_thread_names(false)
+                .with_writer(std::io::stderr)
         )
-        .with_writer(non_blocking_writer)
+        .with(
+            // File layer: structured JSON for log aggregation
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(non_blocking_file)
+        )
+        .with(env_filter)
         .init();
 
     info!("MERCURY v{} starting...", env!("CARGO_PKG_VERSION"));
@@ -627,7 +639,9 @@ async fn main() -> Result<()> {
     
     let discovery = feeds::discovery::MarketDiscovery::new(
         mercury_config.platforms.clone(),
-        60, // CRITICAL FIX: Poll every 60s to immediately catch new 15-minute crypto candles
+        30, // Poll every 30s: 15-minute candles are short-lived, and feeds resync their
+            // subscriptions on their own 60s timer, so we need discovery to run faster
+            // than the downstream consumers to keep the pipeline fed.
         kalshi_auth_for_discovery,
     );
     join_set.spawn(discovery.run(matched_market_tx));
@@ -881,14 +895,21 @@ async fn main() -> Result<()> {
                 } else {
                     let (tx, rx): (mpsc::Sender<NormalizedTick>, mpsc::Receiver<NormalizedTick>) = mpsc::channel(100);
                     market_channels.insert(tick.market_id, tx.clone());
-                    
+
+                    info!(
+                        market_id = %tick.market_id,
+                        platform = ?tick.platform,
+                        active_actors = market_channels.len(),
+                        "First tick for market — spawning MarketActor"
+                    );
+
                     let shared_registry = registry.clone(); // Pass the Arc directly, no expensive deep copies
-                    
+
                     engine::market_actor::MarketActor::spawn(
                         tick.market_id,
                         rx,
                         opportunity_tx.clone(),
-                        detector.clone(), 
+                        detector.clone(),
                         spread_engine.clone(),
                         bankroll_handle.clone(),
                         shared_registry,
@@ -898,7 +919,7 @@ async fn main() -> Result<()> {
                         in_flight_trades.clone(),
                         metrics.clone()
                     );
-                    
+
                     let _ = tx.try_send(tick);
                 }
             }
@@ -906,17 +927,24 @@ async fn main() -> Result<()> {
             // ── Market Discovery Results ──
             Some(matched) = matched_market_rx.recv() => {
                     let market_id = matched.market.unified_id;
-                    if registry.read().unwrap().get_market(&market_id).is_some() {
+                    let is_update = registry.read().unwrap().get_market(&market_id).is_some();
+                    if is_update {
+                        // Market already known — skip (discovery is idempotent)
                         continue;
                     }
                     {
+                        let status = matched.market.status;
+                        let confidence = matched.market.confidence;
+                        let platform_names: Vec<_> = matched.market.platforms.keys().collect();
                         info!(
                             market_id = %market_id,
                             question = %matched.market.question,
-                            platforms = matched.market.platforms.len(),
-                            "New cross-platform market registered"
+                            platforms = ?platform_names,
+                            status = ?status,
+                            confidence,
+                            "NEW cross-platform market discovered and registered"
                         );
-                        
+
                         let db_clone = db.clone();
                         let market_clone = matched.market.clone();
                         tokio::spawn(async move {
@@ -924,8 +952,16 @@ async fn main() -> Result<()> {
                                 tracing::error!(error = %e, "Failed to persist new market");
                             }
                         });
-                        
-                        registry.write().unwrap().register_market(matched.market);
+
+                        let mut reg = registry.write().unwrap();
+                        reg.register_market(matched.market);
+                        let total_markets = reg.market_count();
+                        let total_arb_pairs = reg.arb_pair_count();
+                        info!(
+                            total_markets,
+                            total_arb_pairs,
+                            "Registry updated — arb pairs available for trading"
+                        );
                     }
                 }
 
@@ -1021,13 +1057,16 @@ async fn main() -> Result<()> {
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
                 let evicted_markets = registry.write().unwrap().evict_stale_markets();
-                for id in evicted_markets {
-                    if let Some(sender) = market_channels.remove(&id) {
+                for id in &evicted_markets {
+                    if let Some(sender) = market_channels.remove(id) {
                         tracing::info!(market_id = %id, "Evicting stale market — closing actor channel");
                         drop(sender); // Closing the sender causes the MarketActor's recv() to return None, ending its loop
                     }
                 }
-                
+                if !evicted_markets.is_empty() {
+                    tracing::info!(count = evicted_markets.len(), "Evicted stale/expired markets from registry");
+                }
+
                 if let Ok(count) = db.get_open_arb_count().await {
                     // DB count is ground truth for settled positions. In-flight trades are tracked
                     // separately by in_flight_trades counter. We deliberately do NOT add in_flight
@@ -1037,7 +1076,7 @@ async fn main() -> Result<()> {
                     let total = count.saturating_add(current_in_flight);
                     cached_open_positions.store(total, Ordering::Relaxed);
                 }
-                
+
                 let (detected, passed, gate1, gate2, gate3, gate4, gate5) = {
                     let guard = detector.read().unwrap();
                     (
@@ -1050,16 +1089,46 @@ async fn main() -> Result<()> {
                         guard.stats.gate5_rejected.load(std::sync::atomic::Ordering::Relaxed),
                     )
                 };
+
+                // Log registry state: how many markets and arb pairs are live
+                let (registry_markets, registry_arb_pairs, registry_actors) = {
+                    let reg = registry.read().unwrap();
+                    (reg.market_count(), reg.arb_pair_count(), market_channels.len())
+                };
+
+                let open_pos = cached_open_positions.load(Ordering::Relaxed);
+                let in_flight = in_flight_trades.load(Ordering::Relaxed);
+                let current_kelly = kelly.read().unwrap().fraction();
+                let snapshot = bankroll_handle.get_snapshot(current_kelly).await;
+
                 tracing::info!(
-                    detected = detected,
-                    passed = passed,
-                    gate1_spread = gate1,
-                    gate2_liquidity = gate2,
-                    gate3_stale = gate3,
-                    gate4_correlation = gate4,
+                    // Registry / pipeline state
+                    registered_markets = registry_markets,
+                    arb_pairs = registry_arb_pairs,
+                    active_actors = registry_actors,
+                    open_positions = open_pos,
+                    in_flight_trades = in_flight,
+                    bankroll = %snapshot.bankroll,
+                    daily_pnl = %snapshot.net_pnl,
+                    // Detector gate stats
+                    opps_detected = detected,
+                    opps_passed = passed,
+                    gate1_below_spread = gate1,
+                    gate2_low_liquidity = gate2,
+                    gate3_stale_data = gate3,
+                    gate4_low_confidence = gate4,
                     gate5_capacity = gate5,
-                    "Detector pipeline statistics"
+                    "=== MERCURY STATUS ==="
                 );
+
+                if registry_markets == 0 {
+                    tracing::warn!("Registry has 0 markets — discovery has not produced matches yet. Check API connectivity and Jaccard similarity thresholds.");
+                } else if registry_actors == 0 {
+                    tracing::warn!(
+                        registered_markets = registry_markets,
+                        "No active MarketActors — feeds have not sent any ticks yet. Check WebSocket connections."
+                    );
+                }
             }
 
             // ── Daily Report ──

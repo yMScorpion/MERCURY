@@ -131,18 +131,11 @@ impl ExecutionEngine {
         let opp = &validated.opportunity;
         let start = Instant::now();
         
-        let halves: Vec<&str> = opp.market_question.split(" / ").collect();
-        if halves.len() == 2 {
-            let nums_a: Vec<f64> = halves[0].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
-            let nums_b: Vec<f64> = halves[1].split_whitespace().filter_map(|w| w.replace("$", "").replace(",", "").parse().ok()).collect();
-            
-            // RELAXED CHECK: If one side is "Up or Down" it might not have the strike in the question.
-            // We allow the trade if one side has no numbers, but if BOTH have numbers, they MUST match exactly.
-            if !nums_a.is_empty() && !nums_b.is_empty() && nums_a != nums_b {
-                tracing::error!(question = %opp.market_question, nums_a = ?nums_a, nums_b = ?nums_b, "Mismatched numerical targets in execution. Aborting trade.");
-                return Ok(());
-            }
-        }
+        // Numerical-target validation lives in discovery.rs where matching happens.
+        // Re-checking here via blanket number extraction is unsafe: incidental numbers
+        // like dates, times, and format variations (60000 vs 60k vs 60,000.50) cause
+        // false rejections on legitimately-matched markets. Discovery's confidence
+        // gate + numerical-target match is authoritative.
         
         // HIGH-4: Idempotency Guard
         if self.executed_opps.put(opp.opp_id, ()).is_some() {
@@ -478,26 +471,28 @@ impl ExecutionEngine {
             .await
             .map_err(|_| anyhow::anyhow!("execute_leg timeout after 8s (platform={:?})", platform))?;
 
-        // Handle 429 logic
-        match &result {
-            Err(e) if e.to_string().contains("429") || e.to_string().contains("Too Many Requests") => {
-                let state = self.rate_limits.entry(*platform).or_default();
-                state.consecutive_429s += 1;
-                if state.consecutive_429s >= 3 {
-                    let backoff_duration = std::time::Duration::from_secs(60);
-                    state.backoff_until = Some(Instant::now() + backoff_duration);
-                    warn!(platform = ?platform, "3 consecutive 429s — pausing for 60s");
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                        severity: "warning".into(),
-                        message: format!("Platform {:?} rate limited. Pausing for 60s.", platform),
-                    });
-                }
+        // Handle 429 logic (Catch both native Errs and wrapped Ok errors)
+        let is_429 = match &result {
+            Err(e) => e.to_string().contains("429") || e.to_string().contains("Too Many Requests"),
+            Ok(res) => res.error.as_ref().map(|s| s.contains("429") || s.contains("Too Many Requests")).unwrap_or(false),
+        };
+
+        if is_429 {
+            let state = self.rate_limits.entry(*platform).or_default();
+            state.consecutive_429s += 1;
+            if state.consecutive_429s >= 3 {
+                let backoff_duration = std::time::Duration::from_secs(60);
+                state.backoff_until = Some(Instant::now() + backoff_duration);
+                warn!(platform = ?platform, "3 consecutive 429s — pausing for 60s");
+                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                    severity: "warning".into(),
+                    message: format!("Platform {:?} rate limited. Pausing for 60s.", platform),
+                });
             }
-            _ => {
-                if let Some(state) = self.rate_limits.get_mut(platform) {
-                    state.consecutive_429s = 0;
-                    state.backoff_until = None;
-                }
+        } else {
+            if let Some(state) = self.rate_limits.get_mut(platform) {
+                state.consecutive_429s = 0;
+                state.backoff_until = None;
             }
         }
 

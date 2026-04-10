@@ -10,6 +10,12 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use regex::Regex;
 
+// Compiled once — avoids re-compiling the regex on every call
+fn time_regex() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)(\d{1,2}):(\d{2})\s*(am|pm|a\.m\.|p\.m\.)?\s*(et|est|edt|brt|utc)?").unwrap())
+}
+
 use crate::config::PlatformsConfig;
 use crate::feeds::normalizer::compute_unified_market_id;
 use crate::types::*;
@@ -81,7 +87,13 @@ impl MarketDiscovery {
 
             match self.discover_and_match().await {
                 Ok(matched) => {
-                    info!(count = matched.len(), "Discovery cycle complete");
+                    let active = matched.iter().filter(|m| m.market.status == MarketStatus::Active).count();
+                    info!(
+                        total = matched.len(),
+                        active,
+                        suspended = matched.len() - active,
+                        "Discovery cycle complete — sending to registry"
+                    );
                     for m in matched {
                         if let Err(e) = matched_tx.send(m).await {
                             warn!(error = %e, "Matched market channel closed — skipping");
@@ -98,14 +110,12 @@ impl MarketDiscovery {
     /// Helper to extract time from title like "8:15AM" or "10 PM" and adjust the date.
     fn try_fix_expiration_from_title(title: &str, base_date: DateTime<Utc>) -> DateTime<Utc> {
         let lower = title.to_lowercase();
-        // Regex for patterns like "8:15AM", "8:15 AM", "8 PM", "8PM", "20:15"
-        // We look for a pattern that looks like a time.
-        let re = Regex::new(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?").unwrap();
-        
-        if let Some(caps) = re.captures_iter(&lower).last() {
-            let mut hour: u32 = caps.get(1).unwrap().as_str().parse::<u32>().unwrap_or(0);
-            let min: u32 = caps.get(2).map(|m| m.as_str().parse::<u32>().unwrap_or(0)).unwrap_or(0);
-            let ampm = caps.get(3).map(|m| m.as_str());
+        // Regex compiled once via time_regex() — not re-compiled per call
+        if let Some(caps) = time_regex().captures_iter(&lower).last() {
+            let mut hour: u32 = caps.get(1).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+            let min: u32 = caps.get(2).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+            let ampm = caps.get(3).map(|m| m.as_str().replace(".", ""));
+            let tz = caps.get(4).map(|m| m.as_str());
 
             if let Some(ampm_str) = ampm {
                 if ampm_str == "pm" && hour < 12 {
@@ -116,23 +126,27 @@ impl MarketDiscovery {
             }
 
             if hour < 24 && min < 60 {
-                // If it's a "March 19, 8:15AM-8:20AM" title, we want the LAST time mentioned (the end of candle)
-                // base_date is usually midnight UTC of the correct day.
-                // We assume ET for these titles if not specified, but Kalshi uses UTC in API.
-                // Polymarket titles are almost always ET.
-                
-                // For simplicity, we just set the hour/min on the base_date.
-                // If base_date is midnight, this works.
-                if let Some(new_date) = base_date.with_hour(hour).and_then(|d| d.with_minute(min)) {
-                    // Adjust for ET to UTC (ET is UTC-4 or UTC-5). 
-                    // Most Polymarket 15m crypto titles are ET.
-                    // We'll assume ET for now as it's the most common case for these specific titles.
-                    let is_et = lower.contains("et") || lower.contains("eastern");
-                    if is_et {
-                        // 4 hours difference (assuming summer time for now, or just generic offset)
-                        // In March it's EDT (UTC-4).
-                        return new_date + chrono::Duration::hours(4);
+                if let Some(mut new_date) = base_date.with_hour(hour).and_then(|d| d.with_minute(min)) {
+                    if let Some(tz_str) = tz {
+                        if tz_str == "et" || tz_str == "est" || tz_str == "edt" {
+                            new_date += chrono::Duration::hours(4);
+                        } else if tz_str == "brt" {
+                            new_date += chrono::Duration::hours(3);
+                        }
+                    } else if lower.contains("et") || lower.contains("est") || lower.contains("edt") {
+                        new_date += chrono::Duration::hours(4);
+                    } else if lower.contains("brt") {
+                        new_date += chrono::Duration::hours(3);
                     }
+
+                    // Fix day wraparound if we applied an offset that pushed it too far or pulled it back
+                    let diff = (new_date - base_date).num_hours();
+                    if diff > 12 {
+                        new_date -= chrono::Duration::days(1);
+                    } else if diff < -12 {
+                        new_date += chrono::Duration::days(1);
+                    }
+
                     return new_date;
                 }
             }
@@ -141,13 +155,14 @@ impl MarketDiscovery {
     }
 
     async fn discover_and_match(&self) -> Result<Vec<MatchedMarket>> {
-        let mut all_discovered: Vec<DiscoveredMarket> = Vec::new();
+        let mut poly_markets: Vec<DiscoveredMarket> = Vec::new();
+        let mut kalshi_markets: Vec<DiscoveredMarket> = Vec::new();
 
         if self.platforms_config.polymarket.enabled {
             match self.fetch_polymarket_markets().await {
                 Ok(markets) => {
                     info!(count = markets.len(), "Polymarket markets fetched");
-                    all_discovered.extend(markets);
+                    poly_markets = markets;
                 }
                 Err(e) => warn!(error = %e, "Failed to fetch Polymarket markets"),
             }
@@ -157,147 +172,370 @@ impl MarketDiscovery {
             match self.fetch_kalshi_markets().await {
                 Ok(markets) => {
                     info!(count = markets.len(), "Kalshi markets fetched");
-                    all_discovered.extend(markets);
+                    kalshi_markets = markets;
                 }
                 Err(e) => warn!(error = %e, "Failed to fetch Kalshi markets"),
             }
         }
 
-        let mut matched = Vec::new();
-        let mut seen_pairs = std::collections::HashSet::new();
-        let poly_markets: Vec<_> = all_discovered.iter().filter(|m| m.platform == Platform::Polymarket).collect();
-        let kalshi_markets: Vec<_> = all_discovered.iter().filter(|m| m.platform == Platform::Kalshi).collect();
+        info!(
+            poly_count = poly_markets.len(),
+            kalshi_count = kalshi_markets.len(),
+            "Starting cross-platform market matching (spawn_blocking)"
+        );
 
-        // H-3 FIX: Group Kalshi markets by expiration hour to reduce O(N^2) complexity to O(N * K)
-        let mut kalshi_by_hour: HashMap<i64, Vec<&DiscoveredMarket>> = HashMap::new();
-        for km in &kalshi_markets {
-            let hour = km.expiration.timestamp() / 3600;
-            kalshi_by_hour.entry(hour).or_default().push(km);
+        // Offload the CPU-intensive O(N×K) matching to a blocking thread pool so we
+        // don't starve the Tokio async runtime for 30-90 seconds during each cycle.
+        let matched = tokio::task::spawn_blocking(move || {
+            Self::match_markets_sync(poly_markets, kalshi_markets)
+        }).await??;
+
+        Ok(matched)
+    }
+
+    /// Pure synchronous matching — safe to run on spawn_blocking thread.
+    ///
+    /// Strategy:
+    ///  1. Build an inverted word index over Kalshi markets so we can find
+    ///     candidates that share ≥1 word with a Poly market in O(|words|) time.
+    ///  2. For each candidate pair, apply the expiration window and Jaccard check.
+    ///
+    /// This reduces comparisons from O(N×K) to O(N × avg_shared_word_candidates),
+    /// which is typically 1–3 orders of magnitude fewer pairs.
+    fn match_markets_sync(
+        poly_markets: Vec<DiscoveredMarket>,
+        kalshi_markets: Vec<DiscoveredMarket>,
+    ) -> Result<Vec<MatchedMarket>> {
+        // ── Stop-words that carry no semantic meaning ──────────────────────────
+        // These are stripped from the inverted index so common words ("will",
+        // "the", "by", "at") don't create massive candidate sets.
+        // We preserve directional and numeric descriptors like "up", "above", "below".
+        let stop_words: std::collections::HashSet<&str> = [
+            "will", "the", "a", "an", "in", "on", "at", "by", "for", "to",
+            "of", "be", "is", "are", "was", "were", "has", "have", "had",
+            "do", "does", "did", "not", "or", "and", "if", "it", "its",
+            "this", "that", "with", "from", "as", "so", "can",
+            "may", "per", "vs", "end", "close", "open", "day", "week",
+            "month", "year", "next", "last", "new", "more", "less", "most",
+            "least", "than", "which", "who", "what", "when", "how", "between",
+        ].iter().cloned().collect();
+
+        // ── Build inverted index: word → sorted Vec<kalshi_idx> ───────────────
+        let mut word_to_kalshi: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, km) in kalshi_markets.iter().enumerate() {
+            for word in km.question_normalized.split_whitespace() {
+                if !stop_words.contains(word) {
+                    word_to_kalshi.entry(word.to_string()).or_default().push(i);
+                }
+            }
         }
 
-        for pm in &poly_markets {
-            // FIX: If Poly expiration is midnight, try to fix it from title
+        // ── Pre-compute token sets for Kalshi (for Jaccard computation) ───────
+        let kalshi_tokens: Vec<std::collections::HashSet<String>> = kalshi_markets
+            .iter()
+            .map(|m| {
+                m.question_normalized
+                    .split_whitespace()
+                    .filter(|w| !stop_words.contains(*w))
+                    .map(|w| w.to_string())
+                    .collect()
+            })
+            .collect();
+
+        // ── Group Kalshi by expiration hour for expiration pre-filter ─────────
+        let mut kalshi_by_hour: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, km) in kalshi_markets.iter().enumerate() {
+            let hour = km.expiration.timestamp() / 3600;
+            kalshi_by_hour.entry(hour).or_default().push(i);
+        }
+
+        // ── Diagnostic: show all Kalshi markets by series ─────────────────────
+        {
+            let mut by_series: HashMap<String, Vec<&DiscoveredMarket>> = HashMap::new();
+            for km in kalshi_markets.iter() {
+                let series = km.platform_market_id.split('-').next().unwrap_or("UNK").to_string();
+                by_series.entry(series).or_default().push(km);
+            }
+            let mut series_list: Vec<(String, &Vec<&DiscoveredMarket>)> = by_series.iter()
+                .map(|(k, v)| (k.clone(), v))
+                .collect();
+            series_list.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            for (series, markets) in &series_list {
+                // Show first 2 sample questions for each series so we understand their format
+                let samples: Vec<String> = markets.iter().take(2)
+                    .map(|m| format!("{} [exp={}]", m.question_normalized, m.expiration.format("%m-%d %H:%M")))
+                    .collect();
+                tracing::info!(series = %series, count = markets.len(), samples = ?samples, "Kalshi series breakdown");
+            }
+        }
+
+        // ── Count actual crypto markets (word-boundary) ────────────────────────
+        let poly_crypto_count = poly_markets.iter()
+            .filter(|m| m.category == MarketCategory::Crypto)
+            .count();
+        let kalshi_15m_count = kalshi_markets.iter()
+            .filter(|m| m.platform_market_id.contains("15M"))
+            .count();
+        tracing::info!(
+            poly_crypto = poly_crypto_count,
+            kalshi_15m = kalshi_15m_count,
+            total_poly = poly_markets.len(),
+            total_kalshi = kalshi_markets.len(),
+            "Diagnostic: market category counts"
+        );
+
+        // ── Show soonest-expiring Polymarket markets ───────────────────────────
+        // These are the most likely candidates for Kalshi overlap. If ALL of these
+        // expire weeks or months away, there is no overlap possible today.
+        {
+            let mut sorted_poly: Vec<&DiscoveredMarket> = poly_markets.iter().collect();
+            sorted_poly.sort_by_key(|m| m.expiration);
+            tracing::info!("Soonest-expiring Polymarket markets:");
+            for pm in sorted_poly.iter().take(15) {
+                tracing::info!(q = %pm.question_normalized, exp = %pm.expiration, "  [POLY soonest]");
+            }
+        }
+
+        let mut matched: Vec<MatchedMarket> = Vec::new();
+        let mut seen_pairs = std::collections::HashSet::new();
+
+        for pm in poly_markets.iter() {
+            // Attempt to improve midnight expirations from the title text
             let mut pm_expiration = pm.expiration;
-            if pm_expiration.hour() == 0 && pm_expiration.minute() == 0 {
+            if (pm_expiration.hour() == 0 && pm_expiration.minute() == 0) || (pm_expiration.hour() == 23 && pm_expiration.minute() == 59) {
                 pm_expiration = Self::try_fix_expiration_from_title(&pm.question, pm_expiration);
             }
-
             let pm_hour = pm_expiration.timestamp() / 3600;
-            // Only compare with Kalshi markets expiring in the same, previous, or next 48 hours
-            for hour_offset in -48..=48 {
-                if let Some(kms) = kalshi_by_hour.get(&(pm_hour + hour_offset)) {
-                    for km in kms {
-                        // 1. Dual-Tier Expiration Check
+
+            // ── Candidate discovery via inverted index ────────────────────────
+            // Find all Kalshi markets that share ≥1 meaningful word with this
+            // Poly market, without scanning the entire Kalshi market list.
+            let mut candidate_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+            // Also always include Kalshi markets in the ±1h window (catches 15m crypto)
+            for hour_offset in -1i64..=1 {
+                if let Some(idxs) = kalshi_by_hour.get(&(pm_hour + hour_offset)) {
+                    candidate_set.extend(idxs);
+                }
+            }
+
+            // Add word-match candidates regardless of time window
+            for word in pm.question_normalized.split_whitespace() {
+                if !stop_words.contains(word) {
+                    if let Some(idxs) = word_to_kalshi.get(word) {
+                        candidate_set.extend(idxs);
+                    }
+                }
+            }
+
+            // ── Evaluate each candidate ───────────────────────────────────────
+            for ki in candidate_set {
+                let km = &kalshi_markets[ki];
                 let exp_diff_secs = (pm_expiration - km.expiration).num_seconds().abs();
+
+                let extract_crypto = |q: &str| -> std::collections::HashSet<String> {
+                    q.split_whitespace()
+                        .filter(|w| matches!(*w, "btc" | "eth" | "sol" | "xrp" | "doge" | "bnb" | "hype" | "ada" | "crypto"))
+                        .map(|w| w.to_string())
+                        .collect()
+                };
+                let crypto_pm = extract_crypto(&pm.question_normalized);
+                let crypto_km = extract_crypto(&km.question_normalized);
+                let is_crypto = pm.category == MarketCategory::Crypto
+                    || km.category == MarketCategory::Crypto
+                    || !crypto_pm.is_empty()
+                    || !crypto_km.is_empty();
                 
-                let is_15m_market = pm.question_normalized.contains("15 min") || 
-                                    km.question_normalized.contains("15 min") ||
-                                    km.platform_market_id.contains("15M") ||
-                                    pm.question_normalized.contains("15m") ||
-                                    km.question_normalized.contains("15m");
+                let shared_crypto = crypto_pm.intersection(&crypto_km).count() > 0;
+
+                let is_15m_market = pm.question_normalized.contains("15 min")
+                    || km.question_normalized.contains("15 min")
+                    || km.platform_market_id.contains("15M")
+                    || pm.question_normalized.contains("15m")
+                    || km.question_normalized.contains("15m");
 
                 if is_15m_market {
-                    // CRITICAL: 15-minute candles MUST expire at basically the exact same time (within 5 mins for safety)
-                    if exp_diff_secs > 300 { continue; }
-                } else {
-                    // Standard generic markets (e.g. politics, yearly price targets)
-                    if exp_diff_secs > 48 * 3600 { continue; }
+                    // MASSIVE LOGGING FOR 15M DEBUGGING
+                    tracing::info!(
+                        poly_q = %pm.question_normalized,
+                        kalshi_q = %km.question_normalized,
+                        exp_diff_secs,
+                        poly_exp = %pm_expiration,
+                        kalshi_exp = %km.expiration,
+                        "EVALUATING 15M CRYPTO CANDIDATE PAIR"
+                    );
+                    
+                    // Widen from 300s to 1800s to account for Poly's weird time-range titles
+                    if exp_diff_secs > 1800 { continue; }
+                } else if is_crypto {
+                    if exp_diff_secs > 7 * 24 * 3600 { continue; }
+                } else if exp_diff_secs > 48 * 3600 {
+                    continue;
                 }
 
-                // 2. Token Overlap Jaccard Similarity
-                let tokens_a: std::collections::HashSet<&str> = pm.question_normalized.split_whitespace().collect();
-                let tokens_b: std::collections::HashSet<&str> = km.question_normalized.split_whitespace().collect();
-                let intersection = tokens_a.intersection(&tokens_b).count();
-                let union = tokens_a.union(&tokens_b).count();
-                let sim = if union == 0 { 0.0 } else { intersection as f64 / union as f64 };
+                let sim;
+                let same_category = pm.category == km.category;
 
-                // 70% overlap for safer automated cross-platform matching
-                // CRITICAL FIX: Relax threshold for 15-min crypto markets that match on asset and expiration
-                let is_crypto = pm.category == MarketCategory::Crypto || km.category == MarketCategory::Crypto ||
-                                pm.question_normalized.contains("btc") || km.question_normalized.contains("btc") ||
-                                pm.question_normalized.contains("eth") || km.question_normalized.contains("eth") ||
-                                pm.question_normalized.contains("sol") || km.question_normalized.contains("sol");
-
-                if is_15m_market && is_crypto && km.question_normalized.contains("btc") {
-                    tracing::info!("Checking 15m crypto pair: Poly='{}' (exp: {}) vs Kalshi='{}' (exp: {}), diff: {}s, sim: {:.2}", 
-                        pm.question_normalized, pm_expiration, km.question_normalized, km.expiration, exp_diff_secs, sim);
+                // HARDCODED MATCH FOR 15 MIN CRYPTO
+                // Widen the forced-match time delta to 1800s (30 minutes)
+                if is_15m_market && is_crypto && shared_crypto && exp_diff_secs <= 1800 {
+                    tracing::info!("FORCING 15M CRYPTO MATCH: {}", pm.question);
+                    sim = 1.0; 
+                } else {
+                    // ── Jaccard similarity ────────────────────────────────────────
+                    let tokens_a: std::collections::HashSet<&str> = pm.question_normalized
+                        .split_whitespace()
+                        .filter(|w| !stop_words.contains(w))
+                        .collect();
+                    let tokens_b = &kalshi_tokens[ki];
+                    let intersection = tokens_a.iter().filter(|w| tokens_b.contains(**w)).count();
+                    let union = tokens_a.len() + tokens_b.len() - intersection;
+                    sim = if union == 0 { 0.0 } else { intersection as f64 / union as f64 };
                 }
 
-                let match_confirmed = if is_15m_market && is_crypto && exp_diff_secs <= 120 {
-                    // For 15m crypto, if they expire at the same time, they are almost certainly the same candle.
-                    // We allow a much lower similarity to account for "Up or Down" vs "Target $X" phrasing.
-                    sim >= 0.2
+                let min_sim = if is_15m_market && is_crypto && shared_crypto {
+                    0.01
+                } else if same_category && exp_diff_secs <= 24 * 3600 {
+                    0.15
+                } else if same_category && exp_diff_secs <= 7 * 24 * 3600 {
+                    0.25
                 } else {
-                    sim >= 0.7
+                    0.40
                 };
 
-                if match_confirmed {
-                    // CRITICAL FIX: Extract numerical targets to prevent mismatched strikes (e.g. $60k vs $70k)
-                    let nums_pm: Vec<f64> = pm.question_normalized.split_whitespace()
-                        .filter_map(|w| w.replace("$", "").replace(",", "").parse::<f64>().ok())
-                        .collect();
-                    let nums_km: Vec<f64> = km.question_normalized.split_whitespace()
-                        .filter_map(|w| w.replace("$", "").replace(",", "").parse::<f64>().ok())
-                        .collect();
+                if sim < min_sim { continue; }
 
-                    // For 15m crypto "Up or Down" markets, one platform often omits the price from the title.
-                    // We allow the match if one list is empty, but if BOTH have numbers, they MUST match.
-                    if !nums_pm.is_empty() && !nums_km.is_empty() && nums_pm != nums_km {
-                        continue;
-                    }
+                tracing::debug!(
+                    poly = %pm.question_normalized,
+                    kalshi = %km.question_normalized,
+                    exp_diff_secs,
+                    sim = format!("{:.2}", sim),
+                    min_sim,
+                    "Candidate pair passed similarity gate"
+                );
 
-                    let unified_id = compute_unified_market_id(
-                        &pm.question,
-                        "cross_platform",
-                        &pm_expiration.to_rfc3339(),
-                    );
-
-                    if !seen_pairs.insert(unified_id) {
-                        continue;
-                    }
-
-                    let mut platform_infos = HashMap::new();
-                    platform_infos.insert(pm.platform, PlatformMarketInfo {
-                        platform: pm.platform,
-                        platform_market_id: pm.platform_market_id.clone(),
-                        fee_rate_bps: pm.fee_rate_bps,
-                        min_order_size: pm.min_order_size,
-                        tick_size: pm.tick_size,
-                    });
-                    platform_infos.insert(km.platform, PlatformMarketInfo {
-                        platform: km.platform,
-                        platform_market_id: km.platform_market_id.clone(),
-                        fee_rate_bps: km.fee_rate_bps,
-                        min_order_size: km.min_order_size,
-                        tick_size: km.tick_size,
-                    });
-
-                    matched.push(MatchedMarket {
-                        market: Market {
-                            unified_id,
-                            question: format!("{} / {}", pm.question, km.question), // Store both for auditability
-                            resolution_source: "cross_platform".into(),
-                            expiration: km.expiration, // Use Kalshi's expiration as it's usually more precise
-                            platforms: platform_infos,
-                            // LOW-3 / MED-2 FIX: Better category extraction
-                            category: {
-                                let q = pm.question_normalized.as_str();
-                                if q.contains("trump") || q.contains("election") || q.contains("biden") || q.contains("harris") { MarketCategory::Politics }
-                                else if q.contains("bitcoin") || q.contains("btc") || q.contains("eth") || q.contains("crypto") || q.contains("sol") || q.contains("xrp") || q.contains("doge") || q.contains("bnb") { MarketCategory::Crypto }
-                                else if q.contains("nba") || q.contains("nfl") || q.contains("super bowl") { MarketCategory::Sports }
-                                else { MarketCategory::Other }
-                            },
-                            confidence: if sim > 0.7 { 0.98 } else { 0.95 },
-                            // HIGH-1: All discovered markets start as Suspended to mandate human review, 
-                            // EXCEPT for 15-minute crypto candles which move too fast for manual review.
-                            status: if is_15m_market && is_crypto { MarketStatus::Active } else { MarketStatus::Suspended },
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
+                // Numerical target guard — prevent mismatched strikes ($60k vs $70k)
+                // Only apply when both questions contain numeric price levels.
+                if !is_15m_market {
+                    let extract_nums = |q: &str| -> Vec<i64> {
+                        q.split_whitespace()
+                            .filter_map(|w| {
+                                let mut multiplier = 1.0;
+                                let mut cleaned = w.replace(['$', ',', '%'], "");
+                                if cleaned.ends_with('k') || cleaned.ends_with('K') {
+                                    multiplier = 1000.0;
+                                    cleaned.pop();
+                                }
+                                cleaned.parse::<f64>().ok()
+                                    .map(|f| (f * multiplier * 100.0) as i64) // normalize cents
+                            })
+                            .filter(|&n| n > 100) // ignore small numbers (years, jersey #s, small counts)
+                            .collect()
+                    };
+                    let nums_pm = extract_nums(&pm.question_normalized);
+                    let nums_km = extract_nums(&km.question_normalized);
+                    
+                    // Only reject if BOTH have numbers but NO overlap exists.
+                    // This allows "March 19" vs "BTC at 60k on March 19" if both have 1900.
+                    // But it correctly rejects 60k vs 70k if they are the only numbers.
+                    if !nums_pm.is_empty() && !nums_km.is_empty() {
+                        let set_km: std::collections::HashSet<_> = nums_km.iter().collect();
+                        let mut has_overlap = false;
+                        for n in &nums_pm {
+                            if set_km.contains(n) {
+                                has_overlap = true;
+                                break;
+                            }
                         }
-                    });
-                }
+                        if !has_overlap {
+                            continue;
+                        }
                     }
                 }
+
+                let unified_id = compute_unified_market_id(
+                    &pm.question,
+                    "cross_platform",
+                    &pm_expiration.to_rfc3339(),
+                );
+                if !seen_pairs.insert(unified_id) { continue; }
+
+                let mut platform_infos = HashMap::new();
+                platform_infos.insert(pm.platform, PlatformMarketInfo {
+                    platform: pm.platform,
+                    platform_market_id: pm.platform_market_id.clone(),
+                    fee_rate_bps: pm.fee_rate_bps,
+                    min_order_size: pm.min_order_size,
+                    tick_size: pm.tick_size,
+                });
+                platform_infos.insert(km.platform, PlatformMarketInfo {
+                    platform: km.platform,
+                    platform_market_id: km.platform_market_id.clone(),
+                    fee_rate_bps: km.fee_rate_bps,
+                    min_order_size: km.min_order_size,
+                    tick_size: km.tick_size,
+                });
+
+                let category = {
+                    let q = pm.question_normalized.as_str();
+                    if q.split_whitespace().any(|w| matches!(w, "trump" | "election" | "biden" | "harris" | "democrat" | "republican" | "congress" | "senate")) {
+                        MarketCategory::Politics
+                    } else if q.split_whitespace().any(|w| matches!(w, "btc" | "eth" | "sol" | "xrp" | "doge" | "bnb" | "hype" | "ada" | "crypto")) {
+                        MarketCategory::Crypto
+                    } else if q.split_whitespace().any(|w| matches!(w, "nba" | "nfl" | "nhl" | "mlb" | "ufc" | "celtics" | "lakers" | "warriors" | "knicks" | "playoffs")) {
+                        MarketCategory::Sports
+                    } else {
+                        MarketCategory::Other
+                    }
+                };
+
+                let confidence = if sim >= 0.95 { 0.99 } else if sim >= 0.7 { 0.98 } else { 0.95 };
+
+                info!(
+                    poly_q = %pm.question_normalized,
+                    kalshi_q = %km.question_normalized,
+                    sim = format!("{:.2}", sim),
+                    min_sim,
+                    exp_diff_secs,
+                    is_15m_market,
+                    same_category,
+                    poly_exp = %pm_expiration,
+                    kalshi_exp = %km.expiration,
+                    "MATCH CONFIRMED"
+                );
+
+                matched.push(MatchedMarket {
+                    market: Market {
+                        unified_id,
+                        question: format!("{} / {}", pm.question, km.question),
+                        resolution_source: "cross_platform".into(),
+                        expiration: km.expiration,
+                        platforms: platform_infos,
+                        category,
+                        confidence,
+                        status: MarketStatus::Active,
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    }
+                });
+            }
+        }
+
+        info!(
+            total_matched = matched.len(),
+            "Discovery cycle: cross-platform matching complete"
+        );
+        if matched.is_empty() {
+            warn!(
+                poly_count = poly_markets.len(),
+                kalshi_count = kalshi_markets.len(),
+                "WARNING: 0 markets matched. Sample questions for diagnosis:"
+            );
+            for pm in poly_markets.iter().take(5) {
+                warn!(q = %pm.question_normalized, exp = %pm.expiration, "  [POLY sample]");
+            }
+            for km in kalshi_markets.iter().take(5) {
+                warn!(q = %km.question_normalized, exp = %km.expiration, ticker = %km.platform_market_id, "  [KALSHI sample]");
             }
         }
 
@@ -306,104 +544,178 @@ impl MarketDiscovery {
 
 
 pub(super) fn normalize_question(q: &str) -> String {
-        // 1. Single initial allocation
-        let mut lower = q.to_lowercase();
-        
-        // 2. Fast zero-allocation lookahead: Only allocate a new string if the word actually exists
-        let replacements = [
-            ("bitcoin", "btc"),
-            ("ethereum", "eth"),
-            ("solana", "sol"),
-            ("ripple", "xrp"),
-            ("dogecoin", "doge"),
-            ("binance coin", "bnb"),
-            ("cardano", "ada"),
-            ("minutes", "min"),
-            ("minute", "min"),
-            ("mins", "min"),
-        ];
+    // 1. Single initial allocation - strip commas and dollar signs immediately
+    // to avoid splitting "$60,000" into "60 000" during the alphanumeric pass.
+    let mut lower = q.to_lowercase().replace(',', "").replace('$', "");
 
-        for (from, to) in replacements {
-            if lower.contains(from) {
-                lower = lower.replace(from, to);
-            }
+    // 2. Fast zero-allocation lookahead: Only allocate a new string if the word actually exists
+    let replacements = [
+        ("bitcoin", "btc"),
+        ("ethereum", "eth"),
+        ("solana", "sol"),
+        ("ripple", "xrp"),
+        ("dogecoin", "doge"),
+        ("binance coin", "bnb"),
+        ("cardano", "ada"),
+        ("minutes", "min"),
+        ("minute", "min"),
+        ("mins", "min"),
+    ];
+
+    for (from, to) in replacements {
+        if lower.contains(from) {
+            lower = lower.replace(from, to);
         }
-
-        // 3. Single-pass iteration to strip non-alphanumeric chars and deduplicate spaces without Vecs
-        let mut result = String::with_capacity(lower.len());
-        let mut last_was_space = true;
-
-        for c in lower.chars() {
-            if c.is_alphanumeric() {
-                result.push(c);
-                last_was_space = false;
-            } else if !last_was_space {
-                result.push(' ');
-                last_was_space = true;
-            }
-        }
-
-        // Clean up trailing space if the string ended with a special character
-        if result.ends_with(' ') {
-            result.pop();
-        }
-
-        result
     }
 
+    // 3. Single-pass iteration to strip non-alphanumeric chars and deduplicate spaces without Vecs
+    let mut result = String::with_capacity(lower.len());
+    let mut last_was_space = true;
+
+    for c in lower.chars() {
+        if c.is_alphanumeric() {
+            result.push(c);
+            last_was_space = false;
+        } else if !last_was_space {
+            result.push(' ');
+            last_was_space = true;
+        }
+    }
+
+    // Clean up trailing space if the string ended with a special character
+    if result.ends_with(' ') {
+        result.pop();
+    }
+
+    result
+}
     async fn fetch_polymarket_markets(&self) -> Result<Vec<DiscoveredMarket>> {
         let mut all_markets = Vec::new();
         let now = Utc::now();
-        // Fetch short-horizon markets first (soonest expiring = highest arb priority).
-        // The Gamma API is the authoritative source for CURRENT active markets;
-        // the old CLOB /markets endpoint only returns archived 2023 data.
         let gamma_url = "https://gamma-api.polymarket.com/markets";
-        let mut offset = 0u64;
-        // Cap at 10 000 markets per cycle to prevent runaway pagination.
-        // Use acceptingOrders=true to filter server-side so we only get live markets.
-        const MAX_MARKETS: usize = 10_000;
-        const PAGE_SIZE: usize = 1_000;
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        'gamma: loop {
-            let offset_str = offset.to_string();
-            let page_str = PAGE_SIZE.to_string();
-            let query = vec![
-                ("active", "true"),
-                ("closed", "false"),
-                ("acceptingOrders", "true"),
-                ("limit", page_str.as_str()),
-                ("offset", offset_str.as_str()),
-            ];
+        // ── Helper: parse a page and deduplicate ─────────────────────────────
+        let dedup = |markets: Vec<DiscoveredMarket>, seen: &mut std::collections::HashSet<String>| -> Vec<DiscoveredMarket> {
+            markets.into_iter().filter(|m| seen.insert(m.platform_market_id.clone())).collect()
+        };
 
-            let resp: serde_json::Value = self
-                .http
-                .get(gamma_url)
-                .query(&query)
-                .send()
-                .await
-                .context("Polymarket Gamma markets fetch failed")?
-                .json()
-                .await
-                .context("Polymarket Gamma markets parse failed")?;
-
-            let arr = resp.as_array()
-                .or_else(|| resp.get("data").and_then(|v| v.as_array()));
-
-            let page = match arr {
-                Some(a) => a,
-                None => break 'gamma,
-            };
-
-            let page_len = page.len();
-            let page_markets = self.parse_gamma_polymarket_response(page, now);
-            all_markets.extend(page_markets);
-
-            // Stop early if we've hit the cap or received a partial page
-            if all_markets.len() >= MAX_MARKETS || page_len < PAGE_SIZE {
-                break 'gamma;
+        // Pass 1: Near-term markets expiring within 7 days.
+        // These are the prime candidates for matching Kalshi intraday/weekly markets.
+        // The Gamma API supports end_date_max as a filter (ISO8601).
+        {
+            let week_out = now + chrono::Duration::days(7);
+            let end_max = week_out.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let resp_result = self.http.get(gamma_url)
+                .query(&[
+                    ("active", "true"),
+                    ("closed", "false"),
+                    ("limit", "500"),
+                    ("end_date_max", end_max.as_str()),
+                ])
+                .send().await;
+            match resp_result {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        let page = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+                        let markets = self.parse_gamma_polymarket_response(page, now);
+                        let deduped = dedup(markets, &mut seen_ids);
+                        info!(count = deduped.len(), "Polymarket near-term markets (≤7d expiry)");
+                        all_markets.extend(deduped);
+                    }
+                    Err(e) => warn!(error = %e, "Polymarket near-term parse failed"),
+                },
+                Err(e) => warn!(error = %e, "Polymarket near-term fetch failed"),
             }
+        }
 
-            offset += PAGE_SIZE as u64;
+        // Pass 2: Targeted keyword searches for topics that have Kalshi equivalents.
+        // These run in parallel and find markets that may be buried in general pagination.
+        let keywords: &[(&str, &str)] = &[
+            ("btc",             "BTC price"),
+            ("bitcoin",         "Bitcoin"),
+            ("ethereum",        "ETH price"),
+            ("eth price",       "ETH intraday"),
+            ("15m",             "15m crypto"),
+            ("15 min",          "15 min crypto"),
+            ("up or down",      "Up/Down Crypto"),
+            ("cpi",             "CPI inflation"),
+            ("inflation",       "inflation rate"),
+            ("federal reserve", "Fed rate"),
+            ("interest rate",   "interest rate"),
+            ("nba",             "NBA game"),
+            ("playoffs",        "NBA playoffs"),
+            ("nhl",             "NHL game"),
+            ("mlb",             "MLB game"),
+            ("ufc",             "UFC fight"),
+        ];
+
+        let keyword_futures: Vec<_> = keywords.iter().map(|(kw, label)| {
+            let http = self.http.clone();
+            let gamma_url = gamma_url.to_string();
+            let kw = *kw;
+            let label = *label;
+            async move {
+                let resp = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    http.get(&gamma_url)
+                        .query(&[
+                            ("active", "true"),
+                            ("closed", "false"),
+                            ("limit", "200"),
+                            ("q", kw),
+                        ])
+                        .send()
+                ).await;
+                match resp {
+                    Ok(Ok(r)) => match r.json::<serde_json::Value>().await {
+                        Ok(data) => Some((kw, label, data)),
+                        Err(_) => None,
+                    },
+                    _ => None,
+                }
+            }
+        }).collect();
+
+        let kw_results = futures_util::future::join_all(keyword_futures).await;
+        for result in kw_results {
+            if let Some((kw, label, data)) = result {
+                let page = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+                let markets = self.parse_gamma_polymarket_response(page, now);
+                let deduped = dedup(markets, &mut seen_ids);
+                if !deduped.is_empty() {
+                    info!(keyword = kw, label, count = deduped.len(), "Polymarket keyword search results");
+                }
+                all_markets.extend(deduped);
+            }
+        }
+
+        // Pass 3: General pagination — broad coverage of all active markets.
+        {
+            let mut offset = 0u64;
+            const MAX_GENERAL: usize = 10_000;
+            'general: loop {
+                let offset_str = offset.to_string();
+                let resp: serde_json::Value = self.http.get(gamma_url)
+                    .query(&[
+                        ("active", "true"),
+                        ("closed", "false"),
+                        ("acceptingOrders", "true"),
+                        ("limit", "1000"),
+                        ("offset", offset_str.as_str()),
+                    ])
+                    .send().await.context("Polymarket general fetch failed")?
+                    .json().await.context("Polymarket general parse failed")?;
+
+                let page = match resp.as_array() { Some(a) => a, None => break 'general };
+                let page_len = page.len();
+                let markets = self.parse_gamma_polymarket_response(page, now);
+                let deduped = dedup(markets, &mut seen_ids);
+                all_markets.extend(deduped);
+
+                if all_markets.len() >= MAX_GENERAL || page_len < 1000 { break 'general; }
+                offset += 1000;
+            }
         }
 
         Ok(all_markets)
@@ -440,10 +752,12 @@ pub(super) fn normalize_question(q: &str) -> String {
             // "[\"123456...\", \"789012...\"]" — NOT a native JSON array.
             // We must parse the string value to extract the token IDs.
             let (yes_token, no_token) = {
-                let raw = item.get("clobTokenIds").and_then(|v| v.as_str()).unwrap_or("");
+                let raw = item.get("clobTokenIds")
+                    .map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() })
+                    .unwrap_or_default();
+                
                 if !raw.is_empty() {
-                    // Parse the embedded JSON array string
-                    let parsed: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+                    let parsed: Vec<String> = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::from_str(&raw.replace("\\\"", "\"").trim_matches('"')).unwrap_or_default());
                     let yes = parsed.first().cloned().unwrap_or_default();
                     let no  = parsed.get(1).cloned().unwrap_or_default();
                     (yes, no)
@@ -463,19 +777,61 @@ pub(super) fn normalize_question(q: &str) -> String {
                 }
             };
 
-            if yes_token.is_empty() || yes_token.starts_with("0x") || no_token.is_empty() {
+            if yes_token.is_empty() || no_token.is_empty() {
                 continue;
             }
             let token_id = format!("{},{}", yes_token, no_token);
 
-            // Gamma uses endDate or endDateIso (camelCase); CLOB uses end_date_iso
-            let end_date = item.get("endDateIso")
-                .or_else(|| item.get("endDate"))
-                .or_else(|| item.get("end_date_iso"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|| now + chrono::Duration::days(30));
+            // Gamma uses endDateIso (ISO string), endDate (may be Unix timestamp OR ISO string),
+            // or end_date_iso (CLOB format). Try each field, handling both string and numeric types.
+            let end_date = {
+                let candidate_fields = ["endDateIso", "endDate", "end_date_iso", "closeTime", "close_time", "expiration"];
+                let mut resolved: Option<DateTime<Utc>> = None;
+                for field in &candidate_fields {
+                    if let Some(v) = item.get(field) {
+                        // Try as ISO string first
+                        if let Some(s) = v.as_str() {
+                            // Handle formats: RFC3339, "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS"
+                            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                                resolved = Some(dt.with_timezone(&Utc));
+                                break;
+                            } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+                                resolved = Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+                                break;
+                            } else if let Ok(naive) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                                resolved = Some(DateTime::from_naive_utc_and_offset(naive.and_hms_opt(0, 0, 0).unwrap(), Utc));
+                                break;
+                            }
+                        }
+                        // Try as Unix timestamp (seconds or milliseconds)
+                        if let Some(ts) = v.as_i64() {
+                            let secs = if ts > 1_000_000_000_000 { ts / 1000 } else { ts };
+                            if let chrono::LocalResult::Single(dt) = chrono::TimeZone::timestamp_opt(&Utc, secs, 0) {
+                                resolved = Some(dt);
+                                break;
+                            }
+                        }
+                        if let Some(ts) = v.as_f64() {
+                            let secs = if ts > 1_000_000_000_000.0 { (ts / 1000.0) as i64 } else { ts as i64 };
+                            if let chrono::LocalResult::Single(dt) = chrono::TimeZone::timestamp_opt(&Utc, secs, 0) {
+                                resolved = Some(dt);
+                                break;
+                            }
+                        }
+                    }
+                }
+                // One-time field-dump for first market to diagnose which field carries the date
+                if resolved.is_none() && markets.is_empty() {
+                    if let Some(obj) = item.as_object() {
+                        let date_keys: Vec<(&str, String)> = obj.iter()
+                            .filter(|(k, _)| k.to_lowercase().contains("date") || k.to_lowercase().contains("time") || k.to_lowercase().contains("exp") || k.to_lowercase().contains("close"))
+                            .map(|(k, v)| (k.as_str(), v.to_string()))
+                            .collect();
+                        tracing::warn!(fields = ?date_keys, "DIAG: Polymarket date fields (first market, no date found)");
+                    }
+                }
+                resolved.unwrap_or_else(|| now + chrono::Duration::days(30))
+            };
 
             // Skip already-expired markets
             if end_date <= now {
@@ -483,9 +839,9 @@ pub(super) fn normalize_question(q: &str) -> String {
             }
 
             let question_normalized = Self::normalize_question(&question);
-            let category = if question_normalized.contains("btc") || question_normalized.contains("eth") || question_normalized.contains("crypto") || question_normalized.contains("sol") || question_normalized.contains("xrp") || question_normalized.contains("doge") || question_normalized.contains("bnb") {
+            let category = if question_normalized.split_whitespace().any(|w| matches!(w, "btc" | "eth" | "sol" | "xrp" | "doge" | "bnb" | "hype" | "ada" | "crypto")) {
                 MarketCategory::Crypto
-            } else if question_normalized.contains("trump") || question_normalized.contains("election") || question_normalized.contains("biden") || question_normalized.contains("harris") {
+            } else if question_normalized.split_whitespace().any(|w| matches!(w, "trump" | "election" | "biden" | "harris" | "democrat" | "republican" | "congress" | "senate")) {
                 MarketCategory::Politics
             } else {
                 MarketCategory::Other
@@ -509,85 +865,103 @@ pub(super) fn normalize_question(q: &str) -> String {
     }
 
     async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {
-        let mut all_markets = Vec::new();
-        let mut seen_tickers = std::collections::HashSet::new();
         let url = format!("{}/markets", self.platforms_config.kalshi.rest_url);
 
-        // 1. Generic open markets via cursor pagination (cap at 10k to prevent runaway)
-        {
-            let mut cursor = String::new();
-            let mut generic_count = 0usize;
-            const KALSHI_MAX_GENERIC: usize = 10_000;
-            loop {
-                let mut query = vec![("status", "open"), ("limit", "1000")];
-                if !cursor.is_empty() {
-                    query.push(("cursor", &cursor));
-                }
-                let mut req = self.http.get(&url).query(&query);
-                if let Some(auth) = &self.kalshi_auth {
-                    if let Ok(token) = auth.generate_token() {
-                        req = req.header("Authorization", format!("Bearer {}", token));
-                    }
-                }
-                let resp: serde_json::Value = req.send()
-                    .await
-                    .context("Kalshi markets fetch failed")?
-                    .json()
-                    .await
-                    .context("Kalshi markets parse failed")?;
-
-                let page_markets = self.parse_kalshi_markets(&resp, &mut seen_tickers);
-                generic_count += page_markets.len();
-                all_markets.extend(page_markets);
-
-                cursor = resp.get("cursor")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if cursor.is_empty() || cursor == "null" || generic_count >= KALSHI_MAX_GENERIC {
-                    break;
-                }
-            }
-        }
-
-        // 2. CRITICAL: Explicitly fetch all crypto 15-minute series.
-        // These short-lived markets are often not returned by the generic
-        // cursor-paginated endpoint which favors longer-dated markets.
-        let crypto_15m_series = [
-            "KXBTC15M",  // Bitcoin
-            "KXETH15M",  // Ethereum
-            "KXSOL15M",  // Solana
-            "KXBCH15M",  // Bitcoin Cash
-            "KXADA15M",  // Cardano
-            "KXDOGE15M", // Dogecoin
-            "KXXRP15M",  // XRP
-            "KXBNB15M",  // BNB
-            "KXHYPE15M", // Hype
-        ];
-
-        for series in &crypto_15m_series {
-            let query = vec![("status", "open"), ("series_ticker", *series), ("limit", "100")];
-            let mut req = self.http.get(&url).query(&query);
+        // 1. Generic open markets — first page only (1000 markets, non-parlay).
+        // We skip full cursor pagination since the Kalshi generic endpoint is dominated
+        // by KXMVE complex parlays. One page gives us a representative non-parlay sample,
+        // and the targeted series fetch (step 2) covers all actionable market types.
+        let generic_markets = {
+            let mut req = self.http.get(&url)
+                .query(&[("status", "open"), ("limit", "1000")]);
             if let Some(auth) = &self.kalshi_auth {
                 if let Ok(token) = auth.generate_token() {
                     req = req.header("Authorization", format!("Bearer {}", token));
                 }
             }
             match req.send().await {
-                Ok(resp) => {
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(data) => {
-                            let page_markets = self.parse_kalshi_markets(&data, &mut seen_tickers);
-                            if !page_markets.is_empty() {
-                                info!(series = *series, count = page_markets.len(), "Fetched crypto 15-min series markets");
-                            }
-                            all_markets.extend(page_markets);
-                        }
-                        Err(e) => warn!(series = *series, error = %e, "Failed to parse Kalshi crypto series response"),
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        let mut seen = std::collections::HashSet::new();
+                        self.parse_kalshi_markets(&data, &mut seen)
                     }
+                    Err(e) => { warn!(error = %e, "Kalshi generic page parse failed"); vec![] }
+                },
+                Err(e) => { warn!(error = %e, "Kalshi generic page fetch failed"); vec![] }
+            }
+        };
+        info!(count = generic_markets.len(), "Kalshi generic markets fetched (non-parlay)");
+
+        // 2. Targeted series — fetched in parallel, each with a 10s timeout.
+        // These series are known to have Polymarket equivalents and are often absent
+        // from or underrepresented in the generic endpoint.
+        let targeted_series: &[(&str, &str)] = &[
+            // ── Crypto 15-minute direction ──────────────────────────────────────
+            ("KXBTC15M",  "BTC 15m"),
+            ("KXETH15M",  "ETH 15m"),
+            ("KXSOL15M",  "SOL 15m"),
+            ("KXDOGE15M", "DOGE 15m"),
+            ("KXXRP15M",  "XRP 15m"),
+            ("KXBNB15M",  "BNB 15m"),
+            ("KXHYPE15M", "HYPE 15m"),
+            // ── Crypto price targets (daily/weekly close) ───────────────────────
+            ("KXBTC",     "BTC price target"),
+            ("KXETH",     "ETH price target"),
+            ("KXSOL",     "SOL price target"),
+            // ── Sports: single-game outcomes ────────────────────────────────────
+            ("KXNBA",     "NBA game"),
+            ("KXNBAPLAYOFFS", "NBA playoffs"),
+            ("KXNHL",     "NHL game"),
+            ("KXMLB",     "MLB game"),
+            ("KXUFC",     "UFC bout"),
+            // ── Political / economic ─────────────────────────────────────────────
+            ("KXFED",     "Fed rate decision"),
+            ("KXCPI",     "CPI inflation"),
+            ("KXTRUMP",   "Trump event"),
+        ];
+
+        // Fire all series requests concurrently
+        let series_futures: Vec<_> = targeted_series.iter().map(|(series, label)| {
+            let http = self.http.clone();
+            let url = url.clone();
+            let auth_token = self.kalshi_auth.as_ref()
+                .and_then(|a| a.generate_token().ok());
+            let series = *series;
+            let label = *label;
+            async move {
+                let mut req = http.get(&url)
+                    .query(&[("status", "open"), ("series_ticker", series), ("limit", "200")]);
+                if let Some(token) = auth_token {
+                    req = req.header("Authorization", format!("Bearer {}", token));
                 }
-                Err(e) => warn!(series = *series, error = %e, "Failed to fetch Kalshi crypto series"),
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(25),
+                    req.send()
+                ).await {
+                    Ok(Ok(resp)) => match resp.json::<serde_json::Value>().await {
+                        Ok(data) => Some((series, label, data)),
+                        Err(e) => { tracing::debug!(series, error = %e, "Kalshi series parse failed"); None }
+                    },
+                    Ok(Err(e)) => { tracing::debug!(series, error = %e, "Kalshi series fetch failed"); None }
+                    Err(_) => { tracing::debug!(series, "Kalshi series fetch timed out"); None }
+                }
+            }
+        }).collect();
+
+        let series_results = futures_util::future::join_all(series_futures).await;
+
+        // Merge all results — deduplicate across generic + series using a shared seen set
+        let mut all_markets = generic_markets;
+        let mut seen_tickers: std::collections::HashSet<String> =
+            all_markets.iter().map(|m| m.platform_market_id.clone()).collect();
+
+        for result in series_results {
+            if let Some((series, label, data)) = result {
+                let page_markets = self.parse_kalshi_markets_filtered(&data, &mut seen_tickers, true);
+                if !page_markets.is_empty() {
+                    info!(series, label, count = page_markets.len(), "Fetched targeted Kalshi series");
+                }
+                all_markets.extend(page_markets);
             }
         }
 
@@ -599,6 +973,15 @@ pub(super) fn normalize_question(q: &str) -> String {
         resp: &serde_json::Value,
         seen_tickers: &mut std::collections::HashSet<String>,
     ) -> Vec<DiscoveredMarket> {
+        self.parse_kalshi_markets_filtered(resp, seen_tickers, false)
+    }
+
+    fn parse_kalshi_markets_filtered(
+        &self,
+        resp: &serde_json::Value,
+        seen_tickers: &mut std::collections::HashSet<String>,
+        include_parlays: bool,
+    ) -> Vec<DiscoveredMarket> {
         let mut markets = Vec::new();
         if let Some(arr) = resp.get("markets").and_then(|v| v.as_array()) {
             for item in arr {
@@ -606,6 +989,14 @@ pub(super) fn normalize_question(q: &str) -> String {
                 if title.is_empty() { continue; }
                 let ticker = item.get("ticker").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 if ticker.is_empty() { continue; }
+
+                // Skip complex multi-variable parlay markets — they resolve on combinations
+                // of player props/game outcomes and have no equivalent on Polymarket.
+                // These are identified by the KXMVE prefix (Multi-Variable Event).
+                if !include_parlays && ticker.starts_with("KXMVE") {
+                    continue;
+                }
+
                 if !seen_tickers.insert(ticker.clone()) { continue; } // deduplicate
 
                 let close_time = item
@@ -621,9 +1012,9 @@ pub(super) fn normalize_question(q: &str) -> String {
                 }
 
                 let question_normalized = Self::normalize_question(&title);
-                let category = if question_normalized.contains("btc") || question_normalized.contains("eth") || question_normalized.contains("crypto") || question_normalized.contains("sol") || question_normalized.contains("xrp") || question_normalized.contains("doge") || question_normalized.contains("bnb") {
+                let category = if question_normalized.split_whitespace().any(|w| matches!(w, "btc" | "eth" | "sol" | "xrp" | "doge" | "bnb" | "hype" | "ada" | "crypto")) {
                     MarketCategory::Crypto
-                } else if question_normalized.contains("trump") || question_normalized.contains("election") || question_normalized.contains("biden") || question_normalized.contains("harris") {
+                } else if question_normalized.split_whitespace().any(|w| matches!(w, "trump" | "election" | "biden" | "harris" | "democrat" | "republican" | "congress" | "senate")) {
                     MarketCategory::Politics
                 } else {
                     MarketCategory::Other

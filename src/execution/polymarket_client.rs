@@ -37,6 +37,8 @@ struct OrderPayload {
     signature: String,
     signature_type: u8,
     order_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    funder: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +177,9 @@ impl PlatformOrderClient for PolymarketClient {
         let maker_str = maker_amount_scaled.to_u64().unwrap_or(0).to_string();
         let taker_str = taker_amount_scaled.to_u64().unwrap_or(0).to_string();
 
+        let funder = std::env::var("POLYMARKET_FUNDER").ok();
+        let sig_type = if funder.is_some() { 2 } else { 0 };
+
         let payload = OrderPayload {
             // CRITICAL FIX: Use the specific YES or NO target_token_id instead of the raw market_id pair
             token_id: target_token_id.to_string(),
@@ -185,11 +190,12 @@ impl PlatformOrderClient for PolymarketClient {
             nonce: nonce_val.to_string(),
             expiration: expiration_u256.to_string(),
             signature,
-            signature_type: 0,
+            signature_type: sig_type,
             // CRITICAL FIX: 'IOC' permits partial fills. Because the fast-path assumes 100% execution,
             // a 50% partial fill leaves you 50% unhedged without triggering the Unwind Watchdog. 
             // 'FOK' (Fill Or Kill) guarantees binary success/failure.
             order_type: "FOK".to_string(),
+            funder,
         };
 
         let req_body = CreateOrderRequest { order: payload };

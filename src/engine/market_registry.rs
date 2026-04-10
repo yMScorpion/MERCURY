@@ -91,4 +91,12 @@ impl MarketRegistry {
     pub fn get_platform_info(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformMarketInfo> {
         self.markets.get(market_id)?.platforms.get(platform)
     }
+
+    pub fn market_count(&self) -> usize {
+        self.markets.len()
+    }
+
+    pub fn arb_pair_count(&self) -> usize {
+        self.arb_pairs.values().map(|v| v.len()).sum()
+    }
 }
