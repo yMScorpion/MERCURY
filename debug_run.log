@@ -1,2 +1,167 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.45s
-     Running `target/debug/mercury --dry-run -c config/dry_run.yaml`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.49s
+     Running `target/debug/mercury --config config/dry_run.yaml`
+[2m2026-04-12T19:09:32.127412Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m MERCURY v0.1.0 starting...
+[2m2026-04-12T19:09:32.127601Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Configuration loaded
+[2m2026-04-12T19:09:32.128000Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Secure environment injected from .env
+[2m2026-04-12T19:09:32.128071Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Executing Ahead-of-Time (AOT) pre-flight checks...
+[2m2026-04-12T19:09:32.715543Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m All AOT pre-flight checks passed successfully.
+[2m2026-04-12T19:09:32.715686Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m All pre-flight checks passed.
+[2m2026-04-12T19:09:32.721156Z[0m [32m INFO[0m [2mmercury::db::sqlite[0m[2m:[0m Database schema version validated: 2
+[2m2026-04-12T19:09:32.721383Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Database initialized via SQLx
+[2m2026-04-12T19:09:32.729949Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Telegram alerts enabled (MERCURY_NOTIFICATION bot)
+[2m2026-04-12T19:09:32.729973Z[0m [32m INFO[0m [2mmercury::telegram::alerts[0m[2m:[0m Telegram alert service started
+[2m2026-04-12T19:09:32.730094Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Telegram daily reports & command polling enabled (MERCURY_DAILYBOT)
+[2m2026-04-12T19:09:32.730111Z[0m [32m INFO[0m [2mmercury::telegram::reports[0m[2m:[0m Telegram report & command service started
+[2m2026-04-12T19:09:32.730707Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Recovered circuit breaker state from 0 recent trades
+[2m2026-04-12T19:09:32.731235Z[0m [32m INFO[0m [2mmercury::risk::bankroll[0m[2m:[0m Bankroll state restored from DB [3mcumulative_profit[0m[2m=[0m0
+[2m2026-04-12T19:09:32.732372Z[0m [32m INFO[0m [2mmercury::crypto::eip712[0m[2m:[0m Polymarket signer initialized [3maddress[0m[2m=[0m0x450760C560721D88205bAcc242523f18838A7dfe [3mchain_id[0m[2m=[0m137
+[2m2026-04-12T19:09:32.732523Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Polymarket client initialized [3maddress[0m[2m=[0m0x450760C560721D88205bAcc242523f18838A7dfe
+[2m2026-04-12T19:09:32.734848Z[0m [32m INFO[0m [2mmercury::crypto::jwt[0m[2m:[0m Kalshi auth initialized [3mapi_key_id[0m[2m=[0m88a3b3aa-8fb9-4ecd-ab56-1c642d32ed51
+[2m2026-04-12T19:09:32.734933Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Kalshi client initialized
+[2m2026-04-12T19:09:32.735033Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Polymarket execution: ENABLED
+[2m2026-04-12T19:09:32.735083Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Kalshi execution: ENABLED
+[2m2026-04-12T19:09:32.735208Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Starting startup position reconciliation...
+[2m2026-04-12T19:09:32.735241Z[0m [32m INFO[0m [2mmercury::execution::executor[0m[2m:[0m Execution engine started
+[2m2026-04-12T19:09:32.735261Z[0m [32m INFO[0m [2mmercury::inventory::positions[0m[2m:[0m Position tracker started
+[2m2026-04-12T19:09:32.735273Z[0m [32m INFO[0m [2mmercury::inventory::reconciler[0m[2m:[0m Reconciler started [3minterval_secs[0m[2m=[0m60
+[2m2026-04-12T19:09:32.735341Z[0m [32m INFO[0m [2mmercury::inventory::unwind_watchdog[0m[2m:[0m Unwind watchdog started
+[2m2026-04-12T19:09:32.735349Z[0m [32m INFO[0m [2mmercury::inventory::settlement[0m[2m:[0m Settlement monitor started
+[2m2026-04-12T19:09:32.735387Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Gas oracle started (first fetch is immediate) [3minterval_secs[0m[2m=[0m15 [3mrpc_url[0m[2m=[0mhttps://rpc.ankr.com/polygon
+[2m2026-04-12T19:09:32.735430Z[0m [32m INFO[0m [2mmercury::monitoring::health[0m[2m:[0m Health + Prometheus metrics server listening [3maddr[0m[2m=[0m"127.0.0.1:9091"
+[2m2026-04-12T19:09:32.735445Z[0m [32m INFO[0m [2mmercury::monitoring::backup[0m[2m:[0m DB backup task started [3minterval_secs[0m[2m=[0m21600 [3mdir[0m[2m=[0mbackups
+[2m2026-04-12T19:09:32.735839Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Position reconciliation complete.
+[2m2026-04-12T19:09:32.736716Z[0m [31mERROR[0m [2mmercury::monitoring::backup[0m[2m:[0m Database backup failed [3merror[0m[2m=[0mBackup path resolves outside /opt/mercury/data/: resolved to /Users/isaacvalerianomuniz/MERCURY/backups
+[2m2026-04-12T19:09:32.737246Z[0m [32m INFO[0m [2mmercury::crypto::jwt[0m[2m:[0m Kalshi auth initialized [3mapi_key_id[0m[2m=[0m88a3b3aa-8fb9-4ecd-ab56-1c642d32ed51
+[2m2026-04-12T19:09:32.737457Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Market discovery started [3minterval_secs[0m[2m=[0m30
+[2m2026-04-12T19:09:32.737582Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Config hot-reload watcher active on config/dry_run.yaml
+[2m2026-04-12T19:09:32.737922Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Connecting feed handler [3mplatform[0m[2m=[0mPolymarket
+[2m2026-04-12T19:09:32.738026Z[0m [32m INFO[0m [2mmercury::feeds::polymarket[0m[2m:[0m Connecting to Polymarket WebSocket [3murl[0m[2m=[0m"wss://ws-subscriptions-clob.polymarket.com/ws/market"
+[2m2026-04-12T19:09:32.739596Z[0m [32m INFO[0m [2mmercury::crypto::jwt[0m[2m:[0m Kalshi auth initialized [3mapi_key_id[0m[2m=[0m88a3b3aa-8fb9-4ecd-ab56-1c642d32ed51
+[2m2026-04-12T19:09:32.739881Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m All subsystems initialized. MERCURY engine running. Press Ctrl+C to shutdown.
+[2m2026-04-12T19:09:32.739886Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Connecting feed handler [3mplatform[0m[2m=[0mKalshi
+[2m2026-04-12T19:09:32.739980Z[0m [32m INFO[0m [2mmercury::feeds::kalshi[0m[2m:[0m Connecting to Kalshi WebSocket: wss://api.elections.kalshi.com/trade-api/ws/v2
+[2m2026-04-12T19:09:32.740349Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Daily report scheduled [3mdelay_secs[0m[2m=[0m6627 [3mhour_utc[0m[2m=[0m21
+[2m2026-04-12T19:09:32.740907Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Seeded market registry from DB [3mcount[0m[2m=[0m0
+[2m2026-04-12T19:09:32.741103Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Feed connected — Arbs involving platform restored [3mplatform[0m[2m=[0mPolymarket
+[2m2026-04-12T19:09:32.741402Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m === MERCURY STATUS === [3mregistered_markets[0m[2m=[0m0 [3marb_pairs[0m[2m=[0m0 [3mactive_actors[0m[2m=[0m0 [3mopen_positions[0m[2m=[0m0 [3min_flight_trades[0m[2m=[0m0 [3mbankroll[0m[2m=[0m10000.00 [3mdaily_pnl[0m[2m=[0m0 [3mopps_detected[0m[2m=[0m0 [3mopps_passed[0m[2m=[0m0 [3mgate1_below_spread[0m[2m=[0m0 [3mgate2_low_liquidity[0m[2m=[0m0 [3mgate3_stale_data[0m[2m=[0m0 [3mgate4_low_confidence[0m[2m=[0m0 [3mgate5_capacity[0m[2m=[0m0
+[2m2026-04-12T19:09:32.741510Z[0m [33m WARN[0m [2mmercury[0m[2m:[0m Registry has 0 markets — discovery has not produced matches yet. Check API connectivity and Jaccard similarity thresholds.
+[2m2026-04-12T19:09:32.741571Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Feed connected — Arbs involving platform restored [3mplatform[0m[2m=[0mKalshi
+[2m2026-04-12T19:09:34.365616Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m173 [3mprev_gwei[0m[2m=[0m50
+[2m2026-04-12T19:09:35.745205Z[0m [32m INFO[0m [2mmercury::inventory::reconciler[0m[2m:[0m Reconciliation complete [3mopen_positions[0m[2m=[0m0 [3mtotal_position_value[0m[2m=[0m0
+[2m2026-04-12T19:09:38.881657Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m MATIC/USD price updated [3mmatic_usd[0m[2m=[0m0.10 [3mprev[0m[2m=[0m0.50
+[2m2026-04-12T19:09:40.847699Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket 15-min/crypto pass: 92 markets
+[2m2026-04-12T19:09:48.601186Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m182 [3mprev_gwei[0m[2m=[0m173
+[2m2026-04-12T19:10:00.926474Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Polymarket markets fetched: 5100
+[2m2026-04-12T19:10:00.927108Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket markets fetched [3mcount[0m[2m=[0m5100
+[2m2026-04-12T19:10:03.078244Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m188 [3mprev_gwei[0m[2m=[0m182
+[2m2026-04-12T19:10:15.938761Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXBTC15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:10:15.938905Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXETH15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:10:15.938988Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXSOL15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:10:15.939070Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXDOGE15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:10:15.939149Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXXRP15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:10:15.939227Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXBNB15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:10:15.941438Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXETH" [3mcount[0m[2m=[0m165
+[2m2026-04-12T19:10:15.943085Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXNBA" [3mcount[0m[2m=[0m20
+[2m2026-04-12T19:10:15.943754Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXNHL" [3mcount[0m[2m=[0m25
+[2m2026-04-12T19:10:15.944660Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXMLB" [3mcount[0m[2m=[0m30
+[2m2026-04-12T19:10:15.946037Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXCPI" [3mcount[0m[2m=[0m68
+[2m2026-04-12T19:10:18.727018Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m217 [3mprev_gwei[0m[2m=[0m188
+[2m2026-04-12T19:10:21.134578Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Kalshi markets fetched: 314
+[2m2026-04-12T19:10:21.134708Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi markets fetched [3mcount[0m[2m=[0m314
+[2m2026-04-12T19:10:21.141037Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m === DISCOVERY DIAGNOSTICS ===
+[2m2026-04-12T19:10:21.149845Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket 15-min/BTC candidates: 63
+[2m2026-04-12T19:10:21.149945Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 1m before gta vi | exp=2026-07-31 12:00:00 UTC | id_prefix=10526756807365906821
+[2m2026-04-12T19:10:21.149996Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 150k by june 30 2026 | exp=2026-07-01 04:00:00 UTC | id_prefix=13915689317269078219
+[2m2026-04-12T19:10:21.150044Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 150k by december 31 2026 | exp=2027-01-01 04:00:00 UTC | id_prefix=93694900555669388759
+[2m2026-04-12T19:10:21.150089Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will freddie mac s market cap be less than 150b at market close on ipo day | exp=2026-06-30 00:00:00 UTC | id_prefix=65741715476066904623
+[2m2026-04-12T19:10:21.150140Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will freddie mac s market cap be between 150b and 200b at market close on ipo day | exp=2026-06-30 00:00:00 UTC | id_prefix=81197908990814001611
+[2m2026-04-12T19:10:21.150480Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi BTC/15M candidates: 6
+[2m2026-04-12T19:10:21.150523Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: btc price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXBTC15M-26APR121515-15
+[2m2026-04-12T19:10:21.150568Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: eth price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXETH15M-26APR121515-15
+[2m2026-04-12T19:10:21.150615Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: sol price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXSOL15M-26APR121515-15
+[2m2026-04-12T19:10:21.150662Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: doge price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXDOGE15M-26APR121515-15
+[2m2026-04-12T19:10:21.150709Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: xrp price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXXRP15M-26APR121515-15
+[2m2026-04-12T19:10:21.150757Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Kalshi markets: 314 | Total Polymarket: 5100
+[2m2026-04-12T19:10:32.742321Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m === MERCURY STATUS === [3mregistered_markets[0m[2m=[0m0 [3marb_pairs[0m[2m=[0m0 [3mactive_actors[0m[2m=[0m0 [3mopen_positions[0m[2m=[0m0 [3min_flight_trades[0m[2m=[0m0 [3mbankroll[0m[2m=[0m10000.00 [3mdaily_pnl[0m[2m=[0m0 [3mopps_detected[0m[2m=[0m0 [3mopps_passed[0m[2m=[0m0 [3mgate1_below_spread[0m[2m=[0m0 [3mgate2_low_liquidity[0m[2m=[0m0 [3mgate3_stale_data[0m[2m=[0m0 [3mgate4_low_confidence[0m[2m=[0m0 [3mgate5_capacity[0m[2m=[0m0
+[2m2026-04-12T19:10:32.742498Z[0m [33m WARN[0m [2mmercury[0m[2m:[0m Registry has 0 markets — discovery has not produced matches yet. Check API connectivity and Jaccard similarity thresholds.
+[2m2026-04-12T19:10:33.291473Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m180 [3mprev_gwei[0m[2m=[0m217
+[2m2026-04-12T19:10:33.449167Z[0m [32m INFO[0m [2mmercury::inventory::reconciler[0m[2m:[0m Reconciliation complete [3mopen_positions[0m[2m=[0m0 [3mtotal_position_value[0m[2m=[0m0
+[2m2026-04-12T19:10:40.278269Z[0m [33m WARN[0m [2mmercury::feeds::discovery[0m[2m:[0m ⚠️  ZERO markets matched! poly_count=5100 kalshi_count=314
+[2m2026-04-12T19:10:40.281480Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Discovery cycle complete [3mtotal[0m[2m=[0m0 [3mactive[0m[2m=[0m0
+[2m2026-04-12T19:10:47.777721Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket 15-min/crypto pass: 92 markets
+[2m2026-04-12T19:10:48.169255Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m148 [3mprev_gwei[0m[2m=[0m180
+[2m2026-04-12T19:11:00.101710Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Polymarket markets fetched: 5100
+[2m2026-04-12T19:11:00.103198Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket markets fetched [3mcount[0m[2m=[0m5100
+[2m2026-04-12T19:11:02.655196Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXBTC15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:11:02.655355Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXETH15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:11:02.655445Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXSOL15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:11:02.655534Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXXRP15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:11:02.655617Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXBNB15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:11:02.657986Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXETH" [3mcount[0m[2m=[0m165
+[2m2026-04-12T19:11:02.659882Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXMLB" [3mcount[0m[2m=[0m30
+[2m2026-04-12T19:11:02.663697Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXFED" [3mcount[0m[2m=[0m120
+[2m2026-04-12T19:11:02.665799Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXCPI" [3mcount[0m[2m=[0m68
+[2m2026-04-12T19:11:03.649290Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m162 [3mprev_gwei[0m[2m=[0m148
+[2m2026-04-12T19:11:04.247784Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Kalshi markets fetched: 388
+[2m2026-04-12T19:11:04.247910Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi markets fetched [3mcount[0m[2m=[0m388
+[2m2026-04-12T19:11:04.259474Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m === DISCOVERY DIAGNOSTICS ===
+[2m2026-04-12T19:11:04.268414Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket 15-min/BTC candidates: 63
+[2m2026-04-12T19:11:04.268507Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 1m before gta vi | exp=2026-07-31 12:00:00 UTC | id_prefix=10526756807365906821
+[2m2026-04-12T19:11:04.268558Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 150k by june 30 2026 | exp=2026-07-01 04:00:00 UTC | id_prefix=13915689317269078219
+[2m2026-04-12T19:11:04.268605Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 150k by december 31 2026 | exp=2027-01-01 04:00:00 UTC | id_prefix=93694900555669388759
+[2m2026-04-12T19:11:04.268653Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will freddie mac s market cap be less than 150b at market close on ipo day | exp=2026-06-30 00:00:00 UTC | id_prefix=65741715476066904623
+[2m2026-04-12T19:11:04.268703Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will freddie mac s market cap be between 150b and 200b at market close on ipo day | exp=2026-06-30 00:00:00 UTC | id_prefix=81197908990814001611
+[2m2026-04-12T19:11:04.269096Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi BTC/15M candidates: 5
+[2m2026-04-12T19:11:04.269136Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: btc price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXBTC15M-26APR121515-15
+[2m2026-04-12T19:11:04.269181Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: eth price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXETH15M-26APR121515-15
+[2m2026-04-12T19:11:04.269226Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: sol price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXSOL15M-26APR121515-15
+[2m2026-04-12T19:11:04.269270Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: xrp price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXXRP15M-26APR121515-15
+[2m2026-04-12T19:11:04.269367Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: bnb price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXBNB15M-26APR121515-15
+[2m2026-04-12T19:11:04.269415Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Kalshi markets: 388 | Total Polymarket: 5100
+[2m2026-04-12T19:11:18.466469Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m179 [3mprev_gwei[0m[2m=[0m162
+[2m2026-04-12T19:11:28.486170Z[0m [33m WARN[0m [2mmercury::feeds::discovery[0m[2m:[0m ⚠️  ZERO markets matched! poly_count=5100 kalshi_count=388
+[2m2026-04-12T19:11:28.489415Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Discovery cycle complete [3mtotal[0m[2m=[0m0 [3mactive[0m[2m=[0m0
+[2m2026-04-12T19:11:32.125301Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket 15-min/crypto pass: 92 markets
+[2m2026-04-12T19:11:32.746928Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m === MERCURY STATUS === [3mregistered_markets[0m[2m=[0m0 [3marb_pairs[0m[2m=[0m0 [3mactive_actors[0m[2m=[0m0 [3mopen_positions[0m[2m=[0m0 [3min_flight_trades[0m[2m=[0m0 [3mbankroll[0m[2m=[0m10000.00 [3mdaily_pnl[0m[2m=[0m0 [3mopps_detected[0m[2m=[0m0 [3mopps_passed[0m[2m=[0m0 [3mgate1_below_spread[0m[2m=[0m0 [3mgate2_low_liquidity[0m[2m=[0m0 [3mgate3_stale_data[0m[2m=[0m0 [3mgate4_low_confidence[0m[2m=[0m0 [3mgate5_capacity[0m[2m=[0m0
+[2m2026-04-12T19:11:32.747078Z[0m [33m WARN[0m [2mmercury[0m[2m:[0m Registry has 0 markets — discovery has not produced matches yet. Check API connectivity and Jaccard similarity thresholds.
+[2m2026-04-12T19:11:33.069986Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m178 [3mprev_gwei[0m[2m=[0m179
+[2m2026-04-12T19:11:33.087038Z[0m [32m INFO[0m [2mmercury::inventory::reconciler[0m[2m:[0m Reconciliation complete [3mopen_positions[0m[2m=[0m0 [3mtotal_position_value[0m[2m=[0m0
+[2m2026-04-12T19:11:48.021857Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m171 [3mprev_gwei[0m[2m=[0m178
+[2m2026-04-12T19:11:58.815849Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Polymarket markets fetched: 5100
+[2m2026-04-12T19:11:58.816449Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket markets fetched [3mcount[0m[2m=[0m5100
+[2m2026-04-12T19:12:03.127619Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m182 [3mprev_gwei[0m[2m=[0m171
+[2m2026-04-12T19:12:10.791919Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXBTC15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:12:10.792057Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXETH15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:12:10.792136Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXSOL15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:12:10.792218Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXDOGE15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:12:10.792295Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXXRP15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:12:10.792373Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXBNB15M" [3mcount[0m[2m=[0m1
+[2m2026-04-12T19:12:10.796250Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXBTC" [3mcount[0m[2m=[0m318
+[2m2026-04-12T19:12:10.801399Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXETH" [3mcount[0m[2m=[0m165
+[2m2026-04-12T19:12:10.803162Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXNBA" [3mcount[0m[2m=[0m20
+[2m2026-04-12T19:12:10.803831Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXNHL" [3mcount[0m[2m=[0m25
+[2m2026-04-12T19:12:10.804584Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXMLB" [3mcount[0m[2m=[0m30
+[2m2026-04-12T19:12:10.808485Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXFED" [3mcount[0m[2m=[0m120
+[2m2026-04-12T19:12:10.810613Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi series fetched [3mseries[0m[2m=[0m"KXCPI" [3mcount[0m[2m=[0m68
+[2m2026-04-12T19:12:16.043984Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Kalshi markets fetched: 752
+[2m2026-04-12T19:12:16.044157Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi markets fetched [3mcount[0m[2m=[0m752
+[2m2026-04-12T19:12:16.061074Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m === DISCOVERY DIAGNOSTICS ===
+[2m2026-04-12T19:12:16.070674Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Polymarket 15-min/BTC candidates: 63
+[2m2026-04-12T19:12:16.070768Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 1m before gta vi | exp=2026-07-31 12:00:00 UTC | id_prefix=10526756807365906821
+[2m2026-04-12T19:12:16.070820Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 150k by june 30 2026 | exp=2026-07-01 04:00:00 UTC | id_prefix=13915689317269078219
+[2m2026-04-12T19:12:16.070867Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will btc hit 150k by december 31 2026 | exp=2027-01-01 04:00:00 UTC | id_prefix=93694900555669388759
+[2m2026-04-12T19:12:16.070909Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will freddie mac s market cap be less than 150b at market close on ipo day | exp=2026-06-30 00:00:00 UTC | id_prefix=65741715476066904623
+[2m2026-04-12T19:12:16.070959Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   POLY: will freddie mac s market cap be between 150b and 200b at market close on ipo day | exp=2026-06-30 00:00:00 UTC | id_prefix=81197908990814001611
+[2m2026-04-12T19:12:16.071980Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Kalshi BTC/15M candidates: 324
+[2m2026-04-12T19:12:16.072090Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: btc price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXBTC15M-26APR121515-15
+[2m2026-04-12T19:12:16.072156Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: eth price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXETH15M-26APR121515-15
+[2m2026-04-12T19:12:16.072235Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: sol price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXSOL15M-26APR121515-15
+[2m2026-04-12T19:12:16.072348Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: doge price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXDOGE15M-26APR121515-15
+[2m2026-04-12T19:12:16.072438Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m   KALSHI: xrp price up in next 15 min | exp=2026-04-12 19:15:00 UTC | ticker=KXXRP15M-26APR121515-15
+[2m2026-04-12T19:12:16.072529Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Total Kalshi markets: 752 | Total Polymarket: 5100
+[2m2026-04-12T19:12:18.185109Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m170 [3mprev_gwei[0m[2m=[0m182
+[2m2026-04-12T19:12:29.102960Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m SIGTERM received — initiating graceful shutdown
+[2m2026-04-12T19:12:29.103506Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Feed handler cancelled via token [3mplatform[0m[2m=[0mKalshi
+[2m2026-04-12T19:12:29.103512Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Feed handler cancelled via token [3mplatform[0m[2m=[0mPolymarket
+[2m2026-04-12T19:12:29.103633Z[0m [31mERROR[0m [2mmercury[0m[2m:[0m CRITICAL: Background task failure. Initiating emergency shutdown.
+[2m2026-04-12T19:12:29.104766Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Final WAL checkpoint complete

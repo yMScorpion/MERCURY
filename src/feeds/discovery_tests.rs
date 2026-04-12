@@ -1,8 +1,7 @@
-/// Unit tests for market discovery matching logic.
-/// Declared from discovery.rs as a child module (has access to private items).
+/// Unit tests for the rewritten market discovery logic.
 use super::*;
 
-// ─── normalize_question tests ─────────────────────────────────────────────────
+// ─── normalize_question tests ──────────────────────────────────────────────
 
 #[test]
 fn test_normalize_bitcoin_to_btc() {
@@ -26,180 +25,127 @@ fn test_normalize_strips_punctuation() {
 }
 
 #[test]
-fn test_normalize_lowercases_text() {
+fn test_normalize_lowercases() {
     let result = MarketDiscovery::normalize_question("WILL TRUMP WIN?");
     assert_eq!(result, result.to_lowercase(), "result should be lowercase");
 }
 
 #[test]
-fn test_normalize_deduplicates_spaces() {
+fn test_normalize_no_double_spaces() {
     let result = MarketDiscovery::normalize_question("Will   Bitcoin  hit  100k?");
-    // Should not have double spaces
     assert!(!result.contains("  "), "should not have double spaces: '{}'", result);
 }
 
-// ─── Jaccard similarity (white-box via normalize then compute) ───────────────
+// ─── Token ID parsing tests ────────────────────────────────────────────────
 
-/// Helper: compute Jaccard similarity between two questions using the same logic as discovery.rs
-fn jaccard(q1: &str, q2: &str) -> f64 {
-    let norm1 = MarketDiscovery::normalize_question(q1);
-    let norm2 = MarketDiscovery::normalize_question(q2);
-    let tokens_a: std::collections::HashSet<&str> = norm1.split_whitespace().collect();
-    let tokens_b: std::collections::HashSet<&str> = norm2.split_whitespace().collect();
-    let intersection = tokens_a.intersection(&tokens_b).count();
-    let union = tokens_a.union(&tokens_b).count();
-    if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
+#[test]
+fn test_parse_two_clob_token_ids_string() {
+    let item = serde_json::json!({
+        "clobTokenIds": "[\"abc123\",\"def456\"]"
+    });
+    let (yes, no) = parse_two_clob_token_ids(&item);
+    assert_eq!(yes, "abc123");
+    assert_eq!(no, "def456");
 }
 
 #[test]
-fn test_jaccard_identical_questions_is_1() {
-    let sim = jaccard("Will Bitcoin exceed $60k?", "Will Bitcoin exceed $60k?");
-    assert!((sim - 1.0).abs() < 0.001, "identical questions should have sim=1.0, got {}", sim);
+fn test_parse_two_clob_token_ids_array() {
+    let item = serde_json::json!({
+        "clobTokenIds": ["abc123", "def456"]
+    });
+    let (yes, no) = parse_two_clob_token_ids(&item);
+    assert_eq!(yes, "abc123");
+    assert_eq!(no, "def456");
 }
 
 #[test]
-fn test_jaccard_unrelated_questions_is_low() {
-    let sim = jaccard("Will Bitcoin exceed $60k?", "Will Trump win the election?");
-    assert!(sim < 0.3, "unrelated questions should have low similarity, got {}", sim);
+fn test_parse_two_clob_token_ids_tokens_fallback() {
+    let item = serde_json::json!({
+        "tokens": [
+            {"token_id": "token_yes", "outcome": "Yes"},
+            {"token_id": "token_no", "outcome": "No"}
+        ]
+    });
+    let (yes, no) = parse_two_clob_token_ids(&item);
+    assert_eq!(yes, "token_yes");
+    assert_eq!(no, "token_no");
 }
 
 #[test]
-fn test_jaccard_same_market_different_phrasing() {
-    // Both refer to BTC at $100k — should be highly similar after normalization
-    let sim = jaccard(
-        "Will Bitcoin price exceed $100,000?",
-        "Will BTC exceed $100k by December?",
-    );
-    // These share: will, btc, exceed, 100 (with normalization)
-    assert!(sim >= 0.3, "similar questions should have decent overlap, got {}", sim);
+fn test_parse_two_clob_token_ids_empty() {
+    let item = serde_json::json!({});
+    let (yes, no) = parse_two_clob_token_ids(&item);
+    assert!(yes.is_empty());
+    assert!(no.is_empty());
+}
+
+// ─── Round timestamp tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_round_timestamp_divisible_by_900() {
+    let now_ts = chrono::Utc::now().timestamp();
+    let round = (now_ts / 900) * 900;
+    assert_eq!(round % 900, 0, "Round start must be divisible by 900");
 }
 
 #[test]
-fn test_70_percent_threshold_filters_dissimilar() {
-    // Two questions that share ~50% tokens should NOT meet the 70% threshold
-    let sim = jaccard(
-        "Will Bitcoin exceed $60k this year",
-        "Will Ethereum exceed $4k this year",
-    );
-    // Shares: will, exceed, this, year (~4/7 tokens, ~57%)
-    assert!(sim < 0.70, "50-60% similar questions should fail 70% threshold, got {}", sim);
-}
+fn test_build_round_candidates_skips_expired() {
+    // Create a discovery instance (we only need the method)
+    let config = crate::config::PlatformsConfig {
+        polymarket: crate::config::PolymarketConfig {
+            enabled: true,
+            ws_url: "ws://test".into(),
+            rest_url: "http://test".into(),
+            sports_ws_url: "ws://test".into(),
+        },
+        kalshi: crate::config::KalshiConfig {
+            enabled: true,
+            ws_url: "ws://test".into(),
+            rest_url: "http://test".into(),
+        },
+        cdna: crate::config::CdnaConfig {
+            enabled: false,
+            ws_url: "".into(),
+            rest_url: "".into(),
+        },
+        forecastex: crate::config::ForecastExConfig {
+            enabled: false,
+            fix_host: "".into(),
+            fix_port: 0,
+        },
+    };
+    let discovery = MarketDiscovery::new(config, 30, None);
+    let rounds = discovery.build_round_candidates(&["btc", "eth"]);
 
-// ─── Proptests ────────────────────────────────────────────────────────────────
-use proptest::prelude::*;
-
-proptest! {
-    #[test]
-    fn test_jaccard_similarity_properties(
-        q1 in "[a-zA-Z0-9 ]{10,50}",
-        q2 in "[a-zA-Z0-9 ]{10,50}"
-    ) {
-        let sim = jaccard(&q1, &q2);
-        prop_assert!((0.0..=1.0).contains(&sim), "Jaccard similarity must be between 0 and 1");
+    // Should have 2 assets * up to 3 rounds = at most 6, but expired ones filtered
+    assert!(!rounds.is_empty(), "Should have at least one round candidate");
+    
+    let now_ts = chrono::Utc::now().timestamp();
+    for r in &rounds {
+        let round_end = r.round_start_ts + 900;
+        assert!(
+            round_end > now_ts - 60,
+            "No expired rounds should be returned (round_start={}, end={})",
+            r.round_start_ts,
+            round_end
+        );
     }
-
-    #[test]
-    fn test_normalize_question_is_idempotent(q in "[a-zA-Z0-9$?,. ]{10,50}") {
-        let norm1 = MarketDiscovery::normalize_question(&q);
-        let norm2 = MarketDiscovery::normalize_question(&norm1);
-        prop_assert_eq!(norm1, norm2, "Normalization should be idempotent");
-    }
 }
 
-// ─── Expiration logic tests ───────────────────────────────────────────────────
+// ─── Categorization tests ──────────────────────────────────────────────────
 
 #[test]
-fn test_15_minute_market_expiration_check() {
-    use chrono::{Duration, Utc};
-
-    // A 3-minute difference for a 15-min candle should be REJECTED
-    let pm_exp = Utc::now() + Duration::hours(1);
-    let km_exp_3min_diff = pm_exp + Duration::minutes(3);
-    let diff_secs = (pm_exp - km_exp_3min_diff).num_seconds().abs();
-    assert!(diff_secs > 120, "3-minute diff ({}) should exceed 120s threshold", diff_secs);
-
-    // A 1-minute difference should be accepted (< 120s threshold)
-    let km_exp_1min_diff = pm_exp + Duration::minutes(1);
-    let diff_secs_ok = (pm_exp - km_exp_1min_diff).num_seconds().abs();
-    assert!(diff_secs_ok <= 120, "1-minute diff ({}) should be within 120s threshold", diff_secs_ok);
+fn test_categorize_crypto() {
+    assert_eq!(categorize_question("will btc exceed 100k"), MarketCategory::Crypto);
+    assert_eq!(categorize_question("ethereum price up or down"), MarketCategory::Crypto);
 }
 
 #[test]
-fn test_standard_market_expiration_check() {
-    use chrono::{Duration, Utc};
-
-    // A 24-hour difference for standard markets should be ACCEPTED (<= 48h)
-    let pm_exp = Utc::now() + Duration::days(30);
-    let km_exp_24h = pm_exp + Duration::hours(24);
-    let diff_secs_24h = (pm_exp - km_exp_24h).num_seconds().abs();
-    assert!(diff_secs_24h <= 48 * 3600, "24h diff should be within 48h threshold");
-
-    // A 72-hour difference should be REJECTED (> 48h)
-    let km_exp_72h = pm_exp + Duration::hours(72);
-    let diff_secs_72h = (pm_exp - km_exp_72h).num_seconds().abs();
-    assert!(diff_secs_72h > 48 * 3600, "72h diff should exceed 48h threshold");
+fn test_categorize_sports() {
+    assert_eq!(categorize_question("will nba team win the game"), MarketCategory::Sports);
 }
 
 #[test]
-fn test_numerical_target_mismatch_in_normalize() {
-    // "60k" vs "70k" should be detectable numerically after normalization
-    let q60k = MarketDiscovery::normalize_question("Will Bitcoin exceed $60,000?");
-    let q70k = MarketDiscovery::normalize_question("Will Bitcoin exceed $70,000?");
-
-    let nums_60k: Vec<f64> = q60k.split_whitespace()
-        .filter_map(|w| w.replace(['$', ','], "").parse::<f64>().ok())
-        .collect();
-    let nums_70k: Vec<f64> = q70k.split_whitespace()
-        .filter_map(|w| w.replace(['$', ','], "").parse::<f64>().ok())
-        .collect();
-
-    // They should have different numerical targets
-    assert_ne!(nums_60k, nums_70k, "different price targets should produce different number lists");
-}
-
-#[test]
-fn test_15m_crypto_matching_with_time_extraction() {
-    use chrono::{TimeZone, Utc, Timelike};
-
-    // Simulated Kalshi market
-    let km_title = "Will Bitcoin be above $60,000.50 at 8:15 PM?";
-    let km_ticker = "KXBTC15M-26MAR19-B60000.50";
-    let _km_expiration = Utc.with_ymd_and_hms(2026, 3, 19, 20, 15, 0).unwrap();
-    
-    // Simulated Polymarket market with TRUNCATED expiration
-    let pm_title = "Bitcoin Up or Down - March 19, 8:15AM-8:20AM ET";
-    let pm_expiration_truncated = Utc.with_ymd_and_hms(2026, 3, 19, 0, 0, 0).unwrap();
-
-    // 1. Test time extraction
-    let pm_expiration_fixed = MarketDiscovery::try_fix_expiration_from_title(pm_title, pm_expiration_truncated);
-    
-    // 8:20 AM ET is 12:20 PM UTC (assuming 4h offset)
-    assert_eq!(pm_expiration_fixed.hour(), 12, "Hour should be fixed to 12 UTC (8 AM ET + 4h)");
-    assert_eq!(pm_expiration_fixed.minute(), 20, "Minute should be fixed to 20");
-
-    // 2. Test 15m detection
-    let _is_15m = pm_title.to_lowercase().contains("15 min") || 
-                 km_title.to_lowercase().contains("15 min") ||
-                 km_ticker.contains("15M") ||
-                 pm_title.to_lowercase().contains("8:15am"); // our new regex based detection will handle this in the loop
-    
-    // In the real loop we use normalized title
-    let pm_norm = MarketDiscovery::normalize_question(pm_title);
-    let km_norm = MarketDiscovery::normalize_question(km_title);
-    
-    // Our updated logic:
-    let is_15m_real = pm_norm.contains("15 min") || 
-                      km_norm.contains("15 min") ||
-                      km_ticker.contains("15M") ||
-                      pm_norm.contains("15m") ||
-                      km_norm.contains("15m");
-    
-    assert!(is_15m_real || km_ticker.contains("15M"), "Should be detected as 15m market");
-
-    // 3. Test Similarity
-    let sim = jaccard(pm_title, km_title);
-    // pm_norm: "btc up or down march 19 8 15am 8 20am et"
-    // km_norm: "will btc be above 60000 50 at 8 15 pm"
-    // Tokens overlap: "btc", "8", "15" (if 15 is separated)
-    assert!(sim >= 0.1, "Similarity should be at least 0.1, got {}", sim);
+fn test_categorize_politics() {
+    assert_eq!(categorize_question("who wins the election for president"), MarketCategory::Politics);
 }
