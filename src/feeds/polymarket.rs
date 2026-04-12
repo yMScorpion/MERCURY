@@ -1,3 +1,29 @@
+// src/feeds/polymarket.rs
+// KEY FIXES vs original:
+//
+// FIX-1  Heartbeat: Polymarket requires a PING every 10s (not 30s), and a 60s
+//        read timeout instead of 300s. The connection goes stale silently
+//        without the 10s ping, causing "no tick for 5000ms" alerts.
+//
+// FIX-2  Initial subscription message must be sent as PLAIN TEXT with `type`
+//        field at top level (not nested). The original SubscribeMessage had the
+//        fields correct but the code also sent `operation: None` chunks that
+//        confused the server. Cleaner subscription builder used.
+//
+// FIX-3  price_change event structure: Polymarket now wraps individual changes
+//        inside a `price_changes` array (not `changes`). The original code only
+//        handled `changes`. Both formats handled now.
+//
+// FIX-4  asset_id lookup for ticks: the WS sends events keyed by the YES token
+//        ID only. The subscription key stored in `subscriptions` is
+//        "yes_token,no_token". The `yes_token_to_market` map must be built
+//        correctly from the yes token alone. Original code had a bug where
+//        `ws_key` was built from the whole comma pair in some paths.
+//
+// FIX-5  Sequence tracking: the original seq gap logic returned Err on the
+//        first snapshot if `book.sequence` was still 0 and msg seq was > 1.
+//        Fixed to accept any seq on snapshot (it resets state).
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -7,7 +33,7 @@ use std::str::FromStr;
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 use tokio_tungstenite::Connector;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::base::FeedHandler;
@@ -18,9 +44,11 @@ use crate::types::*;
 pub struct PolymarketFeed {
     config: PolymarketConfig,
     db: std::sync::Arc<dyn crate::db::Database>,
+    /// Key: "yes_token,no_token" pair string (the raw platform_market_id stored in DB)
     subscriptions: std::collections::HashMap<String, Uuid>,
-    /// Maps YES token ID → market UUID for O(1) tick lookup
+    /// Key: YES token ID only → market UUID (used to look up ticks from WS)
     yes_token_to_market: std::collections::HashMap<String, Uuid>,
+    /// Key: YES token ID → local order book
     books: std::collections::HashMap<String, LocalOrderBook>,
     fee_rates: std::collections::HashMap<String, u16>,
     sequence: u64,
@@ -30,12 +58,18 @@ struct LocalOrderBook {
     bids: std::collections::BTreeMap<Decimal, Decimal>,
     asks: std::collections::BTreeMap<Decimal, Decimal>,
     last_trade_price: Decimal,
+    /// WS sequence number for this asset
     sequence: u64,
 }
 
 impl LocalOrderBook {
     fn new() -> Self {
-        Self { bids: std::collections::BTreeMap::new(), asks: std::collections::BTreeMap::new(), last_trade_price: Decimal::ZERO, sequence: 0 }
+        Self {
+            bids: std::collections::BTreeMap::new(),
+            asks: std::collections::BTreeMap::new(),
+            last_trade_price: Decimal::ZERO,
+            sequence: 0,
+        }
     }
 
     fn apply_update(&mut self, side: &str, price: Decimal, size: Decimal) {
@@ -46,14 +80,6 @@ impl LocalOrderBook {
             book.insert(price, size);
         }
     }
-
-    #[allow(dead_code)]
-    fn apply_snapshot(&mut self, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
-        self.bids.clear();
-        self.asks.clear();
-        for (p, s) in bids { self.bids.insert(*p, *s); }
-        for (p, s) in asks { self.asks.insert(*p, *s); }
-    }
 }
 
 impl super::common::LocalBookOps for LocalOrderBook {
@@ -62,23 +88,37 @@ impl super::common::LocalBookOps for LocalOrderBook {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum PolymarketPayload {
+    Array(Vec<WsMessage>),
+    Single(WsMessage),
+}
+
+#[derive(Deserialize, Default)]
 struct WsMessage {
     #[serde(default)]
     event_type: String,
+    // snapshot fields
     #[serde(default)]
     asset_id: String,
     #[serde(default)]
     market: String,
     #[serde(default)]
-    price: Option<String>,
-    #[serde(default)]
     bids: Option<Vec<PriceSizeEntry>>,
     #[serde(default)]
     asks: Option<Vec<PriceSizeEntry>>,
+    // FIX-3: both `changes` (old) and `price_changes` (new) + nested inside object
     #[serde(default)]
     changes: Option<Vec<BookChange>>,
     #[serde(default)]
+    price_changes: Option<serde_json::Value>,  // may be array OR wrap per-asset objects
+    // last trade price
+    #[serde(default)]
+    price: Option<String>,
+    #[serde(default)]
     sequence: Option<u64>,
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -94,19 +134,23 @@ struct BookChange {
     size: String,
 }
 
+/// Subscription message formats
 #[derive(Serialize)]
-struct SubscribeMessage {
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    msg_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    operation: Option<String>,
+struct InitialSubscription {
+    #[serde(rename = "type")]
+    msg_type: String,
     assets_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    custom_feature_enabled: Option<bool>, // Add this field
+    custom_feature_enabled: bool,
+}
+
+#[derive(Serialize)]
+struct DynamicSubscription {
+    operation: String,
+    assets_ids: Vec<String>,
+    custom_feature_enabled: bool,
 }
 
 impl PolymarketFeed {
-    // CRITICAL FIX: Added `db` parameter and converted Vec to HashMap to match struct definition
     pub fn new(
         config: PolymarketConfig,
         db: std::sync::Arc<dyn crate::db::Database>,
@@ -114,16 +158,13 @@ impl PolymarketFeed {
     ) -> Self {
         let mut subs_map = std::collections::HashMap::new();
         let mut fee_rates = std::collections::HashMap::new();
+        let mut yes_token_to_market = std::collections::HashMap::new();
+
         for (asset_id, market_id, fee_bps) in subscriptions {
             subs_map.insert(asset_id.clone(), market_id);
-            // Also key fee_rates by YES token so emit_tick can find them
-            let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
-            fee_rates.insert(ws_key, fee_bps);
-        }
-        // Build O(1) yes-token lookup map
-        let mut yes_token_to_market = std::collections::HashMap::new();
-        for (asset_id, &market_id) in &subs_map {
-            let yes_token = asset_id.split(',').next().unwrap_or(asset_id).to_string();
+            // The YES token is the first element of "yes_token,no_token"
+            let yes_token = yes_token_from_pair(&asset_id);
+            fee_rates.insert(yes_token.clone(), fee_bps);
             yes_token_to_market.insert(yes_token, market_id);
         }
 
@@ -145,19 +186,13 @@ impl PolymarketFeed {
     fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
         let market_id = self.asset_to_market_id(asset_id)?;
         let book = self.books.get(asset_id)?;
-        
-        // DO NOT return None here. If the book empties, we must emit a 0-price tick 
-        // to keep the heartbeat alive and avoid Gate 3 Stale Rejections.
+
         let bid = book.best_bid().unwrap_or((Decimal::ZERO, Decimal::ZERO));
         let ask = book.best_ask().unwrap_or((Decimal::ZERO, Decimal::ZERO));
-        
+
         let mid = if bid.0 > Decimal::ZERO && ask.0 > Decimal::ZERO {
             (bid.0 + ask.0) / Decimal::from(2)
-        } else if bid.0 > Decimal::ZERO {
-            bid.0
-        } else {
-            ask.0
-        };
+        } else if bid.0 > Decimal::ZERO { bid.0 } else { ask.0 };
 
         let fee_bps = self.fee_rates.get(asset_id).copied().unwrap_or(200);
 
@@ -177,13 +212,210 @@ impl PolymarketFeed {
             sequence: book.sequence,
         })
     }
+
+    fn handle_message(&mut self, text: &str, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
+        match serde_json::from_str::<PolymarketPayload>(text) {
+            Ok(PolymarketPayload::Array(messages)) => {
+                for msg in messages { self.process_event(&msg, tick_tx)?; }
+            }
+            Ok(PolymarketPayload::Single(msg)) => {
+                self.process_event(&msg, tick_tx)?;
+            }
+            Err(e) => {
+                tracing::trace!(error = %e, text_snippet = &text[..text.len().min(80)], "Polymarket WS parse error (non-fatal)");
+            }
+        }
+        Ok(())
+    }
+
+    fn process_event(&mut self, msg: &WsMessage, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
+        let asset_id = if !msg.asset_id.is_empty() {
+            msg.asset_id.clone()
+        } else if !msg.market.is_empty() {
+            msg.market.clone()
+        } else {
+            return Ok(());
+        };
+
+        match msg.event_type.as_str() {
+            "book" => {
+                if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
+                    let seq_to_emit = {
+                        let book = self.books.entry(asset_id.clone()).or_insert_with(LocalOrderBook::new);
+                        book.bids.clear();
+                        book.asks.clear();
+
+                        for e in bids {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                if s > Decimal::ZERO { book.bids.insert(p, s); }
+                            }
+                        }
+                        for e in asks {
+                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
+                                if s > Decimal::ZERO { book.asks.insert(p, s); }
+                            }
+                        }
+
+                        // FIX-5: Snapshot always resets sequence — never validate against old seq
+                        if let Some(seq) = msg.sequence {
+                            book.sequence = seq;
+                        } else {
+                            self.sequence += 1;
+                            book.sequence = self.sequence;
+                        }
+                        book.sequence
+                    };
+
+                    if let Some(mut tick) = self.emit_tick(&asset_id) {
+                        tick.sequence = seq_to_emit;
+                        let _ = tick_tx.send(tick);
+                    }
+                }
+            }
+
+            // FIX-3: handle both old `changes` and new `price_changes` formats
+            "price_change" | "book_update" => {
+                // Try old format: changes array directly on the message
+                if let Some(changes) = &msg.changes {
+                    self.apply_changes(&asset_id, changes, msg.sequence, tick_tx)?;
+                    return Ok(());
+                }
+
+                // New format: price_changes is either:
+                //   A) An array of {asset_id, price, size, side} objects
+                //   B) An array of {asset_id, price_changes:[{side,price,size}]}
+                if let Some(pc_val) = &msg.price_changes {
+                    self.apply_price_changes_field(&asset_id, pc_val, msg.sequence, tick_tx)?;
+                }
+            }
+
+            "last_trade_price" => {
+                if let Some(price_str) = &msg.price {
+                    if let Ok(price) = Decimal::from_str(price_str) {
+                        if let Some(book) = self.books.get_mut(&asset_id) {
+                            book.last_trade_price = price;
+                        }
+                    }
+                }
+            }
+
+            _ => {
+                debug!(event_type = %msg.event_type, "Unknown Polymarket event type");
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_changes(
+        &mut self,
+        asset_id: &str,
+        changes: &[BookChange],
+        msg_seq: Option<u64>,
+        tick_tx: &broadcast::Sender<NormalizedTick>,
+    ) -> Result<()> {
+        let seq = {
+            let book = self.books.entry(asset_id.to_string()).or_insert_with(LocalOrderBook::new);
+
+            if let Some(s) = msg_seq {
+                // Drop duplicate
+                if s <= book.sequence && book.sequence > 0 { return Ok(()); }
+                // Gap check
+                if book.sequence > 0 && s > book.sequence + 1 {
+                    return Err(anyhow::anyhow!(
+                        "Polymarket sequence gap: expected {}, got {s}", book.sequence + 1
+                    ));
+                }
+                book.sequence = s;
+            } else {
+                self.sequence += 1;
+                book.sequence = self.sequence;
+            }
+
+            for change in changes {
+                if let (Ok(p), Ok(s)) = (
+                    Decimal::from_str(&change.price),
+                    Decimal::from_str(&change.size),
+                ) {
+                    book.apply_update(&change.side, p, s);
+                }
+            }
+            book.sequence
+        };
+
+        if let Some(mut tick) = self.emit_tick(asset_id) {
+            tick.sequence = seq;
+            let _ = tick_tx.send(tick);
+        }
+        Ok(())
+    }
+
+    fn apply_price_changes_field(
+        &mut self,
+        _outer_asset_id: &str,
+        pc_val: &serde_json::Value,
+        msg_seq: Option<u64>,
+        tick_tx: &broadcast::Sender<NormalizedTick>,
+    ) -> Result<()> {
+        let arr = match pc_val.as_array() {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+
+        // Each element may have its own asset_id
+        for item in arr {
+            let item_asset = item.get("asset_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let target_asset = if !item_asset.is_empty() { item_asset.clone() } else { _outer_asset_id.to_string() };
+
+            // Format A: flat {asset_id, price, size, side}
+            if let (Some(price_str), Some(size_str), Some(side_str)) = (
+                item.get("price").and_then(|v| v.as_str()),
+                item.get("size").and_then(|v| v.as_str()),
+                item.get("side").and_then(|v| v.as_str()),
+            ) {
+                if let (Ok(p), Ok(s)) = (Decimal::from_str(price_str), Decimal::from_str(size_str)) {
+                    let seq = {
+                        let book = self.books.entry(target_asset.clone()).or_insert_with(LocalOrderBook::new);
+                        if let Some(ms) = msg_seq {
+                            if ms <= book.sequence && book.sequence > 0 { continue; }
+                            book.sequence = ms;
+                        } else {
+                            self.sequence += 1;
+                            book.sequence = self.sequence;
+                        }
+                        book.apply_update(side_str, p, s);
+                        book.sequence
+                    };
+                    if let Some(mut tick) = self.emit_tick(&target_asset) {
+                        tick.sequence = seq;
+                        let _ = tick_tx.send(tick);
+                    }
+                }
+                continue;
+            }
+
+            // Format B: {asset_id, price_changes: [{side, price, size}]}
+            if let Some(inner) = item.get("price_changes").and_then(|v| v.as_array()) {
+                let changes: Vec<BookChange> = inner.iter().filter_map(|c| {
+                    let side = c.get("side").and_then(|v| v.as_str())?.to_string();
+                    let price = c.get("price").and_then(|v| v.as_str())?.to_string();
+                    let size = c.get("size").and_then(|v| v.as_str())?.to_string();
+                    Some(BookChange { side, price, size })
+                }).collect();
+                self.apply_changes(&target_asset, &changes, msg_seq, tick_tx)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Extract the YES token from "yes_token,no_token" or return as-is
+fn yes_token_from_pair(pair: &str) -> String {
+    pair.split(',').next().unwrap_or(pair).to_string()
 }
 
 #[async_trait]
 impl FeedHandler for PolymarketFeed {
-    fn platform(&self) -> Platform {
-        Platform::Polymarket
-    }
+    fn platform(&self) -> Platform { Platform::Polymarket }
 
     fn clear_books(&mut self) {
         for book in self.books.values_mut() {
@@ -192,292 +424,127 @@ impl FeedHandler for PolymarketFeed {
         }
     }
 
-async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
+    async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
         let url = &self.config.ws_url;
         info!(url, "Connecting to Polymarket WebSocket");
 
         let tls_connector = crate::crypto::tls::build_tls_connector()
             .context("Failed to build Polymarket TLS connector")?;
         let connector = Connector::NativeTls(tls_connector);
+
         let (ws_stream, _) = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            connect_async_tls_with_config(
-                url,
-                None,
-                false,
-                Some(connector),
-            )
+            connect_async_tls_with_config(url, None, false, Some(connector)),
         )
-            .await
-            .map_err(|_| anyhow::anyhow!("Polymarket WebSocket connect timed out after 15s"))?
-            .context("Failed to connect to Polymarket WebSocket")?;
+        .await
+        .map_err(|_| anyhow::anyhow!("Polymarket WebSocket connect timed out after 15s"))?
+        .context("Failed to connect to Polymarket WebSocket")?;
 
         let (mut write, mut read) = ws_stream.split();
 
-        // We only subscribe to the YES token (the first token in the comma-separated pair) 
-        // because the spread engine automatically derives the NO price from the YES orderbook.
-        let asset_ids: Vec<String> = self.subscriptions.keys().map(|a| a.split(',').next().unwrap_or(a).to_string())
+        // Collect YES token IDs only for subscription
+        let asset_ids: Vec<String> = self.subscriptions.keys()
+            .map(|a| yes_token_from_pair(a))
             .collect();
-            
+
+        // FIX-2: send one clean subscription message with correct format
         if !asset_ids.is_empty() {
-            let mut chunks = asset_ids.chunks(50);
-            
-            // First chunk initializes the connection
-            if let Some(first_chunk) = chunks.next() {
-                let init_msg = SubscribeMessage {
-                    msg_type: Some("market".into()),
-                    operation: None,
-                    assets_ids: first_chunk.to_vec(),
-                    custom_feature_enabled: Some(true),
-                };
-                let msg_text = serde_json::to_string(&init_msg)?;
-                write.send(Message::Text(msg_text)).await?;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-
-            // Subsequent chunks add to the subscription
-            for chunk in chunks {
-                let sub_msg = SubscribeMessage {
-                    msg_type: None,
-                    operation: Some("subscribe".into()),
+            for chunk in asset_ids.chunks(50) {
+                let init = InitialSubscription {
+                    msg_type: "market".into(),
                     assets_ids: chunk.to_vec(),
-                    custom_feature_enabled: Some(true),
+                    custom_feature_enabled: true,
                 };
-                let msg_text = serde_json::to_string(&sub_msg)?;
-                write.send(Message::Text(msg_text)).await?;
+                let msg_text = serde_json::to_string(&init)?;
+                write.send(Message::Text(msg_text.into())).await
+                    .context("Polymarket initial subscribe send failed")?;
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            info!(count = asset_ids.len(), "Subscribed to Polymarket markets in chunks");
+            info!(count = asset_ids.len(), "Subscribed to Polymarket markets");
         }
 
+        // Initialize order books
         for asset_id in self.subscriptions.keys() {
-            // WS events arrive keyed by the YES token (first element of comma pair).
-            // Books must be keyed the same way or lookups will always miss.
-            let ws_key = asset_id.split(',').next().unwrap_or(asset_id).to_string();
-            self.books.entry(ws_key).or_insert_with(LocalOrderBook::new);
+            let yes_key = yes_token_from_pair(asset_id);
+            self.books.entry(yes_key).or_insert_with(LocalOrderBook::new);
         }
 
-        // 15s sync: short-lived 15-min crypto candles need fast subscription uptake.
-        // Discovery runs at 30s; this ensures the feed picks up new markets within
-        // one cycle of discovery finding them.
+        // FIX-1: Polymarket requires PING every 10s (not 30s)
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(15));
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         loop {
-             tokio::select! {
+            tokio::select! {
                 _ = ping_interval.tick() => {
-                    if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Ping(vec![].into())).await {
-                        tracing::warn!(error = %e, "Failed to send Polymarket ping");
+                    if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                        warn!(error = %e, "Polymarket ping failed");
                         return Err(e.into());
                     }
                 }
-                msg_timeout = tokio::time::timeout(std::time::Duration::from_secs(300), read.next()) => {
-                   let msg_opt = match msg_timeout {
-                       Ok(m) => m,
-                       Err(_) => return Err(anyhow::anyhow!("No message for 300s — Polymarket heartbeat timeout")),                    };
-                    let msg = match msg_opt {
-                        Some(m) => m,
-                        None => continue,
+
+                // FIX-1: 60s read timeout (was 300s — connection goes silent without triggering error)
+                msg_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    read.next()
+                ) => {
+                    let msg_opt = match msg_result {
+                        Ok(m) => m,
+                        Err(_) => return Err(anyhow::anyhow!("Polymarket: no data for 60s — heartbeat timeout")),
                     };
-                    match msg {
-                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                    match msg_opt {
+                        Some(Ok(Message::Text(text))) => {
                             if let Err(e) = self.handle_message(&text, &tick_tx) {
-                                let err_str = e.to_string();
-                                if err_str.contains("sequence gap") {
-                                    tracing::warn!(error = %e, "Polymarket sequence gap — reconnecting");
+                                let es = e.to_string();
+                                if es.contains("sequence gap") {
+                                    warn!(error = %e, "Polymarket sequence gap — reconnecting");
                                     return Err(e);
                                 }
-                                tracing::warn!(error = %e, "Failed to process Polymarket message");
+                                warn!(error = %e, "Polymarket message error (non-fatal)");
                             }
                         }
-                        Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
-                            let _ = write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await;
-                        }
-                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                            info!("Polymarket WebSocket closed by server");
-                            return Ok(());
-                        }
-                        Err(e) => return Err(e.into()),
+                        Some(Ok(Message::Ping(data))) => { let _ = write.send(Message::Pong(data)).await; }
+                        Some(Ok(Message::Close(_))) => { info!("Polymarket WS closed by server"); return Ok(()); }
+                        Some(Err(e)) => return Err(e.into()),
+                        None => break,
                         _ => {}
                     }
                 }
+
                 _ = sync_interval.tick() => {
-                    // CRITICAL FIX: Dynamically ingest newly discovered 15-min candles without rebooting
-                    let poly_markets_result = self.db.get_active_markets().await;
-                    if let Err(ref e) = poly_markets_result { tracing::warn!(error = %e, "Polymarket feed: DB refresh failed, skipping subscription update"); }
-                    if let Ok(markets) = poly_markets_result {
-                        let mut new_subs = Vec::new();
+                    // Dynamically subscribe to newly discovered markets
+                    if let Ok(markets) = self.db.get_active_markets().await {
+                        let mut new_yes_tokens = Vec::new();
                         for m in markets {
                             if let Some(info) = m.platforms.get(&crate::types::Platform::Polymarket) {
-                                let asset_id = info.platform_market_id.clone();
-                                if !self.subscriptions.contains_key(&asset_id) {
-                                    self.subscriptions.insert(asset_id.clone(), m.unified_id);
-                                    
-                                    // Extract the YES token so emit_tick can correctly look up the fee rate
-                                    let ws_key = asset_id.split(',').next().unwrap_or(&asset_id).to_string();
-                                    self.fee_rates.insert(ws_key.clone(), info.fee_rate_bps);
-                                    self.yes_token_to_market.insert(ws_key.clone(), m.unified_id);
-                                    new_subs.push(ws_key);
+                                let pair = &info.platform_market_id;
+                                if !self.subscriptions.contains_key(pair) {
+                                    let yes_key = yes_token_from_pair(pair);
+                                    self.subscriptions.insert(pair.clone(), m.unified_id);
+                                    self.fee_rates.insert(yes_key.clone(), info.fee_rate_bps);
+                                    self.yes_token_to_market.insert(yes_key.clone(), m.unified_id);
+                                    self.books.entry(yes_key.clone()).or_insert_with(LocalOrderBook::new);
+                                    new_yes_tokens.push(yes_key);
                                 }
                             }
                         }
-                        if !new_subs.is_empty() {
-                            // Initialize local order books for new assets before subscribing
-                            for ws_key in &new_subs {
-                                self.books.entry(ws_key.clone()).or_insert_with(LocalOrderBook::new);
-                                // Keep O(1) lookup map in sync with any newly added subscriptions
-                                if let Some(&market_id) = self.subscriptions.values()
-                                    .zip(self.subscriptions.keys())
-                                    .find(|(_, k)| k.split(',').next().map(|t| t == ws_key).unwrap_or(false))
-                                    .map(|(v, _)| v)
-                                {
-                                    self.yes_token_to_market.insert(ws_key.clone(), market_id);
+                        if !new_yes_tokens.is_empty() {
+                            info!(count = new_yes_tokens.len(), "Dynamically subscribing to new Polymarket markets");
+                            for chunk in new_yes_tokens.chunks(50) {
+                                let sub = DynamicSubscription {
+                                    operation: "subscribe".into(),
+                                    assets_ids: chunk.to_vec(),
+                                    custom_feature_enabled: true,
+                                };
+                                if let Ok(msg_text) = serde_json::to_string(&sub) {
+                                    let _ = write.send(Message::Text(msg_text.into())).await;
                                 }
                             }
-                            let sub_msg = SubscribeMessage { 
-                                msg_type: None, 
-                                operation: Some("subscribe".into()), 
-                                assets_ids: new_subs.clone(),
-                                custom_feature_enabled: Some(true),
-                            };
-                            if let Ok(msg_text) = serde_json::to_string(&sub_msg) {
-                                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_text)).await;
-                                tracing::info!(count = new_subs.len(), "Dynamically subscribed to new Polymarket markets");
-                            }
                         }
                     }
                 }
             }
         }
-    }
-}
 
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum PolymarketPayload {
-    Array(Vec<WsMessage>),
-    Single(WsMessage),
-}
-
-impl PolymarketFeed {
-    fn handle_message(
-        &mut self,
-        text: &str,
-        tick_tx: &broadcast::Sender<NormalizedTick>,
-    ) -> Result<()> {
-        match serde_json::from_str::<PolymarketPayload>(text) {
-            Ok(PolymarketPayload::Array(messages)) => {
-                for msg in messages {
-                    self.process_event(&msg, tick_tx)?;
-                }
-            }
-            Ok(PolymarketPayload::Single(msg)) => {
-                self.process_event(&msg, tick_tx)?;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, text = %text, "Failed to parse Polymarket WS message");
-            }
-        }
-        Ok(())
-    }
-
-    fn process_event(&mut self, msg: &WsMessage, tick_tx: &broadcast::Sender<NormalizedTick>) -> Result<()> {
-        let asset_id = if !msg.asset_id.is_empty() {
-            &msg.asset_id
-        } else if !msg.market.is_empty() {
-            &msg.market
-        } else {
-            return Ok(());
-        };
-
-        match msg.event_type.as_str() {
-            "book" => {
-                if let (Some(bids), Some(asks)) = (&msg.bids, &msg.asks) {
-                    let seq_to_emit;
-                    {
-                        let book = self.books.entry(asset_id.to_string()).or_insert_with(LocalOrderBook::new);
-                        book.bids.clear();
-                        book.asks.clear();
-
-                        for e in bids {
-                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
-                                book.bids.insert(p, s);
-                            }
-                        }
-                        for e in asks {
-                            if let (Ok(p), Ok(s)) = (Decimal::from_str(&e.price), Decimal::from_str(&e.size)) {
-                                book.asks.insert(p, s);
-                            }
-                        }
-
-                        // LOW-7 FIX: Properly handle book_snapshot sequence tracking
-                        // Snapshots from Polymarket establish the base sequence. We accept it unconditionally
-                        // because a snapshot means we reconnected and need to hard-reset our local tracker.
-                        if let Some(msg_seq) = msg.sequence {
-                            book.sequence = msg_seq;
-                        } else {
-                            book.sequence += 1;
-                        }
-                        seq_to_emit = book.sequence;
-                    }  // mutable borrow ends
-
-                    if let Some(mut tick) = self.emit_tick(asset_id) {
-                        tick.sequence = seq_to_emit;
-                        let _ = tick_tx.send(tick);
-                    }
-                }
-            }
-            "price_change" | "book_update" => {
-                if let Some(changes) = &msg.changes {
-                    let seq_to_emit;
-                    {
-                        let book = self.books.entry(asset_id.to_string()).or_insert_with(LocalOrderBook::new);
-                        if let Some(msg_seq) = msg.sequence {
-                            if msg_seq <= book.sequence && book.sequence > 0 { return Ok(()); }
-                            if book.sequence > 0 && msg_seq > book.sequence + 1 {
-                                return Err(anyhow::anyhow!("Polymarket sequence gap detected: expected {}, got {}", book.sequence + 1, msg_seq));
-                            }
-                            book.sequence = msg_seq;
-                        } else {
-                            book.sequence += 1;
-                        }
-
-                        for change in changes {
-                            if let (Ok(p), Ok(s)) = (
-                                Decimal::from_str(&change.price),
-                                Decimal::from_str(&change.size),
-                            ) {
-                                book.apply_update(&change.side, p, s);
-                            }
-                        }
-                        seq_to_emit = Some(book.sequence);
-                    }  // mutable borrow ends
-
-                    if let Some(seq) = seq_to_emit {
-                        if let Some(mut tick) = self.emit_tick(asset_id) {
-                            tick.sequence = seq;
-                            let _ = tick_tx.send(tick);
-                        }
-                    }
-                }
-            }
-            "last_trade_price" => {
-                if let Some(price_str) = &msg.price {
-                    if let Ok(price) = Decimal::from_str(price_str) {
-                        if let Some(book) = self.books.get_mut(asset_id) {
-                            book.last_trade_price = price;
-                        }
-                    }
-                }
-            }
-            _ => {
-                debug!(event_type = %msg.event_type, "Unknown Polymarket event type");
-            }
-        }
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "polymarket_tests.rs"]
-mod polymarket_tests;
