@@ -26,9 +26,9 @@ pub struct KalshiFeed {
 
 #[derive(Debug, Default)]
 struct KalshiOrderBook {
-    // yes bids: [price_decimal, quantity_decimal]  (price in dollar format e.g. 0.42)
+    // yes bids in dollar format [0.0 - 1.0]
     pub yes_bids: std::collections::BTreeMap<Decimal, Decimal>,
-    // no bids: stored in dollar format too
+    // no bids in dollar format [0.0 - 1.0]
     pub no_bids: std::collections::BTreeMap<Decimal, Decimal>,
     pub is_initialized: bool,
     pub seq: u64,
@@ -37,15 +37,13 @@ struct KalshiOrderBook {
 impl KalshiOrderBook {
     fn new() -> Self { Self::default() }
 
-    /// Best YES bid price = best bid for the unified book
+    /// Best YES bid price
     fn best_yes_bid(&self) -> Option<(Decimal, Decimal)> {
         self.yes_bids.iter().next_back().map(|(&p, &s)| (p, s))
     }
 
-    /// The ask price for YES = 1 - best NO bid
+    /// Best YES ask = 1 - best NO bid (highest NO bid)
     fn best_yes_ask(&self) -> Option<(Decimal, Decimal)> {
-        // The best ask for YES is derived from the best NO bid (lowest NO offer price)
-        // NO bid at X means you pay X cents for NO → YES ask = 1 - X
         self.no_bids.iter().next_back().map(|(&no_price, &size)| {
             (Decimal::ONE - no_price, size)
         })
@@ -63,8 +61,12 @@ impl KalshiOrderBook {
     }
 }
 
-// ── Wire message shapes (current Kalshi API v2) ────────────────────────────
+// ── Wire message shapes ────────────────────────────────────────────────────
 
+/// Subscribe command — only use "orderbook_delta" as the channel.
+/// Kalshi will automatically send an "orderbook_snapshot" message first,
+/// then stream "orderbook_delta" updates. "orderbook_snapshot" is NOT a
+/// valid channel name and will return error code 8 if included.
 #[derive(Debug, Serialize, Deserialize)]
 struct KalshiSubscribe {
     id: u64,
@@ -78,7 +80,9 @@ struct KalshiSubParams {
     market_tickers: Vec<String>,
 }
 
-/// Top-level envelope from Kalshi WebSocket
+/// Top-level envelope from Kalshi WebSocket.
+/// The `type` field identifies the message kind:
+///   "orderbook_snapshot" | "orderbook_delta" | "subscribed" | "error" | ...
 #[derive(Debug, Deserialize)]
 struct KalshiEnvelope {
     #[serde(rename = "type")]
@@ -117,17 +121,29 @@ impl KalshiFeed {
             .map_err(|e| anyhow::anyhow!("JSON parse error: {e}"))?;
 
         match env.msg_type.as_str() {
+            // Kalshi sends "orderbook_snapshot" automatically after subscribing to "orderbook_delta"
             "orderbook_snapshot" => self.handle_snapshot(&env, tick_tx),
             "orderbook_delta"    => self.handle_delta(&env, tick_tx),
-            "error" => {
-                let msg_text = env.msg
-                    .as_ref()
-                    .and_then(|v| v.as_str())
-                    .or_else(|| env.msg.as_ref().and_then(|v| v.get("msg").and_then(|m| m.as_str())))
-                    .unwrap_or("unknown error");
-                anyhow::bail!("Kalshi WS error: {}", msg_text);
+            "subscribed" => {
+                // Log successful subscription confirmation
+                if let Some(msg) = &env.msg {
+                    let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let sid = msg.get("sid").and_then(|v| v.as_u64()).unwrap_or(0);
+                    tracing::debug!(channel, sid, "Kalshi subscription confirmed");
+                }
+                Ok(())
             }
-            // silently ignore heartbeats, acks, and unknown control messages
+            "error" => {
+                let (code, msg_text) = if let Some(msg) = &env.msg {
+                    let code = msg.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let msg_str = msg.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    (code, msg_str.to_string())
+                } else {
+                    (0, "unknown error".to_string())
+                };
+                anyhow::bail!("Kalshi WS error {}: {}", code, msg_text);
+            }
+            // Silently ignore heartbeats, acks, and unknown control messages
             _ => Ok(()),
         }
     }
@@ -142,11 +158,10 @@ impl KalshiFeed {
         book.yes_bids.clear();
         book.no_bids.clear();
 
-        // Current Kalshi API sends `yes_dollars_fp` / `no_dollars_fp` arrays
-        // Each element is ["price_as_dollar_string", "quantity_as_dollar_string"]
-        // e.g. ["0.4200", "300.00"]
-        // NOTE: prices are already in dollar format (0.0-1.0), NOT cents
-        for field in &["yes", "yes_dollars_fp", "yes_dollars"] {
+        // Kalshi sends dollar-format prices: yes_dollars_fp / no_dollars_fp
+        // Each entry is ["price_as_dollar_string", "quantity_as_dollar_string"]
+        // e.g. ["0.4200", "300.00"] means bid at $0.42 for $300 notional
+        for field in &["yes_dollars_fp", "yes"] {
             if let Some(arr) = msg.get(field).and_then(|v| v.as_array()) {
                 for entry in arr {
                     let (p, s) = Self::parse_price_size_entry(entry)?;
@@ -158,7 +173,7 @@ impl KalshiFeed {
             }
         }
 
-        for field in &["no", "no_dollars_fp", "no_dollars"] {
+        for field in &["no_dollars_fp", "no"] {
             if let Some(arr) = msg.get(field).and_then(|v| v.as_array()) {
                 for entry in arr {
                     let (p, s) = Self::parse_price_size_entry(entry)?;
@@ -172,6 +187,8 @@ impl KalshiFeed {
 
         book.is_initialized = true;
         book.seq = seq;
+
+        tracing::debug!(ticker, yes_levels = book.yes_bids.len(), no_levels = book.no_bids.len(), "Kalshi snapshot applied");
 
         if let Some(tick) = self.emit_tick(ticker) {
             let _ = tick_tx.send(tick);
@@ -191,8 +208,7 @@ impl KalshiFeed {
         };
 
         if !book.is_initialized {
-            // FIX: silently skip deltas before first snapshot instead of bailing.
-            // Bailing here causes an infinite reconnect loop.
+            // Silently skip deltas before first snapshot
             tracing::debug!(ticker, "Skipping delta for uninitialized book — waiting for snapshot");
             return Ok(());
         }
@@ -203,13 +219,16 @@ impl KalshiFeed {
                 // Duplicate — ignore silently
                 return Ok(());
             }
-            // Gap — we're missing messages.
-            // Log a warning and accept the new sequence, but this means our book might be slightly out of sync.
-            // Kalshi WS sends full snapshots periodically or on reconnect.
-            tracing::warn!("Kalshi sequence gap for {ticker}: expected {}, got {seq}. Book may be out of sync.", book.seq + 1);
+            // Gap — log warning, accept new sequence
+            tracing::warn!(
+                ticker,
+                expected = book.seq + 1,
+                got = seq,
+                "Kalshi sequence gap. Book may be slightly out of sync."
+            );
         }
 
-        // Delta format A: single delta (price_dollars / delta_fp / side)
+        // Delta format: price_dollars (dollar string) + delta_fp (dollar amount) + side
         if let (Some(price_val), Some(delta_val), Some(side_val)) = (
             msg.get("price_dollars"),
             msg.get("delta_fp"),
@@ -217,6 +236,12 @@ impl KalshiFeed {
         ) {
             let price = Self::parse_decimal_field(price_val)?;
             let delta = Self::parse_decimal_field(delta_val)?;
+            // Normalize price from cents if > 1
+            let price = if price > Decimal::ONE {
+                price / Decimal::from(100)
+            } else {
+                price
+            };
             let target = if side_val == "yes" { &mut book.yes_bids } else { &mut book.no_bids };
             let current = target.get(&price).copied().unwrap_or(Decimal::ZERO);
             let new_qty = (current + delta).max(Decimal::ZERO);
@@ -224,24 +249,6 @@ impl KalshiFeed {
                 target.remove(&price);
             } else {
                 target.insert(price, new_qty);
-            }
-        }
-
-        // Delta format B: arrays of changes (price_deltas.yes / price_deltas.no)
-        if let Some(price_deltas) = msg.get("price_deltas") {
-            for (field, is_yes) in &[("yes", true), ("yes_dollars_fp", true),
-                                      ("no", false), ("no_dollars_fp", false)] {
-                if let Some(arr) = price_deltas.get(field).and_then(|v| v.as_array()) {
-                    let target = if *is_yes { &mut book.yes_bids } else { &mut book.no_bids };
-                    for entry in arr {
-                        let (p, s) = Self::parse_price_size_entry(entry)?;
-                        if s == Decimal::ZERO {
-                            target.remove(&p);
-                        } else {
-                            target.insert(p, s);
-                        }
-                    }
-                }
             }
         }
 
@@ -253,7 +260,7 @@ impl KalshiFeed {
         Ok(())
     }
 
-    /// Parse a [price, size] entry — handles both array and object shapes.
+    /// Parse a [price, size] entry — handles both dollar-string arrays and numeric arrays.
     fn parse_price_size_entry(entry: &serde_json::Value) -> Result<(Decimal, Decimal)> {
         if let Some(arr) = entry.as_array() {
             let p = arr.get(0)
@@ -266,10 +273,9 @@ impl KalshiFeed {
                 .and_then(|s| Decimal::from_str(s).ok())
                 .or_else(|| arr.get(1).and_then(|v| v.as_f64()).and_then(|f| Decimal::try_from(f).ok()))
                 .context("bad size in entry")?;
-            // CRITICAL: Kalshi API v2 sends prices in dollar format (0.0-1.0)
-            // We must NOT divide by 100. Validate range.
+            // Normalize price: Kalshi uses dollar format (0.0–1.0).
+            // If price > 1 it's old cent format — convert.
             let p = if p > Decimal::ONE {
-                // Legacy cent format — convert
                 p / Decimal::from(100)
             } else {
                 p
@@ -310,8 +316,7 @@ impl KalshiFeed {
         // Validate prices are in [0,1]
         if bid.0 > Decimal::ONE || ask.0 > Decimal::ONE { return None; }
 
-        // Fee: Kalshi charges ~7¢ per dollar wagered, capped.
-        // For 15-min crypto markets fee is very low (~5 bps).
+        // Fee: Kalshi 15-min crypto markets ~5 bps; standard markets ~175 bps
         let fee_bps = if ticker.contains("15M") || ticker.contains("BTC") || ticker.contains("ETH") {
             5u16
         } else {
@@ -394,7 +399,10 @@ impl FeedHandler for KalshiFeed {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Subscribe to all tracked markets
+        // FIX: Only subscribe to "orderbook_delta".
+        // "orderbook_snapshot" is NOT a valid channel name (error code 8).
+        // Kalshi automatically sends an orderbook_snapshot message immediately
+        // after a successful orderbook_delta subscription, then streams deltas.
         let tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
         if !tickers.is_empty() {
             for chunk in tickers.chunks(50) {
@@ -402,7 +410,7 @@ impl FeedHandler for KalshiFeed {
                     id: 1,
                     cmd: "subscribe".into(),
                     params: KalshiSubParams {
-                        channels: vec!["orderbook_snapshot".into(), "orderbook_delta".into()],
+                        channels: vec!["orderbook_delta".into()],
                         market_tickers: chunk.to_vec(),
                     },
                 };
@@ -414,7 +422,7 @@ impl FeedHandler for KalshiFeed {
             info!(count = tickers.len(), "Subscribed to Kalshi markets");
         }
 
-        // Initialize book state
+        // Initialize book state for all known tickers
         for ticker in self.subscriptions.keys() {
             self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
         }
@@ -437,7 +445,6 @@ impl FeedHandler for KalshiFeed {
                                 if es.contains("sequence gap") || es.contains("snapshot first") {
                                     return Err(e); // force reconnect
                                 }
-                                // Log at warn so we can see API errors during development
                                 tracing::warn!(error = %e, "Kalshi message handling non-fatal error");
                             }
                         }
@@ -455,7 +462,7 @@ impl FeedHandler for KalshiFeed {
                 }
 
                 _ = sync_interval.tick() => {
-                    // Dynamically subscribe to newly discovered 15-min candles
+                    // Dynamically subscribe to newly discovered markets
                     match self.db.get_active_markets().await {
                         Ok(markets) => {
                             let mut new_tickers = Vec::new();
@@ -472,6 +479,7 @@ impl FeedHandler for KalshiFeed {
                             if !new_tickers.is_empty() {
                                 info!(count = new_tickers.len(), tickers = ?new_tickers, "Dynamically subscribing to new Kalshi markets");
                                 for chunk in new_tickers.chunks(50) {
+                                    // FIX: Only "orderbook_delta" — never "orderbook_snapshot"
                                     let sub = KalshiSubscribe {
                                         id: 2,
                                         cmd: "subscribe".into(),

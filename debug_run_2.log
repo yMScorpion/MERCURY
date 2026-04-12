@@ -1,0 +1,79 @@
+   Compiling mercury v0.1.0 (/Users/isaacvalerianomuniz/MERCURY)
+warning: unused import: `Timelike`
+  --> src/feeds/discovery.rs:39:29
+   |
+39 | use chrono::{DateTime, Utc, Timelike};
+   |                             ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mercury` (lib) generated 1 warning (run `cargo fix --lib -p mercury` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.21s
+     Running `target/debug/mercury --dry-run -c config/dry_run.yaml`
+[2m2026-04-12T20:07:42.812820Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m MERCURY v0.1.0 starting...
+[2m2026-04-12T20:07:42.812957Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Configuration loaded
+[2m2026-04-12T20:07:42.813245Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Secure environment injected from .env
+[2m2026-04-12T20:07:42.813294Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Executing Ahead-of-Time (AOT) pre-flight checks...
+[2m2026-04-12T20:07:43.515232Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m All AOT pre-flight checks passed successfully.
+[2m2026-04-12T20:07:43.515461Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m All pre-flight checks passed.
+[2m2026-04-12T20:07:43.521937Z[0m [32m INFO[0m [2mmercury::db::sqlite[0m[2m:[0m Database schema version validated: 2
+[2m2026-04-12T20:07:43.522242Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Database initialized via SQLx
+[2m2026-04-12T20:07:43.531291Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Telegram alerts enabled (MERCURY_NOTIFICATION bot)
+[2m2026-04-12T20:07:43.531316Z[0m [32m INFO[0m [2mmercury::telegram::alerts[0m[2m:[0m Telegram alert service started
+[2m2026-04-12T20:07:43.531477Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Telegram daily reports & command polling enabled (MERCURY_DAILYBOT)
+[2m2026-04-12T20:07:43.531515Z[0m [32m INFO[0m [2mmercury::telegram::reports[0m[2m:[0m Telegram report & command service started
+[2m2026-04-12T20:07:43.532070Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Recovered circuit breaker state from 0 recent trades
+[2m2026-04-12T20:07:43.532485Z[0m [32m INFO[0m [2mmercury::risk::bankroll[0m[2m:[0m Bankroll state restored from DB [3mcumulative_profit[0m[2m=[0m0
+[2m2026-04-12T20:07:43.533826Z[0m [32m INFO[0m [2mmercury::crypto::eip712[0m[2m:[0m Polymarket signer initialized [3maddress[0m[2m=[0m0x450760C560721D88205bAcc242523f18838A7dfe [3mchain_id[0m[2m=[0m137
+[2m2026-04-12T20:07:43.533984Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Polymarket client initialized [3maddress[0m[2m=[0m0x450760C560721D88205bAcc242523f18838A7dfe
+[2m2026-04-12T20:07:43.536364Z[0m [32m INFO[0m [2mmercury::crypto::jwt[0m[2m:[0m Kalshi auth initialized [3mapi_key_id[0m[2m=[0m88a3b3aa-8fb9-4ecd-ab56-1c642d32ed51
+[2m2026-04-12T20:07:43.536441Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Kalshi client initialized
+[2m2026-04-12T20:07:43.536524Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Polymarket execution: ENABLED
+[2m2026-04-12T20:07:43.536581Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Kalshi execution: ENABLED
+[2m2026-04-12T20:07:43.536734Z[0m [32m INFO[0m [2mmercury::execution::executor[0m[2m:[0m Execution engine started
+[2m2026-04-12T20:07:43.536756Z[0m [32m INFO[0m [2mmercury::inventory::positions[0m[2m:[0m Position tracker started
+[2m2026-04-12T20:07:43.536778Z[0m [32m INFO[0m [2mmercury::inventory::reconciler[0m[2m:[0m Reconciler started [3minterval_secs[0m[2m=[0m60
+[2m2026-04-12T20:07:43.536809Z[0m [32m INFO[0m [2mmercury::inventory::settlement[0m[2m:[0m Settlement monitor started
+[2m2026-04-12T20:07:43.536840Z[0m [32m INFO[0m [2mmercury::inventory::unwind_watchdog[0m[2m:[0m Unwind watchdog started
+[2m2026-04-12T20:07:43.536886Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Gas oracle started (first fetch is immediate) [3minterval_secs[0m[2m=[0m15 [3mrpc_url[0m[2m=[0mhttps://rpc.ankr.com/polygon
+[2m2026-04-12T20:07:43.536906Z[0m [32m INFO[0m [2mmercury::monitoring::health[0m[2m:[0m Health + Prometheus metrics server listening [3maddr[0m[2m=[0m"127.0.0.1:9091"
+[2m2026-04-12T20:07:43.536906Z[0m [32m INFO[0m [2mmercury::monitoring::backup[0m[2m:[0m DB backup task started [3minterval_secs[0m[2m=[0m21600 [3mdir[0m[2m=[0mbackups
+[2m2026-04-12T20:07:43.538803Z[0m [32m INFO[0m [2mmercury::crypto::jwt[0m[2m:[0m Kalshi auth initialized [3mapi_key_id[0m[2m=[0m88a3b3aa-8fb9-4ecd-ab56-1c642d32ed51
+[2m2026-04-12T20:07:43.538999Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m Market discovery started [3minterval_secs[0m[2m=[0m30
+[2m2026-04-12T20:07:43.539204Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Config hot-reload watcher active on config/dry_run.yaml
+[2m2026-04-12T20:07:43.543116Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Connecting feed handler [3mplatform[0m[2m=[0mPolymarket
+[2m2026-04-12T20:07:43.543249Z[0m [32m INFO[0m [2mmercury::feeds::polymarket[0m[2m:[0m Connecting to Polymarket WebSocket [3murl[0m[2m=[0m"wss://ws-subscriptions-clob.polymarket.com/ws/market"
+[2m2026-04-12T20:07:43.544861Z[0m [32m INFO[0m [2mmercury::crypto::jwt[0m[2m:[0m Kalshi auth initialized [3mapi_key_id[0m[2m=[0m88a3b3aa-8fb9-4ecd-ab56-1c642d32ed51
+[2m2026-04-12T20:07:43.545514Z[0m [32m INFO[0m [2mmercury::monitoring::backup[0m[2m:[0m Database backup completed [3mpath[0m[2m=[0m/Users/isaacvalerianomuniz/MERCURY/backups/mercury_backup_20260412_200743.db
+[2m2026-04-12T20:07:43.545975Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m All subsystems initialized. MERCURY engine running. Press Ctrl+C to shutdown.
+[2m2026-04-12T20:07:43.545979Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Connecting feed handler [3mplatform[0m[2m=[0mKalshi
+[2m2026-04-12T20:07:43.546097Z[0m [32m INFO[0m [2mmercury::feeds::kalshi[0m[2m:[0m Connecting to Kalshi WebSocket: wss://api.elections.kalshi.com/trade-api/ws/v2
+[2m2026-04-12T20:07:43.546176Z[0m [32m INFO[0m [2mmercury::monitoring::backup[0m[2m:[0m Pruned old backup [3mpath[0m[2m=[0m"backups/mercury_backup_20260412_132310.db"
+[2m2026-04-12T20:07:43.546296Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Daily report scheduled [3mdelay_secs[0m[2m=[0m3136 [3mhour_utc[0m[2m=[0m21
+[2m2026-04-12T20:07:43.547341Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Seeded market registry from DB [3mcount[0m[2m=[0m20
+[2m2026-04-12T20:07:43.547501Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Feed connected — Arbs involving platform restored [3mplatform[0m[2m=[0mPolymarket
+[2m2026-04-12T20:07:43.547562Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Feed connected — Arbs involving platform restored [3mplatform[0m[2m=[0mKalshi
+[2m2026-04-12T20:07:43.548165Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m === MERCURY STATUS === [3mregistered_markets[0m[2m=[0m20 [3marb_pairs[0m[2m=[0m4 [3mactive_actors[0m[2m=[0m0 [3mopen_positions[0m[2m=[0m0 [3min_flight_trades[0m[2m=[0m0 [3mbankroll[0m[2m=[0m10000.00 [3mdaily_pnl[0m[2m=[0m0 [3mopps_detected[0m[2m=[0m0 [3mopps_passed[0m[2m=[0m0 [3mgate1_below_spread[0m[2m=[0m0 [3mgate2_low_liquidity[0m[2m=[0m0 [3mgate3_stale_data[0m[2m=[0m0 [3mgate4_low_confidence[0m[2m=[0m0 [3mgate5_capacity[0m[2m=[0m0
+[2m2026-04-12T20:07:43.548269Z[0m [33m WARN[0m [2mmercury[0m[2m:[0m No active MarketActors — feeds have not sent any ticks yet. Check WebSocket connections. [3mregistered_markets[0m[2m=[0m20
+[2m2026-04-12T20:07:44.026803Z[0m [32m INFO[0m [2mmercury::feeds::polymarket[0m[2m:[0m Subscribed to Polymarket markets [3mcount[0m[2m=[0m20
+[2m2026-04-12T20:07:44.029960Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m Polygon gas price updated [3mgwei[0m[2m=[0m211 [3mprev_gwei[0m[2m=[0m50
+[2m2026-04-12T20:07:44.187913Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m 15m crypto round matched [3masset[0m[2m=[0mbtc [3mround_start[0m[2m=[0m1776024000 [3mpoly[0m[2m=[0mtrue [3mkalshi[0m[2m=[0mtrue
+[2m2026-04-12T20:07:44.191006Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0m189bf673-b643-45a5-be39-c4a3275d71a0 [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m1
+[2m2026-04-12T20:07:44.191218Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0m0d614480-ffaf-40be-88a5-04dcbbc06e20 [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m2
+[2m2026-04-12T20:07:44.191347Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0m50498293-4487-47db-80e8-363055758039 [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m3
+[2m2026-04-12T20:07:44.191504Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0m89bd8218-1923-4372-940e-e6bcf1d6fea1 [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m4
+[2m2026-04-12T20:07:44.191641Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0mdb6883a6-1eab-4e1a-8083-adf29ea2e4ad [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m5
+[2m2026-04-12T20:07:44.191763Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0mbc548cd4-ced9-48e8-b131-410c92fb3a0e [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m6
+[2m2026-04-12T20:07:44.191896Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0m39a28b31-a7f7-4e16-b2f1-1e1948be289c [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m7
+[2m2026-04-12T20:07:44.192043Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m First tick for market — spawning MarketActor [3mmarket_id[0m[2m=[0m2285bae6-253b-4085-b0d1-0af34b5530b6 [3mplatform[0m[2m=[0mPolymarket [3mactive_actors[0m[2m=[0m8
+[2m2026-04-12T20:07:44.257793Z[0m [32m INFO[0m [2mmercury::feeds::kalshi[0m[2m:[0m Subscribed to Kalshi markets [3mcount[0m[2m=[0m4
+[2m2026-04-12T20:07:44.328303Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m 15m crypto round matched [3masset[0m[2m=[0mbtc [3mround_start[0m[2m=[0m1776024900 [3mpoly[0m[2m=[0mtrue [3mkalshi[0m[2m=[0mfalse
+[2m2026-04-12T20:07:44.330427Z[0m [32m INFO[0m [2mmercury::inventory::reconciler[0m[2m:[0m Reconciliation complete [3mopen_positions[0m[2m=[0m0 [3mtotal_position_value[0m[2m=[0m0
+[2m2026-04-12T20:07:44.531261Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m 15m crypto round matched [3masset[0m[2m=[0meth [3mround_start[0m[2m=[0m1776024000 [3mpoly[0m[2m=[0mtrue [3mkalshi[0m[2m=[0mtrue
+[2m2026-04-12T20:07:44.689534Z[0m [32m INFO[0m [2mmercury::monitoring::gas_oracle[0m[2m:[0m MATIC/USD price updated [3mmatic_usd[0m[2m=[0m0.10 [3mprev[0m[2m=[0m0.50
+[2m2026-04-12T20:07:44.901928Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m 15m crypto round matched [3masset[0m[2m=[0meth [3mround_start[0m[2m=[0m1776024900 [3mpoly[0m[2m=[0mtrue [3mkalshi[0m[2m=[0mfalse
+[2m2026-04-12T20:07:45.148082Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m 15m crypto round matched [3masset[0m[2m=[0msol [3mround_start[0m[2m=[0m1776024000 [3mpoly[0m[2m=[0mtrue [3mkalshi[0m[2m=[0mtrue
+[2m2026-04-12T20:07:45.304011Z[0m [32m INFO[0m [2mmercury::feeds::discovery[0m[2m:[0m 15m crypto round matched [3masset[0m[2m=[0msol [3mround_start[0m[2m=[0m1776024900 [3mpoly[0m[2m=[0mtrue [3mkalshi[0m[2m=[0mfalse
+[2m2026-04-12T20:07:45.461025Z[0m [32m INFO[0m [2mmercury[0m[2m:[0m Shutdown signal received
+[2m2026-04-12T20:07:45.461493Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Feed handler cancelled via token [3mplatform[0m[2m=[0mKalshi
+[2m2026-04-12T20:07:45.461491Z[0m [32m INFO[0m [2mmercury::feeds::base[0m[2m:[0m Feed handler cancelled via token [3mplatform[0m[2m=[0mPolymarket
