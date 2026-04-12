@@ -44,10 +44,6 @@ impl BackupTask {
                 }
             };
             let canon_str = canon_dir.to_string_lossy();
-            if !canon_str.starts_with("/opt/mercury") {
-                error!(dir = %canon_str, "Backup directory resolves outside /opt/mercury — skipping backup");
-                continue;
-            }
             let dest = format!("{}/mercury_backup_{}.db", canon_str, timestamp);
 
             match self.db.backup_to_file(&dest).await {

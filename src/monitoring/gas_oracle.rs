@@ -56,7 +56,7 @@ impl GasOracle {
             .tcp_nodelay(true)
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
-            .user_agent("mercury-gas-oracle/1.0")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
             .build()
             .expect("failed to build gas oracle HTTP client");
         Self { rpc_url, poll_interval_secs, update_tx, http }
@@ -186,8 +186,8 @@ impl GasOracle {
     async fn fetch_matic_usd(&self) -> Result<Decimal> {
         let (cg, bin, cb) = tokio::join!(
             self.try_coingecko_price("polygon-ecosystem-token"),
-            self.try_binance_price("MATICUSDT"),
-            self.try_coinbase_price("MATIC-USD")
+            self.try_binance_price("POLUSDT"),
+            self.try_coinbase_price("POL-USD")
         );
 
         let mut prices = Vec::new();

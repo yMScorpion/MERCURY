@@ -356,29 +356,31 @@ impl ArbitrageDetector {
             });
         }
 
-        let stale_timeout_ns = self.stale_timeout_ms * 1_000_000;
         let now = now_ns();
 
-        // Stale data check: only reject if the timestamp difference exceeds the timeout.
-        // We use platform_liveness to avoid punishing valid resting orders.
+        // Stale data check: Prediction markets are illiquid and can sit unchanged for minutes.
+        // We only reject if the specific book is older than 15 minutes to catch severe desyncs.
+        // Global connection health is strictly handled by platform_liveness and CB9.
+        let max_book_age_ns = 15 * 60 * 1_000_000_000u64; // 15 minutes
+
         if self.platform_liveness.get(&Platform::Polymarket).map(|v| *v).unwrap_or(true) {
             let age_a = now.saturating_sub(book_a.last_update_ns);
-            if age_a > stale_timeout_ns {
+            if age_a > max_book_age_ns {
                 self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(RejectionReason::StaleData {
                     age_ms: age_a / 1_000_000,
-                    max_ms: self.stale_timeout_ms,
+                    max_ms: max_book_age_ns / 1_000_000,
                 });
             }
         }
 
         if self.platform_liveness.get(&Platform::Kalshi).map(|v| *v).unwrap_or(true) {
             let age_b = now.saturating_sub(book_b.last_update_ns);
-            if age_b > stale_timeout_ns {
+            if age_b > max_book_age_ns {
                 self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(RejectionReason::StaleData {
                     age_ms: age_b / 1_000_000,
-                    max_ms: self.stale_timeout_ms,
+                    max_ms: max_book_age_ns / 1_000_000,
                 });
             }
         }

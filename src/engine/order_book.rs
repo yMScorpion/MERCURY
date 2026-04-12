@@ -84,50 +84,35 @@ impl PlatformBook {
             return;
         }
 
-        // Apply depth levels as incremental updates. Zero-size = remove.
-        for level in tick.book_depth.iter() {
-            if level.size == Decimal::ZERO {
-                self.bids.remove(&level.price);
-                self.asks.remove(&level.price);
-                continue;
-            }
-            if level.price <= tick.bid_price {
-                self.bids.insert(level.price, level.size);
-            } else if level.price >= tick.ask_price {
-                self.asks.insert(level.price, level.size);
-            } else {
-                // Mid-spread level: classify by proximity
-                if tick.ask_price - level.price < level.price - tick.bid_price {
-                    self.asks.insert(level.price, level.size);
-                } else {
-                    self.bids.insert(level.price, level.size);
-                }
-            }
-        }
+        // Since `tick.book_depth` is a snapshot of the top N levels,
+        // we completely clear local state to prevent phantom stale liquidity.
+        self.bids.clear();
+        self.asks.clear();
 
-        // Apply BBO and enforce uncrossed book invariant using O(log N) split_off
-        // HIGH-4 FIX: BTreeMap::split_off is O(log N) vs the previous O(N) collect+remove.
+        // Apply BBO
         if tick.bid_price > Decimal::ZERO && tick.bid_size > Decimal::ZERO {
             self.bids.insert(tick.bid_price, tick.bid_size);
-            // Remove all asks at or below bid_price.
-            // split_off(key) returns everything >= key, leaving everything < key in self.
-            // We need to remove asks where price <= bid_price.
-            // Increment by smallest possible to get "strictly greater than bid_price".
-            // BTreeMap split trick: split at bid_price + epsilon isn't clean with Decimal.
-            // Instead, we split at bid_price and check if bid_price itself is in asks.
-            let kept = self.asks.split_off(&tick.bid_price);
-            // `self.asks` now contains asks < bid_price (invalid). `kept` has asks >= bid_price.
-            self.asks = kept;
-            // Also remove the ask AT bid_price if it exists (asks must be strictly > bid)
-            self.asks.remove(&tick.bid_price);
         }
         if tick.ask_price > Decimal::ZERO && tick.ask_size > Decimal::ZERO {
             self.asks.insert(tick.ask_price, tick.ask_size);
-            // Remove all bids at or above ask_price.
-            // split_off(ask_price) gives us everything >= ask_price (invalid bids).
-            let invalid_bids = self.bids.split_off(&tick.ask_price);
-            // `invalid_bids` is dropped, `self.bids` retains only bids < ask_price.
-            drop(invalid_bids);
+        }
+
+        // Apply depth levels
+        for level in tick.book_depth.iter() {
+            if level.size > Decimal::ZERO {
+                if level.price <= tick.bid_price {
+                    self.bids.insert(level.price, level.size);
+                } else if level.price >= tick.ask_price {
+                    self.asks.insert(level.price, level.size);
+                } else {
+                    // Mid-spread level: classify by proximity
+                    if tick.ask_price - level.price < level.price - tick.bid_price {
+                        self.asks.insert(level.price, level.size);
+                    } else {
+                        self.bids.insert(level.price, level.size);
+                    }
+                }
+            }
         }
 
         if let (Some((bb, _)), Some((ba, _))) = (self.best_bid(), self.best_ask()) {

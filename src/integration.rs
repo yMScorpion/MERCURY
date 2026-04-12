@@ -167,13 +167,13 @@ mod pipeline_tests {
         // 100ms stale timeout — ticks will be stale by the time we detect
         let detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 100, 3);
 
-        // Insert ticks with old timestamps
+        // Insert ticks with very old timestamps
         let mut tick_a = make_tick(Platform::Polymarket, market_id, dec!(0.30), dec!(100), dec!(0.32), dec!(100), 200, 1);
-        tick_a.timestamp_ns = now_ns() - 200_000_000; // 200ms ago
+        tick_a.timestamp_ns = now_ns() - (20 * 60 * 1_000_000_000u64); // 20 minutes ago
         uob.update(&tick_a);
 
         let mut tick_b = make_tick(Platform::Kalshi, market_id, dec!(0.60), dec!(100), dec!(0.62), dec!(100), 175, 1);
-        tick_b.timestamp_ns = now_ns() - 200_000_000;
+        tick_b.timestamp_ns = now_ns() - (20 * 60 * 1_000_000_000u64);
         uob.update(&tick_b);
 
         let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(10.0));

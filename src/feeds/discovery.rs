@@ -1,7 +1,7 @@
 //! Market discovery: polls platform REST APIs, matches equivalent markets
 //! cross-platform, and registers them in the MarketRegistry.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc, Timelike};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -50,7 +50,21 @@ pub struct MarketDiscovery {
 }
 
 impl MarketDiscovery {
+    // Helper to safely extract market arrays from Polymarket's inconsistent pagination JSON
+    fn extract_markets_array(value: &serde_json::Value) -> &[serde_json::Value] {
+        if let Some(arr) = value.as_array() {
+            arr.as_slice()
+        } else if let Some(arr) = value.get("data").and_then(|d| d.as_array()) {
+            arr.as_slice()
+        } else {
+            &[]
+        }
+    }
+
     pub fn new(platforms_config: PlatformsConfig, poll_interval_secs: u64, kalshi_auth: Option<crate::crypto::jwt::KalshiAuth>) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static("application/json, text/plain, */*"));
+        
         let http = reqwest::Client::builder()
             .tcp_keepalive(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(300))
@@ -58,7 +72,8 @@ impl MarketDiscovery {
             .tcp_nodelay(true)
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
-            .user_agent("mercury-discovery/1.0")
+            .default_headers(headers)
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
             .build()
             .expect("failed to build discovery HTTP client");
         Self {
@@ -351,22 +366,24 @@ impl MarketDiscovery {
                 let is_15m_market = pm.question_normalized.contains("15 min")
                     || km.question_normalized.contains("15 min")
                     || km.platform_market_id.contains("15M")
-                    || pm.question_normalized.contains("15m")
-                    || km.question_normalized.contains("15m");
+                    || pm.question_normalized.split_whitespace().any(|w| w == "15m")
+                    || km.question_normalized.split_whitespace().any(|w| w == "15m");
 
                 if is_15m_market {
-                    // MASSIVE LOGGING FOR 15M DEBUGGING
-                    tracing::info!(
-                        poly_q = %pm.question_normalized,
-                        kalshi_q = %km.question_normalized,
-                        exp_diff_secs,
-                        poly_exp = %pm_expiration,
-                        kalshi_exp = %km.expiration,
-                        "EVALUATING 15M CRYPTO CANDIDATE PAIR"
-                    );
+                    // Strict 120s threshold for 15-minute candles to avoid cross-matching adjacent candles
+                    if exp_diff_secs > 120 { continue; }
                     
-                    // Widen from 300s to 1800s to account for Poly's weird time-range titles
-                    if exp_diff_secs > 1800 { continue; }
+                    // Only log when at least one side is crypto (eliminates "NY 15 house seat" noise)
+                    if is_crypto || shared_crypto {
+                        tracing::info!(
+                            poly_q = %pm.question_normalized,
+                            kalshi_q = %km.question_normalized,
+                            exp_diff_secs,
+                            poly_exp = %pm_expiration,
+                            kalshi_exp = %km.expiration,
+                            "EVALUATING 15M CRYPTO CANDIDATE PAIR"
+                        );
+                    }
                 } else if is_crypto {
                     if exp_diff_secs > 7 * 24 * 3600 { continue; }
                 } else if exp_diff_secs > 48 * 3600 {
@@ -377,8 +394,8 @@ impl MarketDiscovery {
                 let same_category = pm.category == km.category;
 
                 // HARDCODED MATCH FOR 15 MIN CRYPTO
-                // Widen the forced-match time delta to 1800s (30 minutes)
-                if is_15m_market && is_crypto && shared_crypto && exp_diff_secs <= 1800 {
+                // Revert to strict 120s delta limit for safe execution
+                if is_15m_market && is_crypto && shared_crypto && exp_diff_secs <= 120 {
                     tracing::info!("FORCING 15M CRYPTO MATCH: {}", pm.question);
                     sim = 1.0; 
                 } else {
@@ -396,11 +413,11 @@ impl MarketDiscovery {
                 let min_sim = if is_15m_market && is_crypto && shared_crypto {
                     0.01
                 } else if same_category && exp_diff_secs <= 24 * 3600 {
-                    0.15
+                    0.35
                 } else if same_category && exp_diff_secs <= 7 * 24 * 3600 {
-                    0.25
-                } else {
                     0.40
+                } else {
+                    0.50
                 };
 
                 if sim < min_sim { continue; }
@@ -415,39 +432,36 @@ impl MarketDiscovery {
                 );
 
                 // Numerical target guard — prevent mismatched strikes ($60k vs $70k)
-                // Only apply when both questions contain numeric price levels.
                 if !is_15m_market {
-                    let extract_nums = |q: &str| -> Vec<i64> {
+                    let extract_nums = |q: &str| -> std::collections::HashSet<i64> {
                         q.split_whitespace()
                             .filter_map(|w| {
                                 let mut multiplier = 1.0;
-                                let mut cleaned = w.replace(['$', ',', '%'], "");
+                                let mut cleaned = w.replace(['$', ',', '%', '?', '(', ')', '[', ']', ':'], "");
                                 if cleaned.ends_with('k') || cleaned.ends_with('K') {
                                     multiplier = 1000.0;
                                     cleaned.pop();
                                 }
-                                cleaned.parse::<f64>().ok()
-                                    .map(|f| (f * multiplier * 100.0) as i64) // normalize cents
+                                if let Ok(f) = cleaned.parse::<f64>() {
+                                    // Ignore common year numbers to prevent false positive overlaps
+                                    if f >= 2020.0 && f <= 2030.0 && f.fract() == 0.0 {
+                                        return None;
+                                    }
+                                    Some((f * multiplier * 100.0).round() as i64)
+                                } else {
+                                    None
+                                }
                             })
-                            .filter(|&n| n > 100) // ignore small numbers (years, jersey #s, small counts)
                             .collect()
                     };
-                    let nums_pm = extract_nums(&pm.question_normalized);
-                    let nums_km = extract_nums(&km.question_normalized);
+                    // Use the ORIGINAL question to preserve decimal points (e.g. 3.50)
+                    let nums_pm = extract_nums(&pm.question);
+                    let nums_km = extract_nums(&km.question);
                     
-                    // Only reject if BOTH have numbers but NO overlap exists.
-                    // This allows "March 19" vs "BTC at 60k on March 19" if both have 1900.
-                    // But it correctly rejects 60k vs 70k if they are the only numbers.
-                    if !nums_pm.is_empty() && !nums_km.is_empty() {
-                        let set_km: std::collections::HashSet<_> = nums_km.iter().collect();
-                        let mut has_overlap = false;
-                        for n in &nums_pm {
-                            if set_km.contains(n) {
-                                has_overlap = true;
-                                break;
-                            }
-                        }
-                        if !has_overlap {
+                    // If either question has a numeric target, there MUST be an overlap.
+                    // This prevents matching a specific target ("over 3.50") with a generic binary ("rate cut").
+                    if !nums_pm.is_empty() || !nums_km.is_empty() {
+                        if nums_pm.intersection(&nums_km).next().is_none() {
                             continue;
                         }
                     }
@@ -601,8 +615,6 @@ pub(super) fn normalize_question(q: &str) -> String {
         };
 
         // Pass 1: Near-term markets expiring within 7 days.
-        // These are the prime candidates for matching Kalshi intraday/weekly markets.
-        // The Gamma API supports end_date_max as a filter (ISO8601).
         {
             let week_out = now + chrono::Duration::days(7);
             let end_max = week_out.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -610,29 +622,34 @@ pub(super) fn normalize_question(q: &str) -> String {
                 .query(&[
                     ("active", "true"),
                     ("closed", "false"),
-                    ("limit", "500"),
+                    ("limit", "100"), // Reduced limit to prevent Cloudflare blocks
                     ("end_date_max", end_max.as_str()),
                 ])
                 .send().await;
             match resp_result {
-                Ok(resp) => match resp.json::<serde_json::Value>().await {
-                    Ok(data) => {
-                        let page = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
-                        let markets = self.parse_gamma_polymarket_response(page, now);
-                        let deduped = dedup(markets, &mut seen_ids);
-                        info!(count = deduped.len(), "Polymarket near-term markets (≤7d expiry)");
-                        all_markets.extend(deduped);
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        warn!("Polymarket near-term fetch returned HTTP {}", resp.status());
+                    } else {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(data) => {
+                                let page = Self::extract_markets_array(&data);
+                                let markets = self.parse_gamma_polymarket_response(page, now);
+                                let deduped = dedup(markets, &mut seen_ids);
+                                info!(count = deduped.len(), "Polymarket near-term markets (≤7d expiry)");
+                                all_markets.extend(deduped);
+                            }
+                            Err(e) => warn!(error = %e, "Polymarket near-term parse failed"),
+                        }
                     }
-                    Err(e) => warn!(error = %e, "Polymarket near-term parse failed"),
                 },
                 Err(e) => warn!(error = %e, "Polymarket near-term fetch failed"),
             }
         }
 
         // Pass 2: Targeted keyword searches for topics that have Kalshi equivalents.
-        // These run in parallel and find markets that may be buried in general pagination.
         let keywords: &[(&str, &str)] = &[
-            ("btc",             "BTC price"),
+            ("btc",             "BTC up or down"),
             ("bitcoin",         "Bitcoin"),
             ("ethereum",        "ETH price"),
             ("eth price",       "ETH intraday"),
@@ -662,15 +679,20 @@ pub(super) fn normalize_question(q: &str) -> String {
                         .query(&[
                             ("active", "true"),
                             ("closed", "false"),
-                            ("limit", "200"),
+                            ("limit", "100"), // Reduced
                             ("q", kw),
                         ])
                         .send()
                 ).await;
                 match resp {
-                    Ok(Ok(r)) => match r.json::<serde_json::Value>().await {
-                        Ok(data) => Some((kw, label, data)),
-                        Err(_) => None,
+                    Ok(Ok(r)) => {
+                        if !r.status().is_success() { None }
+                        else {
+                            match r.json::<serde_json::Value>().await {
+                                Ok(data) => Some((kw, label, data)),
+                                Err(_) => None,
+                            }
+                        }
                     },
                     _ => None,
                 }
@@ -680,7 +702,7 @@ pub(super) fn normalize_question(q: &str) -> String {
         let kw_results = futures_util::future::join_all(keyword_futures).await;
         for result in kw_results {
             if let Some((kw, label, data)) = result {
-                let page = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+                let page = Self::extract_markets_array(&data);
                 let markets = self.parse_gamma_polymarket_response(page, now);
                 let deduped = dedup(markets, &mut seen_ids);
                 if !deduped.is_empty() {
@@ -696,25 +718,43 @@ pub(super) fn normalize_question(q: &str) -> String {
             const MAX_GENERAL: usize = 10_000;
             'general: loop {
                 let offset_str = offset.to_string();
-                let resp: serde_json::Value = self.http.get(gamma_url)
+                let resp = match self.http.get(gamma_url)
                     .query(&[
                         ("active", "true"),
                         ("closed", "false"),
                         ("acceptingOrders", "true"),
-                        ("limit", "1000"),
+                        ("limit", "100"), // Reduced
                         ("offset", offset_str.as_str()),
                     ])
-                    .send().await.context("Polymarket general fetch failed")?
-                    .json().await.context("Polymarket general parse failed")?;
+                    .send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("Polymarket general fetch failed: {}", e);
+                            break 'general;
+                        }
+                    };
+                
+                if !resp.status().is_success() {
+                    tracing::warn!("Polymarket general fetch returned HTTP {}", resp.status());
+                    break 'general;
+                }
 
-                let page = match resp.as_array() { Some(a) => a, None => break 'general };
+                let data = match resp.json::<serde_json::Value>().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Polymarket general parse failed: {}", e);
+                        break 'general;
+                    }
+                };
+                let page = Self::extract_markets_array(&data);
+                if page.is_empty() { break 'general; }
                 let page_len = page.len();
                 let markets = self.parse_gamma_polymarket_response(page, now);
                 let deduped = dedup(markets, &mut seen_ids);
                 all_markets.extend(deduped);
 
-                if all_markets.len() >= MAX_GENERAL || page_len < 1000 { break 'general; }
-                offset += 1000;
+                if all_markets.len() >= MAX_GENERAL || page_len < 100 { break 'general; }
+                offset += 100;
             }
         }
 
@@ -731,21 +771,37 @@ pub(super) fn normalize_question(q: &str) -> String {
         let mut markets = Vec::new();
 
         for item in arr {
-            // Only process markets that are currently accepting orders
-            let accepting = item.get("acceptingOrders")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !accepting {
-                continue;
-            }
-
             let question = item
                 .get("question")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            
             if question.is_empty() {
                 continue;
+            }
+
+            let slug = item.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Only process markets that are currently accepting orders
+            let accepting = item.get("acceptingOrders")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // For 15-minute crypto markets, the order acceptance window closes before
+            // the market resolves. Skipping them here prevents discovery from ever
+            // seeing them. Allow non-accepting markets through so they can be matched
+            // and subscribed to — the CLOB API rejects stale orders at submission time.
+            // We only skip non-accepting markets that are clearly long-dated.
+            if !accepting {
+                // Peek at the question to check if this is a short-lived crypto candle
+                let q_lower = question.to_lowercase();
+                let is_short_lived_crypto = (q_lower.contains("up or down") || q_lower.contains("15 min") || q_lower.contains("15m") || slug.contains("-15m-"))
+                    && (q_lower.contains("bitcoin") || q_lower.contains("btc") || q_lower.contains("ethereum") || q_lower.contains("eth")
+                        || q_lower.contains("solana") || q_lower.contains("sol") || q_lower.contains("doge") || q_lower.contains("xrp")
+                        || q_lower.contains("bnb") || q_lower.contains("hype"));
+                if !is_short_lived_crypto {
+                    continue;
+                }
             }
 
             // Gamma API: clobTokenIds is a JSON-serialized string like
@@ -785,9 +841,23 @@ pub(super) fn normalize_question(q: &str) -> String {
             // Gamma uses endDateIso (ISO string), endDate (may be Unix timestamp OR ISO string),
             // or end_date_iso (CLOB format). Try each field, handling both string and numeric types.
             let end_date = {
-                let candidate_fields = ["endDateIso", "endDate", "end_date_iso", "closeTime", "close_time", "expiration"];
                 let mut resolved: Option<DateTime<Utc>> = None;
-                for field in &candidate_fields {
+
+                // NEW LOGIC: Accurately extract timestamp from 15m crypto slugs
+                if slug.contains("-15m-") || slug.contains("-updown-15m-") {
+                    if let Some(last_dash) = slug.rfind('-') {
+                        if let Ok(ts) = slug[last_dash + 1..].parse::<i64>() {
+                            // Slug timestamp is the start of the 15m period. Expiration is 15 mins (900s) later.
+                            if let chrono::LocalResult::Single(dt) = chrono::TimeZone::timestamp_opt(&Utc, ts + 900, 0) {
+                                resolved = Some(dt);
+                            }
+                        }
+                    }
+                }
+
+                if resolved.is_none() {
+                    let candidate_fields = ["endDateIso", "endDate", "end_date_iso", "closeTime", "close_time", "expiration"];
+                    for field in &candidate_fields {
                     if let Some(v) = item.get(field) {
                         // Try as ISO string first
                         if let Some(s) = v.as_str() {
@@ -820,16 +890,7 @@ pub(super) fn normalize_question(q: &str) -> String {
                         }
                     }
                 }
-                // One-time field-dump for first market to diagnose which field carries the date
-                if resolved.is_none() && markets.is_empty() {
-                    if let Some(obj) = item.as_object() {
-                        let date_keys: Vec<(&str, String)> = obj.iter()
-                            .filter(|(k, _)| k.to_lowercase().contains("date") || k.to_lowercase().contains("time") || k.to_lowercase().contains("exp") || k.to_lowercase().contains("close"))
-                            .map(|(k, v)| (k.as_str(), v.to_string()))
-                            .collect();
-                        tracing::warn!(fields = ?date_keys, "DIAG: Polymarket date fields (first market, no date found)");
-                    }
-                }
+            }
                 resolved.unwrap_or_else(|| now + chrono::Duration::days(30))
             };
 
@@ -867,13 +928,13 @@ pub(super) fn normalize_question(q: &str) -> String {
     async fn fetch_kalshi_markets(&self) -> Result<Vec<DiscoveredMarket>> {
         let url = format!("{}/markets", self.platforms_config.kalshi.rest_url);
 
-        // 1. Generic open markets — first page only (1000 markets, non-parlay).
+        // 1. Generic open markets — first page only (200 markets, non-parlay).
         // We skip full cursor pagination since the Kalshi generic endpoint is dominated
         // by KXMVE complex parlays. One page gives us a representative non-parlay sample,
         // and the targeted series fetch (step 2) covers all actionable market types.
         let generic_markets = {
             let mut req = self.http.get(&url)
-                .query(&[("status", "open"), ("limit", "1000")]);
+                .query(&[("status", "open"), ("limit", "200")]); // Reduced limit
             if let Some(auth) = &self.kalshi_auth {
                 if let Ok(token) = auth.generate_token() {
                     req = req.header("Authorization", format!("Bearer {}", token));
