@@ -731,13 +731,13 @@ impl Database for SqliteDb {
         let canonical = std::fs::canonicalize(
             std::path::Path::new(dest_path).parent().unwrap_or(std::path::Path::new("."))
         ).map_err(|e| anyhow::anyhow!("Cannot resolve backup directory: {}", e))?;
-        
+
         let canonical_str = canonical.to_string_lossy();
+        let current_dir = std::env::current_dir()?.to_string_lossy().into_owned();
         anyhow::ensure!(
-            canonical_str.starts_with("/opt/mercury/data"),
-            "Backup path resolves outside /opt/mercury/data/: resolved to {}", canonical_str
-        );
-        
+            canonical_str.starts_with(&current_dir),
+            "Backup path resolves outside {}: resolved to {}", current_dir, canonical_str
+        );        
         // Reconstruct the full path using the canonical directory + original filename
         let filename = std::path::Path::new(dest_path)
             .file_name()

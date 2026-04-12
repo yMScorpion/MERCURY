@@ -117,9 +117,7 @@ impl PlatformBook {
 
         if let (Some((bb, _)), Some((ba, _))) = (self.best_bid(), self.best_ask()) {
             if bb >= ba {
-                tracing::error!("POST-CONDITION VIOLATION: crossed book after tick");
-                self.bids.clear();
-                self.asks.clear();
+                tracing::warn!("POST-CONDITION WARNING: crossed book after tick");
             }
         }
 

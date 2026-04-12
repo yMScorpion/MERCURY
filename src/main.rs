@@ -927,9 +927,32 @@ async fn main() -> Result<()> {
             // ── Market Discovery Results ──
             Some(matched) = matched_market_rx.recv() => {
                     let market_id = matched.market.unified_id;
-                    let is_update = registry.read().unwrap().get_market(&market_id).is_some();
+                    let mut reg = registry.write().unwrap();
+                    let is_update = reg.get_market(&market_id).is_some();
+                    
                     if is_update {
-                        // Market already known — skip (discovery is idempotent)
+                        // Market already known — but it might have discovered a new platform (e.g. Kalshi listed it late)
+                        let existing = reg.get_market(&market_id).unwrap().clone();
+                        let mut updated = existing.clone();
+                        let mut platforms_added = 0;
+                        for (plat, info) in matched.market.platforms {
+                            if updated.platforms.insert(plat, info).is_none() {
+                                platforms_added += 1;
+                            }
+                        }
+                        if platforms_added > 0 {
+                            reg.register_market(updated.clone());
+                            let db_clone = db.clone();
+                            tokio::spawn(async move {
+                                let _ = db_clone.upsert_market(&updated).await;
+                            });
+                            info!(
+                                market_id = %market_id,
+                                total_markets = reg.market_count(),
+                                total_arb_pairs = reg.arb_pair_count(),
+                                "Registry updated — new platform added to existing market"
+                            );
+                        }
                         continue;
                     }
                     {

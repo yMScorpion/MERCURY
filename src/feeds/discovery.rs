@@ -245,7 +245,7 @@ impl MarketDiscovery {
                     kalshi_ticker: None,
                     kalshi_question: None,
                     kalshi_expiration: None,
-                    kalshi_fee_bps: 50, // 15m crypto markets have low fees
+                    kalshi_fee_bps: 5, // 15m crypto markets have low fees (5 bps)
                 });
             }
         }

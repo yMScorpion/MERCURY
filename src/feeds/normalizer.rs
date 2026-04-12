@@ -76,10 +76,17 @@ pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<D
     Some((vwap - best_price).abs())
 }
 
-pub fn kalshi_fee(price: Decimal, quantity: Decimal) -> Decimal {
-    let max_fee = rust_decimal_macros::dec!(0.07);
-    let implied_fee = price * rust_decimal_macros::dec!(0.10);
-    max_fee.min(implied_fee) * quantity
+pub fn kalshi_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
+    if fee_rate_bps < 100 {
+        // e.g. 5 bps for 15M crypto markets. Calculate as a standard percentage of the wager.
+        let rate = Decimal::from(fee_rate_bps) / rust_decimal_macros::dec!(10000);
+        rate * quantity * price
+    } else {
+        // Standard Kalshi fee: 10% of wager capped at 7c per contract
+        let max_fee = rust_decimal_macros::dec!(0.07);
+        let implied_fee = price * rust_decimal_macros::dec!(0.10);
+        max_fee.min(implied_fee) * quantity
+    }
 }
 
 #[cfg(test)]

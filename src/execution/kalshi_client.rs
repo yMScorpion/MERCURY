@@ -74,7 +74,7 @@ use crate::execution::executor::OrderAction;
 
 #[async_trait::async_trait]
 impl PlatformOrderClient for KalshiClient {
-    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, _fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
+    async fn submit_order(&self, market_id: &str, action: OrderAction, side: Side, price: crate::types::Usd, size: crate::types::Contracts, fee_rate_bps: crate::types::BasisPoints) -> Result<OrderResult> {
         let price = price.0;
         let size = size.0;
         // Round to nearest cent before converting — avoids silent truncation (e.g. 50.5¢ → 50¢).
@@ -167,7 +167,7 @@ impl PlatformOrderClient for KalshiClient {
             let filled = filled_count > 0;
             let fill_price = Decimal::from(order.yes_price.max(order.no_price)) / Decimal::from(100);
             // CRIT-5 FIX: Centralize fee math to ensure consistency with spread engine
-            let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count));
+            let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count), fee_rate_bps.0 as u16);
             Ok(OrderResult {
                 filled,
                 fill_price: crate::types::Usd(fill_price),

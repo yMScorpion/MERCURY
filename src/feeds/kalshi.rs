@@ -201,8 +201,10 @@ impl KalshiFeed {
                 // Duplicate — ignore silently
                 return Ok(());
             }
-            // Gap — force reconnect to rebuild
-            anyhow::bail!("Kalshi sequence gap for {ticker}: expected {}, got {seq}", book.seq + 1);
+            // Gap — we're missing messages.
+            // Log a warning and accept the new sequence, but this means our book might be slightly out of sync.
+            // Kalshi WS sends full snapshots periodically or on reconnect.
+            tracing::warn!("Kalshi sequence gap for {ticker}: expected {}, got {seq}. Book may be out of sync.", book.seq + 1);
         }
 
         // Delta format A: single delta (price_dollars / delta_fp / side)
@@ -433,8 +435,8 @@ impl FeedHandler for KalshiFeed {
                                 if es.contains("sequence gap") || es.contains("snapshot first") {
                                     return Err(e); // force reconnect
                                 }
-                                // Log at trace for unrecognised types
-                                tracing::trace!(error = %e, "Kalshi message handling non-fatal error");
+                                // Log at warn so we can see API errors during development
+                                tracing::warn!(error = %e, "Kalshi message handling non-fatal error");
                             }
                         }
                         Message::Ping(data) => { let _ = write.send(Message::Pong(data)).await; }

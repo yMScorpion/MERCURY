@@ -189,29 +189,24 @@ impl ArbitrageDetector {
         let pairs = match registry.get_arb_pairs_for_market(market_id) {
             Some(p) => p,
             None => {
-                debug!(market_id = %market_id, "No arb pairs registered for market — skipping detection");
                 return opportunities;
             }
         };
 
         for pair in pairs {
-            // PHASE 3 FIX: Enhanced Feed Health Guard
-            // Invalidate the pair if either platform feed is currently offline
             let a_alive = self.platform_liveness.get(&pair.platform_a).map(|v| *v).unwrap_or(true);
             let b_alive = self.platform_liveness.get(&pair.platform_b).map(|v| *v).unwrap_or(true);
             if !a_alive || !b_alive {
                 continue;
             }
 
-            // CRITICAL FIX: The Time-to-Maturity Trap
-            // Do not evaluate spreads if the market resolves in less than 60 seconds.
-            // If a hedge fails at T-25s, the 30-second Unwind Watchdog will not wake up 
-            // in time to dump the naked leg before the exchange locks the order book.
             if let Some(market) = registry.get_market(&pair.market_id) {
                 let seconds_to_exp = (market.expiration - chrono::Utc::now()).num_seconds();
                 if seconds_to_exp < 60 {
                     continue; 
                 }
+            } else {
+                continue;
             }
 
             let book_a = match uob.get_book(&pair.market_id, &pair.platform_a) {

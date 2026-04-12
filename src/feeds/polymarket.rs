@@ -476,7 +476,7 @@ impl FeedHandler for PolymarketFeed {
         loop {
             tokio::select! {
                 _ = ping_interval.tick() => {
-                    if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                    if let Err(e) = write.send(Message::Text("PING".into())).await {
                         warn!(error = %e, "Polymarket ping failed");
                         return Err(e.into());
                     }
@@ -493,6 +493,9 @@ impl FeedHandler for PolymarketFeed {
                     };
                     match msg_opt {
                         Some(Ok(Message::Text(text))) => {
+                            if text == "PONG" {
+                                continue;
+                            }
                             if let Err(e) = self.handle_message(&text, &tick_tx) {
                                 let es = e.to_string();
                                 if es.contains("sequence gap") {

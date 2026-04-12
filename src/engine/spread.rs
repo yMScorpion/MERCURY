@@ -132,6 +132,15 @@ impl NetSpreadEngine {
             let ask_a_no = Decimal::ONE - bid_a;
             let raw_spread = Decimal::ONE - ask_a_no - ask_b;
 
+            tracing::debug!(
+                market_id = %book_a.market_id,
+                direction = "NO-A/YES-B",
+                raw_spread = %raw_spread,
+                bid_a = %bid_a,
+                ask_b = %ask_b,
+                "Evaluated spread direction 2"
+            );
+
             if raw_spread > Decimal::ZERO {
                 // CRITICAL FIX: Clamp to the total available depth, not just the top-of-book size.
                 // This allows the VWAP estimator to correctly "walk the book" and consume 
@@ -209,7 +218,7 @@ impl NetSpreadEngine {
             Platform::Kalshi => {
                 // Delegate to the centralized normalizer to ensure consistency
                 // between spread estimation and execution fill accounting.
-                normalizer::kalshi_fee(price, quantity)
+                normalizer::kalshi_fee(price, quantity, fee_rate_bps)
             }
             Platform::Cdna => {
                 let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
