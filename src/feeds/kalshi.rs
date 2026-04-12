@@ -191,8 +191,10 @@ impl KalshiFeed {
         };
 
         if !book.is_initialized {
-            // Deltas before snapshot → reconnect required
-            anyhow::bail!("Received delta before snapshot for {ticker} — need snapshot first, triggering reconnect");
+            // FIX: silently skip deltas before first snapshot instead of bailing.
+            // Bailing here causes an infinite reconnect loop.
+            tracing::debug!(ticker, "Skipping delta for uninitialized book — waiting for snapshot");
+            return Ok(());
         }
 
         // Sequence validation
@@ -400,7 +402,7 @@ impl FeedHandler for KalshiFeed {
                     id: 1,
                     cmd: "subscribe".into(),
                     params: KalshiSubParams {
-                        channels: vec!["orderbook_delta".into()],
+                        channels: vec!["orderbook_snapshot".into(), "orderbook_delta".into()],
                         market_tickers: chunk.to_vec(),
                     },
                 };

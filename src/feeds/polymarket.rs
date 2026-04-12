@@ -482,14 +482,14 @@ impl FeedHandler for PolymarketFeed {
                     }
                 }
 
-                // FIX-1: 60s read timeout (was 300s — connection goes silent without triggering error)
+                // FIX-1: 90s read timeout (was 60s — connection goes silent without triggering error)
                 msg_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(90),
                     read.next()
                 ) => {
                     let msg_opt = match msg_result {
                         Ok(m) => m,
-                        Err(_) => return Err(anyhow::anyhow!("Polymarket: no data for 60s — heartbeat timeout")),
+                        Err(_) => return Err(anyhow::anyhow!("Polymarket: no data for 90s — heartbeat timeout")),
                     };
                     match msg_opt {
                         Some(Ok(Message::Text(text))) => {
