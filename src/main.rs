@@ -1183,7 +1183,7 @@ async fn main() -> Result<()> {
 
             // ── Settlement PnL Sink ──
             Some(settlement) = settlement_rx.recv() => {
-                bankroll_handle.record_settlement(settlement.realized_pnl).await;
+                bankroll_handle.record_settlement(settlement).await;
                 cached_open_positions.fetch_sub(1, Ordering::Relaxed);
             }
 

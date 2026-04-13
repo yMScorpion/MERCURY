@@ -156,7 +156,13 @@ async fn test_process_trade_failure_releases_exposure() {
 #[tokio::test]
 async fn test_record_settlement_updates_bankroll_and_peak() {
     let handle = make_handle(dec!(1000));
-    handle.record_settlement(dec!(50)).await;
+    handle.record_settlement(crate::types::SettlementResult {
+        realized_pnl: dec!(50),
+        platform: Platform::Polymarket,
+        market_id: Uuid::new_v4(),
+        quantity: dec!(10),
+        avg_entry_price: dec!(0.5),
+    }).await;
 
     let snapshot = handle.get_snapshot(dec!(0.25)).await;
     assert_eq!(snapshot.bankroll, dec!(1050), "bankroll should be 1050 after settlement");

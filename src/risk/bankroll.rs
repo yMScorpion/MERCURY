@@ -123,12 +123,17 @@ impl BankrollManager {
 
     /// Credits the bankroll with realized PnL from an expired/settled market.
     /// Winning legs pay $1.00 per contract; losing legs pay $0.00. 
-    pub fn record_settlement(&mut self, realized_pnl: Decimal) {
-        self.total_bankroll += realized_pnl;
+    pub fn record_settlement(&mut self, settlement: &crate::types::SettlementResult) {
+        self.total_bankroll += settlement.realized_pnl;
         if self.total_bankroll > self.peak_bankroll {
             self.peak_bankroll = self.total_bankroll;
         }
-        tracing::info!(realized_pnl = %realized_pnl, bankroll = %self.total_bankroll, "Settlement credited to bankroll");
+        
+        let exposure_freed = settlement.quantity * settlement.avg_entry_price;
+        self.remove_exposure(settlement.platform, exposure_freed);
+        self.remove_market_exposure(settlement.market_id, exposure_freed);
+        
+        tracing::info!(realized_pnl = %settlement.realized_pnl, exposure_freed = %exposure_freed, bankroll = %self.total_bankroll, "Settlement credited to bankroll and exposure freed");
     }
 
     pub fn record_trade(&mut self, result: &TradeResult) {
@@ -261,7 +266,13 @@ mod tests {
         assert_eq!(bm.total_bankroll(), dec!(1000.8));
         assert_eq!(bm.success_today(), 1);
         
-        bm.record_settlement(dec!(10)); 
+        bm.record_settlement(&crate::types::SettlementResult {
+            realized_pnl: dec!(10),
+            platform: Platform::Polymarket,
+            market_id: Uuid::new_v4(),
+            quantity: dec!(10),
+            avg_entry_price: dec!(0.5),
+        }); 
         assert_eq!(bm.total_bankroll(), dec!(1010.8));
         assert_eq!(bm.peak_bankroll(), dec!(1010.8));
     }
@@ -291,8 +302,15 @@ pub enum BankrollMsg {
         market_id: Uuid,
         reply: oneshot::Sender<bool>,
     },
+    ReleaseCapital {
+        leg_a_exposure: Decimal,
+        leg_b_exposure: Decimal,
+        platform_a: Platform,
+        platform_b: Platform,
+        market_id: Uuid,
+    },
     ProcessTrade(TradeResult, oneshot::Sender<TradeResult>),
-    RecordSettlement(Decimal),
+    RecordSettlement(SettlementResult),
     GetSnapshot(Decimal, oneshot::Sender<DailySnapshot>),
     GetRiskState {
         platform_a: Platform,
@@ -356,7 +374,12 @@ impl BankrollHandle {
                         }
                         let _ = reply.send(trade);
                     }
-                    BankrollMsg::RecordSettlement(pnl) => manager.record_settlement(pnl),
+                    BankrollMsg::ReleaseCapital { leg_a_exposure, leg_b_exposure, platform_a, platform_b, market_id } => {
+                        manager.remove_exposure(platform_a, leg_a_exposure);
+                        manager.remove_exposure(platform_b, leg_b_exposure);
+                        manager.remove_market_exposure(market_id, leg_a_exposure + leg_b_exposure);
+                    }
+                    BankrollMsg::RecordSettlement(settlement) => manager.record_settlement(&settlement),
                     BankrollMsg::GetSnapshot(kelly_frac, reply) => {
                         let _ = reply.send(manager.daily_snapshot(kelly_frac));
                     }
@@ -385,8 +408,8 @@ impl BankrollHandle {
         reply_rx.await.expect("Bankroll actor died")
     }
     
-    pub async fn record_settlement(&self, pnl: Decimal) {
-        let _ = self.tx.send(BankrollMsg::RecordSettlement(pnl)).await;
+    pub async fn record_settlement(&self, settlement: SettlementResult) {
+        let _ = self.tx.send(BankrollMsg::RecordSettlement(settlement)).await;
     }
 
     pub async fn get_snapshot(&self, kelly_frac: Decimal) -> DailySnapshot {

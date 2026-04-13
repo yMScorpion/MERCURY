@@ -169,8 +169,14 @@ impl MarketActor {
                             reserved = true;
                             let validated = ValidatedOpportunity { opportunity: opp.clone(), approved_size, risk_score };
                             if let Err(_) = exec_tx.try_send(validated) {
-                                let _ = bankroll.tx.send(crate::risk::bankroll::BankrollMsg::RecordSettlement(rust_decimal::Decimal::ZERO)).await;
-                            }
+                            let _ = bankroll.tx.send(crate::risk::bankroll::BankrollMsg::ReleaseCapital {
+                                leg_a_exposure,
+                                leg_b_exposure,
+                                platform_a: opp.leg_a.platform,
+                                platform_b: opp.leg_b.platform,
+                                market_id: opp.market_id,
+                            }).await;
+                        }
                         } else {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
