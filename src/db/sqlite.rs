@@ -732,8 +732,17 @@ impl Database for SqliteDb {
             std::path::Path::new(dest_path).parent().unwrap_or(std::path::Path::new("."))
         ).map_err(|e| anyhow::anyhow!("Cannot resolve backup directory: {}", e))?;
 
-        // Removed current_dir() check to support Docker environments where working dir differs from data dir
-        // Reconstruct the full path using the canonical directory + original filename
+        // Reconstruct the full path using the canonical directory + original filename.
+        // Enforce that the canonical directory is under one of the known safe prefixes
+        // to prevent symlink-based traversal into arbitrary filesystem locations.
+        let allowed_prefixes = ["/opt/mercury", "/tmp", "/home"];
+        let canonical_str = canonical.to_string_lossy();
+        anyhow::ensure!(
+            allowed_prefixes.iter().any(|prefix| canonical_str.starts_with(prefix)),
+            "Backup directory '{}' is outside allowed paths {:?}",
+            canonical_str,
+            allowed_prefixes,
+        );
         let filename = std::path::Path::new(dest_path)
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("Backup path has no filename"))?

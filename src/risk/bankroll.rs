@@ -240,17 +240,37 @@ mod tests {
     #[test]
     fn test_daily_reset_preserves_peak() {
         let mut bm = BankrollManager::new(dec!(1000));
+        // Drive peak up via record_trade (the only path that changes total_bankroll).
+        let trade = TradeResult {
+            trade_id: 1, opp_id: Uuid::new_v4(), market_id: Uuid::new_v4(),
+            market_question: "".into(),
+            leg_a_platform: Platform::Polymarket, leg_a_side: Side::Yes,
+            leg_a_price: dec!(0.4), leg_a_size: dec!(10), leg_a_fill_price: dec!(0.4), leg_a_fee: dec!(0),
+            leg_b_platform: Platform::Kalshi, leg_b_side: Side::No,
+            leg_b_price: dec!(0.5), leg_b_size: dec!(10), leg_b_fill_price: dec!(0.5), leg_b_fee: dec!(0),
+            raw_spread: dec!(0.1), net_spread: dec!(0.1),
+            profit: dec!(500),
+            status: TradeStatus::Success, failure_reason: None, execution_ms: 0,
+            executed_at: chrono::Utc::now(), bankroll_after: dec!(0), bankroll_change_pct: dec!(0),
+            approved_size: dec!(10),
+        };
+        bm.record_trade(&trade);
+        assert_eq!(bm.total_bankroll(), dec!(1500));
+        assert_eq!(bm.peak_bankroll(), dec!(1500));
+        bm.reset_daily();
+        // M-10 FIX: Enforce via unit test that peak bankroll persists across daily resets
+        assert_eq!(bm.peak_bankroll(), dec!(1500), "peak must survive daily reset");
+        assert_eq!(bm.total_bankroll(), dec!(1500), "bankroll must survive daily reset");
+        // record_settlement frees exposure but does NOT change total_bankroll
+        // (arb profit was already booked at execution time via record_trade)
         bm.record_settlement(&crate::types::SettlementResult {
-            realized_pnl: dec!(500),
+            realized_pnl: dec!(5),
             platform: Platform::Polymarket,
             market_id: Uuid::new_v4(),
             quantity: dec!(10),
             avg_entry_price: dec!(0.5),
-        }); // total is 1500, peak is 1500
-        assert_eq!(bm.peak_bankroll(), dec!(1500));
-        bm.reset_daily();
-        // M-10 FIX: Enforce via unit test that peak bankroll persists across daily resets
-        assert_eq!(bm.peak_bankroll(), dec!(1500));
+        });
+        assert_eq!(bm.total_bankroll(), dec!(1500), "settlement must not double-count PnL");
     }
 
     #[test]

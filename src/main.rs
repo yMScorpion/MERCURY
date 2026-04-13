@@ -642,9 +642,10 @@ async fn main() -> Result<()> {
     
     let discovery = feeds::discovery::MarketDiscovery::new(
         mercury_config.platforms.clone(),
-        30, // Poll every 30s: 15-minute candles are short-lived, and feeds resync their
-            // subscriptions on their own 60s timer, so we need discovery to run faster
-            // than the downstream consumers to keep the pipeline fed.
+        15, // Poll every 15s: 15-minute candles are short-lived (900s total lifetime).
+            // A 30s poll wastes up to 2 full cycles before a new round is discovered.
+            // Feed handlers resync subscriptions on their own 15s timer, so discovery
+            // must run at parity or faster to keep the pipeline fed without gaps.
         kalshi_auth_for_discovery,
     );
     join_set.spawn(discovery.run(matched_market_tx));

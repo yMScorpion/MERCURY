@@ -159,37 +159,43 @@ impl MarketActor {
                     let leg_a_exposure = approved_size * opp.leg_a.price;
                     let leg_b_exposure = approved_size * opp.leg_b.price;
                     
-                    let mut reserved = false;
-                    while !reserved {
-                        if crate::types::now_ns() > expiration_ns {
-                            tracing::warn!(opp_id = %opp.opp_id, "Opportunity TTL expired while waiting for capital");
-                            return;
-                        }
-                        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
-                        let _ = bankroll.tx.send(crate::risk::bankroll::BankrollMsg::ReserveCapital {
+                    // Attempt capital reservation exactly once. If the bankroll actor
+                    // cannot satisfy it, the opportunity is dropped cleanly — no spin loop,
+                    // no risk of holding the task alive past TTL.
+                    if crate::types::now_ns() > expiration_ns {
+                        tracing::warn!(opp_id = %opp.opp_id, "Opportunity TTL expired before capital reservation");
+                        return;
+                    }
+                    let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+                    let send_result = bankroll.tx.send(crate::risk::bankroll::BankrollMsg::ReserveCapital {
+                        leg_a_exposure,
+                        leg_b_exposure,
+                        platform_a: opp.leg_a.platform,
+                        platform_b: opp.leg_b.platform,
+                        market_id: opp.market_id,
+                        reply: res_tx,
+                    }).await;
+                    if send_result.is_err() {
+                        tracing::error!(opp_id = %opp.opp_id, "Bankroll actor channel closed — dropping opportunity");
+                        return;
+                    }
+                    let reserved = matches!(res_rx.await, Ok(true));
+                    if !reserved {
+                        tracing::debug!(opp_id = %opp.opp_id, "Insufficient capital for reservation — dropping opportunity");
+                        return;
+                    }
+                    // Capital reserved — forward to executor. On send failure, release
+                    // immediately so the capital is not stranded.
+                    let validated = ValidatedOpportunity { opportunity: opp.clone(), approved_size, risk_score };
+                    if exec_tx.send(validated).await.is_err() {
+                        tracing::warn!(opp_id = %opp.opp_id, "Executor channel closed — releasing reserved capital");
+                        let _ = bankroll.tx.send(crate::risk::bankroll::BankrollMsg::ReleaseCapital {
                             leg_a_exposure,
                             leg_b_exposure,
                             platform_a: opp.leg_a.platform,
                             platform_b: opp.leg_b.platform,
                             market_id: opp.market_id,
-                            reply: res_tx,
                         }).await;
-
-                        if let Ok(true) = res_rx.await {
-                            reserved = true;
-                            let validated = ValidatedOpportunity { opportunity: opp.clone(), approved_size, risk_score };
-                            if let Err(_) = exec_tx.try_send(validated) {
-                            let _ = bankroll.tx.send(crate::risk::bankroll::BankrollMsg::ReleaseCapital {
-                                leg_a_exposure,
-                                leg_b_exposure,
-                                platform_a: opp.leg_a.platform,
-                                platform_b: opp.leg_b.platform,
-                                market_id: opp.market_id,
-                            }).await;
-                        }
-                        } else {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
                     }
                 });
             }

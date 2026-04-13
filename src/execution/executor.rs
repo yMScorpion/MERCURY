@@ -395,10 +395,12 @@ impl ExecutionEngine {
             bankroll_change_pct: Decimal::ZERO,
         };
 
-        // Pass the result directly back to the orchestrator.
-        // The executor MUST NOT dispatch to Telegram or SQLite. 
-        if let Err(e) = self.trade_result_tx.try_send(trade_result) {
-            tracing::error!(error = %e, "Trade result channel full — dropping notification");
+        // Pass the result directly back to the orchestrator via blocking send.
+        // This MUST succeed — a dropped trade result means capital exposure is
+        // never released from the bankroll actor, permanently starving future arbs.
+        // The executor MUST NOT dispatch to Telegram or SQLite.
+        if let Err(e) = self.trade_result_tx.send(trade_result).await {
+            tracing::error!(error = %e, "CRITICAL: trade result channel closed — bankroll exposure permanently stranded. Executor shutting down.");
         }
 
         Ok(())
