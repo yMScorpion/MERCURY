@@ -301,6 +301,8 @@ async fn main() -> Result<()> {
         mercury_config.trading.max_single_trade_pct,
     )));
     
+    let global_uob = Arc::new(std::sync::RwLock::new(engine::order_book::UnifiedOrderBook::new()));
+
     let mut cb_initial = risk::circuit_breaker::CircuitBreakers::new(
         mercury_config.trading.max_single_trade_pct,
         mercury_config.trading.max_daily_loss_pct,
@@ -541,7 +543,7 @@ async fn main() -> Result<()> {
         kalshi_for_unwind,
         cdna_for_unwind,
         forex_for_unwind,
-        None, // UOB not shared globally; stop-loss uses per-market books in actor shards
+        Some(global_uob.clone()), // UOB now shared globally for stop-loss
     );
     join_set.spawn(unwind_watchdog.run());
 
@@ -883,6 +885,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                global_uob.write().unwrap().update(&tick);
                 metrics.inc_ticks_for_platform(tick.platform);
 
                 if circuit_breakers.write().unwrap().is_trading_halted() {

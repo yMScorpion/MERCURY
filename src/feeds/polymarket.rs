@@ -943,15 +943,9 @@ impl FeedHandler for PolymarketFeed {
 
                             // Bootstrap new books via REST
                             for yes_token in &new_yes_tokens {
-                                let tick_tx = tick_tx.clone();
-                                let mut feed_clone = self.clone();
-                                let token_clone = yes_token.clone();
-                                tokio::spawn(async move {
-                                    // Small delay to let the WS subscription register first
-                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                    feed_clone.bootstrap_book_via_rest(&token_clone, &tick_tx).await;
-                                });
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                // Small delay to let the WS subscription register first
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                self.bootstrap_book_via_rest(yes_token, &tick_tx).await;
                             }
                         }
                     }

@@ -161,6 +161,10 @@ impl MarketActor {
                     
                     let mut reserved = false;
                     while !reserved {
+                        if crate::types::now_ns() > expiration_ns {
+                            tracing::warn!(opp_id = %opp.opp_id, "Opportunity TTL expired while waiting for capital");
+                            return;
+                        }
                         let (res_tx, res_rx) = tokio::sync::oneshot::channel();
                         let _ = bankroll.tx.send(crate::risk::bankroll::BankrollMsg::ReserveCapital {
                             leg_a_exposure,

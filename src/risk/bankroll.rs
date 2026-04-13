@@ -240,7 +240,13 @@ mod tests {
     #[test]
     fn test_daily_reset_preserves_peak() {
         let mut bm = BankrollManager::new(dec!(1000));
-        bm.record_settlement(dec!(500)); // total is 1500, peak is 1500
+        bm.record_settlement(&crate::types::SettlementResult {
+            realized_pnl: dec!(500),
+            platform: Platform::Polymarket,
+            market_id: Uuid::new_v4(),
+            quantity: dec!(10),
+            avg_entry_price: dec!(0.5),
+        }); // total is 1500, peak is 1500
         assert_eq!(bm.peak_bankroll(), dec!(1500));
         bm.reset_daily();
         // M-10 FIX: Enforce via unit test that peak bankroll persists across daily resets
