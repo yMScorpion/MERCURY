@@ -73,6 +73,7 @@ pub struct PolymarketFeed {
     sequence: u64,
     /// HTTP client for REST book bootstrap calls
     http: reqwest::Client,
+    resolved_markets: std::collections::HashSet<Uuid>,
 }
 
 #[derive(Clone)]
@@ -237,6 +238,7 @@ impl PolymarketFeed {
             fee_rates,
             sequence: 0,
             http,
+            resolved_markets: std::collections::HashSet::new(),
         }
     }
 
@@ -246,7 +248,14 @@ impl PolymarketFeed {
 
     fn emit_tick(&self, asset_id: &str) -> Option<NormalizedTick> {
         let market_id = self.asset_to_market_id(asset_id)?;
+
+        // Skip resolved markets
+        if self.resolved_markets.contains(&market_id) {
+            return None;
+        }
+
         let book = self.books.get(asset_id)?;
+        // ... (rest of logic)
 
         let bid = book.best_bid().unwrap_or((Decimal::ZERO, Decimal::ZERO));
         let ask = book.best_ask().unwrap_or((Decimal::ZERO, Decimal::ZERO));
@@ -408,6 +417,11 @@ impl PolymarketFeed {
                 let market_id = msg.market.clone();
                 let winner = msg.winning_asset_id.as_deref().unwrap_or("unknown");
                 info!(%market_id, %winner, "Market resolved");
+                
+                // Add to resolved set
+                if let Ok(uuid) = Uuid::parse_str(&market_id) {
+                    self.resolved_markets.insert(uuid);
+                }
                 
                 // Update market status in DB
                 let db = self.db.clone();

@@ -916,8 +916,6 @@ async fn main() -> Result<()> {
                         shared_registry,
                         circuit_breakers.clone(),
                         kelly.clone(),
-                        cached_open_positions.clone(),
-                        in_flight_trades.clone(),
                         metrics.clone()
                     );
 
