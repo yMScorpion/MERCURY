@@ -437,7 +437,7 @@ impl Database for SqliteDb {
     }
 
     async fn get_cumulative_profit(&self) -> Result<Decimal> {
-        let profit_str: String = sqlx::query_scalar("SELECT COALESCE(SUM(profit), '0') FROM trades WHERE status = 'success'")
+        let profit_str: String = sqlx::query_scalar("SELECT COALESCE(SUM(profit), '0') FROM trades")
             .fetch_one(&self.pool).await?;
         dec(&profit_str)
     }

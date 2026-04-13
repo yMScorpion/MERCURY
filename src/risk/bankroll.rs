@@ -204,10 +204,39 @@ impl BankrollManager {
         info!(bankroll = %self.total_bankroll, "Daily counters reset");
     }
 
-    pub fn restore_state(&mut self, cumulative_profit: Decimal) {
+    pub fn restore_state(&mut self, cumulative_profit: Decimal, todays_trades: &[TradeResult]) {
         self.total_bankroll += cumulative_profit;
         self.peak_bankroll = self.total_bankroll.max(self.peak_bankroll);
-        tracing::info!(cumulative_profit = %cumulative_profit, "Bankroll state restored from DB");
+        
+        self.trades_today = todays_trades.len() as i32;
+        self.success_today = todays_trades.iter().filter(|t| t.status == TradeStatus::Success).count() as i32;
+        self.fail_today = todays_trades.iter().filter(|t| matches!(t.status, TradeStatus::Fail | TradeStatus::Partial)).count() as i32;
+        
+        self.daily_pnl = todays_trades.iter().map(|t| t.profit).sum();
+        self.daily_fees = todays_trades.iter().map(|t| t.leg_a_fee + t.leg_b_fee).sum();
+        
+        self.daily_start_bankroll = self.total_bankroll - self.daily_pnl;
+        
+        self.exec_history.clear();
+        self.exec_success_count = 0;
+        for t in todays_trades {
+            let is_success = t.status == TradeStatus::Success;
+            self.exec_history.push_back((t.executed_at, is_success));
+            if is_success {
+                self.exec_success_count += 1;
+            }
+        }
+        
+        if !self.exec_history.is_empty() {
+            self.exec_success_rate = Decimal::from(self.exec_success_count as u64) / Decimal::from(self.exec_history.len() as u64);
+        }
+
+        tracing::info!(
+            cumulative_profit = %cumulative_profit,
+            trades_today = self.trades_today,
+            daily_pnl = %self.daily_pnl,
+            "Bankroll state restored from DB"
+        );
     }
 
     pub fn daily_snapshot(&self, kelly_utilization: Decimal) -> DailySnapshot {

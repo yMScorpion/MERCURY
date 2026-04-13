@@ -123,8 +123,11 @@ impl MarketActor {
                         let fraction = k.optimal_fraction(win_prob, opp.net_spread);
                         let ideal_usd = k.position_size(state.bankroll, win_prob, opp.net_spread, rust_decimal_macros::dec!(0.10));
                         
+                        let available_capital = state.bankroll * (rust_decimal::Decimal::ONE - state.total_exposure_pct);
+                        let affordable_usd = ideal_usd.min(available_capital);
+
                         let combined_price = opp.leg_a.price + opp.leg_b.price;
-                        let contracts = if combined_price > rust_decimal::Decimal::ZERO { ideal_usd / combined_price } else { rust_decimal::Decimal::ZERO };
+                        let contracts = if combined_price > rust_decimal::Decimal::ZERO { affordable_usd / combined_price } else { rust_decimal::Decimal::ZERO };
                         let mut size = if opp.leg_a.platform == Platform::Kalshi || opp.leg_b.platform == Platform::Kalshi {
                             contracts.min(opp.recommended_size).floor()
                         } else {

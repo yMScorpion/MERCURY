@@ -22,7 +22,7 @@ pub trait Database: Send + Sync + 'static {
     async fn get_trade_count(&self) -> Result<i64>;
     /// Count distinct in-flight arbitrage pairs (not individual position records).
     async fn get_open_arb_count(&self) -> Result<usize>;
-    /// Sum cumulative profit of all successful trades to recover state post-crash
+    /// Sum cumulative profit of all trades to recover state post-crash
     async fn get_cumulative_profit(&self) -> Result<Decimal>;
 
     // Positions

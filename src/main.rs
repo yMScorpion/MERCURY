@@ -250,8 +250,12 @@ async fn main() -> Result<()> {
     let (liveness_tx, mut liveness_rx) = mpsc::channel::<(Platform, bool)>(20);
 
     // ─── Telegram ───
-    let tg_notification_token = std::env::var("TELEGRAM_NOTIFICATION_TOKEN").unwrap_or_default();
-    let tg_daily_token = std::env::var("TELEGRAM_DAILY_TOKEN").unwrap_or_default();
+    let tg_notification_token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .or_else(|_| std::env::var("TELEGRAM_NOTIFICATION_TOKEN"))
+        .unwrap_or_default();
+    let tg_daily_token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .or_else(|_| std::env::var("TELEGRAM_DAILY_TOKEN"))
+        .unwrap_or_default();
     let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_default();
     let tg_report_chat = std::env::var("TELEGRAM_REPORT_CHAT_ID").unwrap_or_default();
 
@@ -342,7 +346,8 @@ async fn main() -> Result<()> {
 
 
     if let Ok(cum_profit) = db.get_cumulative_profit().await {
-        bankroll_manager.restore_state(cum_profit);
+        let todays_trades = db.get_trades_for_date(chrono::Utc::now().date_naive()).await.unwrap_or_default();
+        bankroll_manager.restore_state(cum_profit, &todays_trades);
     }
 
     // ─── Initialize Platform Clients from Environment ───
@@ -1137,21 +1142,6 @@ async fn main() -> Result<()> {
             Some(raw_result) = trade_result_rx.recv() => {
                 let result = bankroll_handle.process_trade(raw_result).await;
 
-                let db_clone = db.clone();
-                let res_for_db = result.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = db_clone.insert_trade(&res_for_db).await {
-                        tracing::error!(error = %e, "Failed to persist trade result to database");
-                    }
-                });
-
-                // FIX: Non-blocking Telegram alert dispatch prevents engine freeze
-                if tg_alerts_enabled {
-                    if let Err(e) = alert_tx.try_send(AlertMessage::TradeComplete(Box::new(result.clone()))) {
-                        tracing::warn!(error = %e, trade_id = result.trade_id, "Telegram alert queue full — dropping notification to preserve HFT latency");
-                    }
-                }
-
                 circuit_breakers.write().unwrap().record_execution(result.status == TradeStatus::Success);
                 
                 let current_kelly = kelly.read().unwrap().fraction();
@@ -1167,16 +1157,39 @@ async fn main() -> Result<()> {
                     cached_open_positions.fetch_sub(1, Ordering::Relaxed);
                 }
 
-                if let Err(e) = trade_result_tx2.try_send(result.clone()) {
-                    error!(error = %e, trade_id = result.trade_id,
-                        "CRITICAL: Position tracker channel full/closed — trade result lost, \
-                         open position will not be closed in DB. Manual intervention required.");
-                }
-
                 match result.status {
                     TradeStatus::Success => metrics.inc_success(),
                     _ => metrics.inc_failed(),
                 }
+
+                let db_clone = db.clone();
+                let alert_tx_clone = alert_tx.clone();
+                let trade_result_tx2_clone = trade_result_tx2.clone();
+                let mut final_result = result.clone();
+
+                tokio::spawn(async move {
+                    match db_clone.insert_trade(&final_result).await {
+                        Ok(id) => {
+                            final_result.trade_id = id;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to persist trade result to database");
+                        }
+                    }
+
+                    // FIX: Send Telegram alert AFTER getting the real trade ID to prevent duplicate message drops
+                    if tg_alerts_enabled {
+                        if let Err(e) = alert_tx_clone.send(AlertMessage::TradeComplete(Box::new(final_result.clone()))).await {
+                            tracing::warn!(error = %e, trade_id = final_result.trade_id, "Telegram alert channel closed — dropping notification");
+                        }
+                    }
+
+                    if let Err(e) = trade_result_tx2_clone.send(final_result.clone()).await {
+                        tracing::error!(error = %e, trade_id = final_result.trade_id,
+                            "CRITICAL: Position tracker channel full/closed — trade result lost, \
+                             open position will not be closed in DB. Manual intervention required.");
+                    }
+                });
             }
 
             // ── Gas Oracle Updates ──

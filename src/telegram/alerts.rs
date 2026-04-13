@@ -85,11 +85,13 @@ fn format_trade_alert(trade: &TradeResult) -> String {
         msg,
         "\n\n{profit_icon} <b>Profit: {profit_sign}${profit}</b>\n\
          📊 Bankroll: ${bankroll} ({pct_sign}{pct}%)\n\
-         ⏱️ Execution: {exec_ms}ms",
+         ⏱️ Execution: {exec_ms}ms\n\
+         🆔 Opp ID: <code>{opp_id}</code>",
         profit = trade.profit.round_dp(2),
         bankroll = trade.bankroll_after.round_dp(2),
         pct = trade.bankroll_change_pct.round_dp(4),
         exec_ms = trade.execution_ms,
+        opp_id = trade.opp_id,
     );
 
     if let Some(reason) = &trade.failure_reason {
