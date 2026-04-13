@@ -179,17 +179,20 @@ impl KalshiFeed {
             "orderbook_snapshot" => self.handle_snapshot(&env, tick_tx),
             "orderbook_delta"    => self.handle_delta(&env, tick_tx),
             "subscribed" => {
-                if let Some(sid) = env.sid {
-                    // Store the sid so we can use update_subscription later
+                let mut actual_sid = env.sid;
+                if let Some(msg) = &env.msg {
+                    if actual_sid.is_none() {
+                        actual_sid = msg.get("sid").and_then(|v| v.as_u64());
+                    }
+                    let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let sid = actual_sid.unwrap_or(0);
+                    tracing::debug!(channel, sid, "Kalshi subscription confirmed");
+                }
+                if let Some(sid) = actual_sid {
                     if self.orderbook_sid.is_none() {
                         self.orderbook_sid = Some(sid);
                         tracing::info!(sid, "Kalshi orderbook_delta subscription confirmed, sid stored");
                     }
-                }
-                if let Some(msg) = &env.msg {
-                    let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let sid = env.sid.or_else(|| msg.get("sid").and_then(|v| v.as_u64())).unwrap_or(0);
-                    tracing::debug!(channel, sid, "Kalshi subscription confirmed");
                 }
                 Ok(())
             }

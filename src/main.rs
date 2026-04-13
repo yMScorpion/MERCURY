@@ -917,7 +917,8 @@ async fn main() -> Result<()> {
                         shared_registry,
                         circuit_breakers.clone(),
                         kelly.clone(),
-                        metrics.clone()
+                        metrics.clone(),
+                        cached_open_positions.clone()
                     );
 
                     let _ = tx.try_send(tick);
@@ -1132,11 +1133,6 @@ async fn main() -> Result<()> {
             Some(raw_result) = trade_result_rx.recv() => {
                 let result = bankroll_handle.process_trade(raw_result).await;
 
-                // Reliable notification delivery
-                if let Err(e) = alert_tx.send(AlertMessage::TradeComplete(Box::new(result.clone()))).await {
-                    error!(error = %e, "Failed to send trade notification");
-                }
-
                 let db_clone = db.clone();
                 let res_for_db = result.clone();
                 tokio::spawn(async move {
@@ -1145,8 +1141,11 @@ async fn main() -> Result<()> {
                     }
                 });
 
+                // FIX: Non-blocking Telegram alert dispatch prevents engine freeze
                 if tg_alerts_enabled {
-                    let _ = alert_tx.try_send(AlertMessage::TradeComplete(Box::new(result.clone())));
+                    if let Err(e) = alert_tx.try_send(AlertMessage::TradeComplete(Box::new(result.clone()))) {
+                        tracing::warn!(error = %e, trade_id = result.trade_id, "Telegram alert queue full — dropping notification to preserve HFT latency");
+                    }
                 }
 
                 circuit_breakers.write().unwrap().record_execution(result.status == TradeStatus::Success);
@@ -1155,10 +1154,10 @@ async fn main() -> Result<()> {
                 let snapshot = bankroll_handle.get_snapshot(current_kelly).await;
                 kelly.write().unwrap().adjust_for_drawdown(snapshot.drawdown_pct);
 
-                in_flight_trades.fetch_sub(1, Ordering::Relaxed);
+                let _ = in_flight_trades.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(1)));
 
                 if result.status == TradeStatus::Fail {
-                    cached_open_positions.fetch_sub(1, Ordering::Relaxed);
+                    let _ = cached_open_positions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(1)));
                 }
 
                 if let Err(e) = trade_result_tx2.try_send(result.clone()) {
@@ -1184,7 +1183,7 @@ async fn main() -> Result<()> {
             // ── Settlement PnL Sink ──
             Some(settlement) = settlement_rx.recv() => {
                 bankroll_handle.record_settlement(settlement).await;
-                cached_open_positions.fetch_sub(1, Ordering::Relaxed);
+                let _ = cached_open_positions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(1)));
             }
 
             // ── Periodic State Sync ──
@@ -1363,7 +1362,7 @@ async fn main() -> Result<()> {
                     // Route through the actor to ensure exposure matches DB
                     let result = bankroll_handle.process_trade(raw_result).await;
                     
-                    cached_open_positions.fetch_sub(1, Ordering::Relaxed); 
+                    let _ = cached_open_positions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(1)));
                     
                     // Use send (blocking) during shutdown — we must ensure positions are tracked
                     if let Err(e) = trade_result_tx2.send(result).await {

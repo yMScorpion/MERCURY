@@ -124,16 +124,15 @@ impl BankrollManager {
     /// Credits the bankroll with realized PnL from an expired/settled market.
     /// Winning legs pay $1.00 per contract; losing legs pay $0.00. 
     pub fn record_settlement(&mut self, settlement: &crate::types::SettlementResult) {
-        self.total_bankroll += settlement.realized_pnl;
-        if self.total_bankroll > self.peak_bankroll {
-            self.peak_bankroll = self.total_bankroll;
-        }
+        // CRITICAL FIX: Do NOT add realized_pnl to total_bankroll here.
+        // The arbitrage profit was already added to total_bankroll in `record_trade`.
+        // Adding settlement PnL double-counts (or incorrectly subtracts) the legs.
         
         let exposure_freed = settlement.quantity * settlement.avg_entry_price;
         self.remove_exposure(settlement.platform, exposure_freed);
         self.remove_market_exposure(settlement.market_id, exposure_freed);
         
-        tracing::info!(realized_pnl = %settlement.realized_pnl, exposure_freed = %exposure_freed, bankroll = %self.total_bankroll, "Settlement credited to bankroll and exposure freed");
+        tracing::info!(realized_pnl = %settlement.realized_pnl, exposure_freed = %exposure_freed, bankroll = %self.total_bankroll, "Settlement processed and exposure freed");
     }
 
     pub fn record_trade(&mut self, result: &TradeResult) {

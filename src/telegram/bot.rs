@@ -37,6 +37,14 @@ struct AnswerCallbackQueryRequest<'a> {
 struct TelegramResponse {
     ok: bool,
     description: Option<String>,
+    #[serde(default)]
+    parameters: Option<TelegramParameters>,
+}
+
+#[derive(Deserialize, Default)]
+struct TelegramParameters {
+    #[serde(default)]
+    retry_after: Option<u64>,
 }
 
 impl TelegramBot {
@@ -67,15 +75,17 @@ impl TelegramBot {
         {
             let sleep_for = {
                 let mut last = self.last_send.lock().await;
-                let elapsed = last.elapsed();
+                let now = Instant::now();
                 let min_interval = Duration::from_millis(1000 / RATE_LIMIT_PER_SECOND as u64);
-                if elapsed < min_interval {
-                    let wait = min_interval - elapsed;
+                let next_allowed = *last + min_interval;
+                
+                if now < next_allowed {
+                    let wait = next_allowed - now;
                     // Pre-emptively advance the timer for the NEXT concurrent caller
-                    *last += min_interval;
+                    *last = next_allowed;
                     Some(wait)
                 } else {
-                    *last = Instant::now();
+                    *last = now;
                     None
                 }
             };
@@ -110,7 +120,7 @@ impl TelegramBot {
                 Ok(resp) => {
                     let status = resp.status();
                     let resp_body: TelegramResponse = resp.json().await
-                        .unwrap_or(TelegramResponse { ok: false, description: Some("Failed to parse response".into()) });
+                        .unwrap_or(TelegramResponse { ok: false, description: Some("Failed to parse response".into()), parameters: None });
 
                     if resp_body.ok {
                         return Ok(());
@@ -118,11 +128,12 @@ impl TelegramBot {
 
                     let desc = resp_body.description.unwrap_or_default();
                     if status.as_u16() == 429 {
-                        warn!(attempt, "Telegram rate limited, backing off");
-                        if attempt >= 3 {
+                        let retry_after = resp_body.parameters.and_then(|p| p.retry_after).unwrap_or(5);
+                        warn!(attempt, retry_after, "Telegram rate limited, backing off");
+                        if attempt >= 5 {
                             anyhow::bail!("Telegram rate limited after {} attempts: {}", attempt, desc);
                         }
-                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                        tokio::time::sleep(Duration::from_secs(retry_after)).await;
                         continue;
                     }
 

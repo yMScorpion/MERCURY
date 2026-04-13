@@ -186,7 +186,17 @@ impl UnwindWatchdog {
                                             severity: "warning".into(),
                                             message: format!("✅ Automated liquidation successful. Filled {} contracts on {}.", res.fill_size, plat),
                                         });
+                                        let sell_price = res.fill_price.0;
                                         for pos in legs {
+                                            let pnl = pos.quantity * (sell_price - pos.avg_entry_price);
+                                            let _ = self.db.enqueue_settlement(
+                                                pos.id,
+                                                &pos.market_id,
+                                                pos.platform,
+                                                pos.quantity,
+                                                pos.avg_entry_price,
+                                                pnl
+                                            ).await;
                                             let _ = self.db.close_position(pos.id).await;
                                         }
                                     } else {

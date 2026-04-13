@@ -101,7 +101,18 @@ impl PlatformOrderClient for KalshiClient {
         }
         
         // CRIT-1 / MED-10 FIX: Prevent catastrophic fallback to i64::MAX on extreme size overflows
-        let count = size.floor().to_i64().unwrap_or(0).clamp(1, 10_000);
+        let count = size.floor().to_i64().unwrap_or(0);
+        if count < 1 {
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
+                order_id: String::new(),
+                error: Some(format!("Kalshi order size too small: {}", size)),
+            });
+        }
+        let count = count.clamp(1, 10_000);
 
         // Rate limiting is handled by CB6 (execution failure rate circuit breaker).
         // A fixed 50ms sleep per order adds unacceptable latency for arbitrage.

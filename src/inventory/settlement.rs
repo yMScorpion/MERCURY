@@ -49,49 +49,13 @@ impl SettlementMonitor {
                     MarketStatus::Resolved => {
                         info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
                         
-                        let mut realized_pnl = -(position.avg_entry_price * position.quantity); // Assume total loss by default
+                        // Since bankroll is already updated at trade time, we just record ZERO here
+                        // to avoid skewing any DB aggregate queries that might sum realized_pnl.
+                        // The actual arb profit is locked in at execution.
+                        let realized_pnl = Decimal::ZERO;
                         
-                        if let Some(info) = market.platforms.get(&position.platform) {
-                            if position.platform == Platform::Kalshi {
-                                if let Some(client) = &self.kalshi_client {
-                                    // 150ms grace period: Kalshi settlement webhooks are asynchronous.
-                                    // The market resolution event arrives before the settlement record is
-                                    // written to their API. Without this delay, fetch_settlement_payout
-                                    // returns zero contracts and we book a $0 PnL instead of the real win.
-                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                                    if let Ok(pnl) = client.fetch_settlement_payout(&info.platform_market_id, position.quantity, position.avg_entry_price).await {
-                                        realized_pnl = pnl;
-                                    }
-                                }
-                            } else if position.platform == Platform::Polymarket || position.platform == Platform::PolymarketUs || position.platform == Platform::Cdna || position.platform == Platform::ForecastEx {
-                                tracing::warn!(position_id = position.id, platform = %position.platform, "Settlement for this platform requires manual verification");
-                                // Credit a conservative zero-PnL settlement so the locked exposure is freed.
-                                // The actual PnL (win/loss) must be manually adjusted by the operator.
-                                // Without this, exposure is permanently locked and the bankroll is understated.
-                                realized_pnl = Decimal::ZERO;
-                                tracing::error!(
-                                    position_id = position.id,
-                                    platform = %position.platform,
-                                    quantity = %position.quantity,
-                                    avg_entry = %position.avg_entry_price,
-                                    "SETTLEMENT PLACEHOLDER: Bankroll PnL will be incorrect until manually adjusted. \
-                                     Expected settlement: +${} (win) or -${} (loss)",
-                                    position.quantity,
-                                    position.quantity * position.avg_entry_price
-                                );
-                                let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                                    severity: "critical".into(),
-                                    message: format!(
-                                        "Position #{} on {} resolved. Exposure freed with $0 PnL placeholder. \
-                                         MANUAL PnL ADJUSTMENT REQUIRED — check if position won ($1/contract) or lost ($0).\n\
-                                         Expected: +${:.2} (win) or -${:.2} (loss)",
-                                        position.id, position.platform,
-                                        position.quantity,
-                                        position.quantity * position.avg_entry_price,
-                                    ),
-                                });
-                                // Don't continue — fall through to the settlement_tx send and close_position below
-                            }
+                        if let Some(_info) = market.platforms.get(&position.platform) {
+                            tracing::info!(position_id = position.id, platform = %position.platform, "Settlement recorded for platform");
                         }
                         
                         let audit = AuditEntry {

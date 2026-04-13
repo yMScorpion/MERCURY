@@ -12,6 +12,7 @@ use crate::risk::bankroll::BankrollHandle;
 use crate::risk::circuit_breaker::{CircuitBreakers, CheckParams};
 use crate::risk::kelly::KellyCalculator;
 use crate::monitoring::metrics::Metrics;
+#[allow(unused_imports)]
 use tracing::{debug, info, warn};
 
 pub struct MarketActor {
@@ -27,6 +28,7 @@ pub struct MarketActor {
     kelly: Arc<RwLock<KellyCalculator>>,
     metrics: Arc<Metrics>,
     alert_tx: mpsc::Sender<crate::types::AlertMessage>,
+    cached_open_positions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MarketActor {
@@ -42,6 +44,7 @@ impl MarketActor {
         circuit_breakers: Arc<RwLock<CircuitBreakers>>,
         kelly: Arc<RwLock<KellyCalculator>>,
         metrics: Arc<Metrics>,
+        cached_open_positions: Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let mut actor = Self {
             market_id,
@@ -56,6 +59,7 @@ impl MarketActor {
             circuit_breakers,
             kelly,
             metrics,
+            cached_open_positions,
         };
 
         tokio::spawn(async move {
@@ -66,7 +70,7 @@ impl MarketActor {
     async fn run(&mut self) {
         debug!(market_id = %self.market_id, "MarketActor started");
 
-        let alert_tx = self.alert_tx.clone();
+        let _alert_tx = self.alert_tx.clone();
         let metrics = self.metrics.clone();
         let bankroll = self.bankroll.clone();
         let execution_tx = self.execution_tx.clone();
@@ -74,6 +78,7 @@ impl MarketActor {
         let kelly = self.kelly.clone();
         let detector = self.detector.clone();
         let market_id = self.market_id;
+        let cached_open_positions = self.cached_open_positions.clone();
 
         while let Some(tick) = self.rx.recv().await {
             self.uob_shard.update(&tick);
@@ -96,7 +101,8 @@ impl MarketActor {
                 let cbs = circuit_breakers.clone();
                 let kelly = kelly.clone();
                 let metrics = metrics.clone();
-                let alert_tx = alert_tx.clone();
+                let _alert_tx_inner = _alert_tx.clone();
+                let cached_open_pos = cached_open_positions.clone();
                 
                 tokio::spawn(async move {
                     let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
@@ -123,14 +129,14 @@ impl MarketActor {
                         (size, fraction)
                     };
 
-                    let mut too_small = false;
-                    let mut scaled_size = approved_size;
+                    let too_small = false;
+                    let scaled_size = approved_size;
                     // ... (size scaling logic)
                     if too_small || scaled_size <= rust_decimal::Decimal::ZERO { return; }
                     let approved_size = scaled_size;
 
                     let combined_price = opp.leg_a.price + opp.leg_b.price;
-                    let (passed_cbs, violations) = {
+                    let (passed_cbs, _violations) = {
                         let mut cb_guard = cbs.write().unwrap();
                         let params = CheckParams {
                             trade_size: approved_size * combined_price,
@@ -138,7 +144,7 @@ impl MarketActor {
                             daily_loss_pct: state.daily_loss_pct,
                             drawdown_pct: state.drawdown_pct,
                             platform_exposure_pct: state.platform_a_exposure_pct.max(state.platform_b_exposure_pct),
-                            open_positions: 0,
+                            open_positions: cached_open_pos.load(std::sync::atomic::Ordering::Relaxed),
                             involves_polymarket: opp.leg_a.platform == Platform::Polymarket || opp.leg_b.platform == Platform::Polymarket,
                             ms_since_last_tick: metrics.ms_since_last_tick(),
                             market_exposure_pct: state.market_exposure_pct,

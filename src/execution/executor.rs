@@ -152,10 +152,9 @@ impl ExecutionEngine {
         // Trade ID is assigned by the DB via AUTOINCREMENT. Use 0 as placeholder.
         let current_trade_id: i64 = 0;
 
-        // In dry-run mode, skip the TTL check entirely. There is no real order to
-        // submit, so stale-price risk is irrelevant and tight timing would cause
-        // every simulated trade to be dropped by the async processing chain overhead.
-        if !self.dry_run && current_time_ns > expiration_ns {
+        // Apply the TTL check even in dry-run mode to ensure accurate simulation
+        // and prevent execution of massively delayed opportunities.
+        if current_time_ns > expiration_ns {
             let delay_ms = (current_time_ns - opp.detected_at) / 1_000_000;
             tracing::warn!(
                 opp_id = %opp.opp_id, 

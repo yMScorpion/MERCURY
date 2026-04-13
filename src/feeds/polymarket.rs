@@ -199,7 +199,7 @@ struct RestLevel {
 struct InitialSubscription {
     #[serde(rename = "type")]
     msg_type: String,
-    #[serde(rename = "asset_ids")]
+    #[serde(rename = "assets_ids")]
     asset_ids: Vec<String>,
     custom_feature_enabled: bool,
 }
@@ -209,7 +209,7 @@ struct InitialSubscription {
 #[derive(Serialize)]
 struct DynamicSubscription {
     operation: String,
-    #[serde(rename = "asset_ids")]
+    #[serde(rename = "assets_ids")]
     asset_ids: Vec<String>,
     #[serde(rename = "type")]
     msg_type: String,
@@ -445,7 +445,7 @@ impl PolymarketFeed {
             }
 
             "market_resolved" => {
-                let condition_id = msg.market.clone();
+                let condition_id = msg.condition_id.clone().unwrap_or_else(|| msg.market.clone());
                 let winner_asset = msg.winning_asset_id.as_deref().unwrap_or("").to_string();
                 info!(condition_id = %condition_id, winner_asset = %winner_asset, "Market resolved event received");
 
@@ -606,7 +606,7 @@ impl PolymarketFeed {
                     let seq = {
                         let book = self.books.entry(item_asset.clone()).or_insert_with(LocalOrderBook::new);
                         if let Some(ms) = msg_seq {
-                            if ms <= book.sequence && book.sequence > 0 { continue; }
+                            if ms < book.sequence && book.sequence > 0 { continue; }
                             book.sequence = ms;
                         } else {
                             self.sequence += 1;
@@ -833,12 +833,10 @@ impl FeedHandler for PolymarketFeed {
                             if !self.pending_unsub_tokens.is_empty() {
                                 let tokens: Vec<String> = std::mem::take(&mut self.pending_unsub_tokens);
                                 for chunk in tokens.chunks(50) {
-                                    let unsub = DynamicSubscription {
-                                        operation: "unsubscribe".into(),
-                                        asset_ids: chunk.to_vec(),
-                                        msg_type: "market".into(),
-                                        custom_feature_enabled: true,
-                                    };
+                                    let unsub = serde_json::json!({
+                                        "operation": "unsubscribe",
+                                        "assets_ids": chunk.to_vec()
+                                    });
                                     if let Ok(msg_text) = serde_json::to_string(&unsub) {
                                         if let Err(e) = write.send(Message::Text(msg_text.into())).await {
                                             warn!(error = %e, "Failed to send WS unsubscribe for resolved market tokens");
@@ -910,12 +908,10 @@ impl FeedHandler for PolymarketFeed {
                         // Unsubscribe from old tokens
                         if !old_yes_tokens_to_remove.is_empty() {
                             for chunk in old_yes_tokens_to_remove.chunks(50) {
-                                let unsub = DynamicSubscription {
-                                    operation: "unsubscribe".into(),
-                                    asset_ids: chunk.to_vec(),
-                                    msg_type: "market".into(),
-                                    custom_feature_enabled: true,
-                                };
+                                let unsub = serde_json::json!({
+                                    "operation": "unsubscribe",
+                                    "assets_ids": chunk.to_vec()
+                                });
                                 if let Ok(msg_text) = serde_json::to_string(&unsub) {
                                     let _ = write.send(Message::Text(msg_text.into())).await;
                                 }
@@ -934,12 +930,12 @@ impl FeedHandler for PolymarketFeed {
                         if !new_yes_tokens.is_empty() {
                             tracing::info!(count = new_yes_tokens.len(), "Dynamically subscribing to new Polymarket markets");
                             for chunk in new_yes_tokens.chunks(50) {
-                                let sub = DynamicSubscription {
-                                    operation: "subscribe".into(),
-                                    asset_ids: chunk.to_vec(),
-                                    msg_type: "market".into(),
-                                    custom_feature_enabled: true,
-                                };
+                                let sub = serde_json::json!({
+                                    "operation": "subscribe",
+                                    "assets_ids": chunk.to_vec(),
+                                    "type": "market",
+                                    "custom_feature_enabled": true
+                                });
                                 if let Ok(msg_text) = serde_json::to_string(&sub) {
                                     let _ = write.send(Message::Text(msg_text.into())).await;
                                 }

@@ -475,7 +475,7 @@ impl MarketDiscovery {
         let unified_id = compute_unified_market_id(
             &format!("{}-updown-15m-{}", round.asset, round.round_start_ts),
             "cross_platform_crypto_15m",
-            &expiration.to_rfc3339(),
+            &(round.round_start_ts + 900).to_string(),
         );
 
         Some(MatchedMarket {
