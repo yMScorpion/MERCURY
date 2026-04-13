@@ -1314,14 +1314,32 @@ async fn main() -> Result<()> {
 
             // ── Graceful Shutdown ──
             _ = tokio::signal::ctrl_c() => {
-                info!("Shutdown signal received");
+                info!("Shutdown signal received. Clearing queue and preparing final daily report...");
                 cancel_token.cancel();
+
+                // Compute all trades profits and send the final daily report on Telegram
+                if tg_reports_enabled {
+                    info!("Computing final trades profits and generating daily report...");
+                    let current_kelly = kelly.read().unwrap().fraction();
+                    let snapshot = bankroll_handle.get_snapshot(current_kelly).await;
+                    let uptime_secs = metrics.uptime_secs();
+                    let ws_reconnects = metrics.ws_reconnects.load(Ordering::Relaxed);
+                    let api_errors = metrics.api_errors.load(Ordering::Relaxed);
+                    
+                    let report = build_daily_report(db.clone(), snapshot, uptime_secs, ws_reconnects, api_errors).await;
+                    
+                    // Send the final report to the queue
+                    let _ = daily_report_tx.send(report).await;
+                    
+                    // Allow time for the report to flush through the channel before process exits
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
 
                 if tg_alerts_enabled {
                     let bot = telegram::bot::TelegramBot::new(tg_notification_token.clone());
                     let _ = bot.send_message(
                         &tg_alerts_chat,
-                        "MERCURY SHUTTING DOWN - Graceful shutdown initiated.",
+                        "MERCURY SHUTTING DOWN - Graceful shutdown initiated. Final reports sent.",
                     ).await;
                 }
 
