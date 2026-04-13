@@ -753,24 +753,73 @@ impl FeedHandler for PolymarketFeed {
                 }
 
                 _ = sync_interval.tick() => {
-                    // Dynamically subscribe to newly discovered markets
                     if let Ok(markets) = self.db.get_active_markets().await {
-                        let mut new_yes_tokens = Vec::new();
-                        for m in markets {
+                        let mut new_yes_tokens: Vec<String> = Vec::new();
+                        let mut old_yes_tokens_to_remove: Vec<String> = Vec::new();
+
+                        // Build the current set of expected yes-tokens from DB
+                        let mut expected_pairs: std::collections::HashMap<String, (Uuid, u16)> = std::collections::HashMap::new();
+                        for m in &markets {
                             if let Some(info) = m.platforms.get(&crate::types::Platform::Polymarket) {
                                 let pair = &info.platform_market_id;
-                                if !self.subscriptions.contains_key(pair) {
-                                    let yes_key = yes_token_from_pair(pair);
-                                    self.subscriptions.insert(pair.clone(), m.unified_id);
-                                    self.fee_rates.insert(yes_key.clone(), info.fee_rate_bps);
-                                    self.yes_token_to_market.insert(yes_key.clone(), m.unified_id);
-                                    self.books.entry(yes_key.clone()).or_insert_with(LocalOrderBook::new);
-                                    new_yes_tokens.push(yes_key);
+                                let yes_key = yes_token_from_pair(pair);
+                                expected_pairs.insert(pair.clone(), (m.unified_id, info.fee_rate_bps));
+                                // Map yes_token -> market
+                                self.yes_token_to_market.insert(yes_key.clone(), m.unified_id);
+                            }
+                        }
+
+                        // Find new token pairs (in DB but not subscribed)
+                        for (pair, (market_id, fee_bps)) in &expected_pairs {
+                            let yes_key = yes_token_from_pair(pair);
+                            if !self.subscriptions.contains_key(pair) {
+                                // New pair — could be a new round's different token
+                                self.subscriptions.insert(pair.clone(), *market_id);
+                                self.fee_rates.insert(yes_key.clone(), *fee_bps);
+                                self.yes_token_to_market.insert(yes_key.clone(), *market_id);
+                                self.books.entry(yes_key.clone()).or_insert_with(LocalOrderBook::new);
+                                new_yes_tokens.push(yes_key);
+                                tracing::info!(
+                                    pair = %pair,
+                                    market_id = %market_id,
+                                    "New Polymarket token pair discovered"
+                                );
+                            }
+                        }
+
+                        // Find stale pairs (subscribed but no longer active in DB)
+                        // This handles the case where a 15m round ended and a new one began
+                        // with different token IDs but potentially the same market UUID
+                        for (pair, _market_id) in self.subscriptions.clone().iter() {
+                            if !expected_pairs.contains_key(pair) {
+                                let yes_key = yes_token_from_pair(pair);
+                                old_yes_tokens_to_remove.push(yes_key.clone());
+                                self.subscriptions.remove(pair);
+                                self.fee_rates.remove(&yes_key);
+                                self.yes_token_to_market.remove(&yes_key);
+                                self.books.remove(&yes_key);
+                                tracing::info!(pair = %pair, "Removing stale Polymarket token pair subscription");
+                            }
+                        }
+
+                        // Unsubscribe from old tokens
+                        if !old_yes_tokens_to_remove.is_empty() {
+                            for chunk in old_yes_tokens_to_remove.chunks(50) {
+                                let unsub = DynamicSubscription {
+                                    operation: "unsubscribe".into(),
+                                    asset_ids: chunk.to_vec(),
+                                    msg_type: "market".into(),
+                                    custom_feature_enabled: true,
+                                };
+                                if let Ok(msg_text) = serde_json::to_string(&unsub) {
+                                    let _ = write.send(Message::Text(msg_text.into())).await;
                                 }
                             }
                         }
+
+                        // Subscribe to new tokens
                         if !new_yes_tokens.is_empty() {
-                            info!(count = new_yes_tokens.len(), "Dynamically subscribing to new Polymarket markets");
+                            tracing::info!(count = new_yes_tokens.len(), "Dynamically subscribing to new Polymarket markets");
                             for chunk in new_yes_tokens.chunks(50) {
                                 let sub = DynamicSubscription {
                                     operation: "subscribe".into(),
@@ -783,11 +832,15 @@ impl FeedHandler for PolymarketFeed {
                                 }
                             }
 
-                            for yes_token in new_yes_tokens {
+                            // Bootstrap new books via REST
+                            for yes_token in &new_yes_tokens {
                                 let tick_tx = tick_tx.clone();
                                 let mut feed_clone = self.clone();
+                                let token_clone = yes_token.clone();
                                 tokio::spawn(async move {
-                                    feed_clone.bootstrap_book_via_rest(&yes_token, &tick_tx).await;
+                                    // Small delay to let the WS subscription register first
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                    feed_clone.bootstrap_book_via_rest(&token_clone, &tick_tx).await;
                                 });
                                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             }
