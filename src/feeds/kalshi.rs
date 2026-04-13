@@ -48,8 +48,14 @@ impl KalshiOrderBook {
     }
 
     fn best_yes_ask(&self) -> Option<(Decimal, Decimal)> {
-        self.no_bids.iter().next_back().map(|(&no_price, &size)| {
-            (Decimal::ONE - no_price, size)
+        self.no_bids.iter().next_back().and_then(|(&no_price, &size)| {
+            let yes_ask = Decimal::ONE - no_price;
+            // Guard: no_price must be in (0, 1) so yes_ask is also in (0, 1)
+            if yes_ask > Decimal::ZERO && yes_ask < Decimal::ONE {
+                Some((yes_ask, size))
+            } else {
+                None
+            }
         })
     }
 
@@ -280,11 +286,11 @@ impl KalshiFeed {
         }
         self.latest_seq = seq.max(self.latest_seq);
 
-        if let (Some(price_val), Some(delta_val), Some(side_val)) = (
-            msg.get("price_dollars"),
-            msg.get("delta_fp"),
-            msg.get("side").and_then(|v| v.as_str()),
-        ) {
+        let price_val = msg.get("price_dollars").or_else(|| msg.get("price"));
+        let delta_val = msg.get("delta_fp").or_else(|| msg.get("delta"));
+        let side_val = msg.get("side").and_then(|v| v.as_str());
+
+        if let (Some(price_val), Some(delta_val), Some(side_val)) = (price_val, delta_val, side_val) {
             let price = Self::parse_decimal_field(price_val)?;
             let delta = Self::parse_decimal_field(delta_val)?;
             let price = if price > Decimal::ONE { price / Decimal::from(100) } else { price };
@@ -432,22 +438,28 @@ impl KalshiFeed {
 
         for entry in &data.orderbook.yes {
             if entry.len() >= 2 {
-                let price_cents = entry[0].as_i64().unwrap_or(0);
-                let qty = entry[1].as_i64().unwrap_or(0);
-                if price_cents > 0 && price_cents < 100 && qty > 0 {
-                    let price = Decimal::from(price_cents) / Decimal::from(100);
-                    book.yes_bids.insert(price, Decimal::from(qty));
+                if let (Ok(p), Ok(s)) = (
+                    Self::parse_decimal_field(&entry[0]),
+                    Self::parse_decimal_field(&entry[1])
+                ) {
+                    let price = if p > Decimal::ONE { p / Decimal::from(100) } else { p };
+                    if s > Decimal::ZERO && price > Decimal::ZERO && price < Decimal::ONE { 
+                        book.yes_bids.insert(price, s); 
+                    }
                 }
             }
         }
 
         for entry in &data.orderbook.no {
             if entry.len() >= 2 {
-                let price_cents = entry[0].as_i64().unwrap_or(0);
-                let qty = entry[1].as_i64().unwrap_or(0);
-                if price_cents > 0 && price_cents < 100 && qty > 0 {
-                    let price = Decimal::from(price_cents) / Decimal::from(100);
-                    book.no_bids.insert(price, Decimal::from(qty));
+                if let (Ok(p), Ok(s)) = (
+                    Self::parse_decimal_field(&entry[0]),
+                    Self::parse_decimal_field(&entry[1])
+                ) {
+                    let price = if p > Decimal::ONE { p / Decimal::from(100) } else { p };
+                    if s > Decimal::ZERO && price > Decimal::ZERO && price < Decimal::ONE { 
+                        book.no_bids.insert(price, s); 
+                    }
                 }
             }
         }

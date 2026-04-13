@@ -85,7 +85,7 @@ impl MarketActor {
                     &self.registry.read().unwrap(),
                     &self.uob_shard,
                     &self.spread_engine.read().unwrap(),
-                    rust_decimal_macros::dec!(10_000.0)
+                    rust_decimal_macros::dec!(500)
                 )
             };
 

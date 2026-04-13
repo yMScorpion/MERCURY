@@ -83,16 +83,19 @@ impl PlatformBook {
             return;
         }
 
-        // Reject ticks with prices outside valid prediction market range
-        if tick.bid_price < Decimal::ZERO || tick.bid_price > Decimal::ONE
-            || tick.ask_price < Decimal::ZERO || tick.ask_price > Decimal::ONE
-        {
+        // Reject sentinel prices: Polymarket sends bid=0 (no resting bids) and ask=1
+        // (no resting asks). Both are invalid for arbitrage computation. Also reject
+        // any price that is negative or strictly out of the [0,1] prediction market range.
+        let bid_valid = tick.bid_price > Decimal::ZERO && tick.bid_price < Decimal::ONE;
+        let ask_valid = tick.ask_price > Decimal::ZERO && tick.ask_price < Decimal::ONE;
+
+        if !bid_valid && !ask_valid {
             tracing::warn!(
                 platform = ?self.platform,
                 market_id = %self.market_id,
                 bid = %tick.bid_price,
                 ask = %tick.ask_price,
-                "Rejecting tick with out-of-range prices"
+                "Rejecting tick: both bid and ask are out-of-range or sentinel prices (bid=0/ask=1)"
             );
             return;
         }

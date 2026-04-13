@@ -274,10 +274,18 @@ impl PolymarketFeed {
         let bid = book.best_bid().unwrap_or((Decimal::ZERO, Decimal::ZERO));
         let ask = book.best_ask().unwrap_or((Decimal::ZERO, Decimal::ZERO));
 
-        // Only emit if at least one side is present
-        if bid.0 == Decimal::ZERO && ask.0 == Decimal::ZERO {
+        // Only emit if at least one side has a valid, non-sentinel price.
+        // Polymarket sentinel values: bid=0 means no resting bids; ask=1 means no resting asks.
+        // Emitting a tick with ask=1.0 would cause spread engine to compute negative spreads.
+        let bid_valid = bid.0 > Decimal::ZERO && bid.0 < Decimal::ONE;
+        let ask_valid = ask.0 > Decimal::ZERO && ask.0 < Decimal::ONE;
+        if !bid_valid && !ask_valid {
             return None;
         }
+        // If one side is a sentinel, zero it out so NormalizedTick carries (0,0) for that side,
+        // which update_from_tick will then skip (size==0 check).
+        let bid = if bid_valid { bid } else { (Decimal::ZERO, Decimal::ZERO) };
+        let ask = if ask_valid { ask } else { (Decimal::ZERO, Decimal::ZERO) };
 
         let mid = if bid.0 > Decimal::ZERO && ask.0 > Decimal::ZERO {
             (bid.0 + ask.0) / Decimal::from(2)
@@ -409,13 +417,17 @@ impl PolymarketFeed {
             }
 
             "best_bid_ask" => {
-                // best_bid_ask carries BBO price only — no size. Never wipe the book.
-                // The depth from REST bootstrap / prior `book` snapshots must survive.
                 let asset_id = if !msg.asset_id.is_empty() { msg.asset_id.clone() } else { return Ok(()) };
                 if let (Some(best_bid_str), Some(best_ask_str)) = (&msg.best_bid, &msg.best_ask) {
                     if let (Ok(bid), Ok(ask)) = (Decimal::from_str(best_bid_str), Decimal::from_str(best_ask_str)) {
-                        if bid <= Decimal::ZERO || ask <= Decimal::ZERO || bid >= ask {
-                            return Ok(());  // crossed/stale BBO — ignore
+                        // Polymarket sends best_bid="0" when no bids rest, and best_ask="1"
+                        // when no asks rest. These are sentinel values — NOT real price levels.
+                        // Inserting ask=1.0 into the book makes spread engine compute
+                        // raw_spread ≤ 0 → no arb ever detected.
+                        let bid_valid = bid > Decimal::ZERO && bid < Decimal::ONE;
+                        let ask_valid = ask > Decimal::ZERO && ask < Decimal::ONE;
+                        if !bid_valid || !ask_valid || bid >= ask {
+                            return Ok(());
                         }
                         if let Some(book) = self.books.get_mut(&asset_id) {
                             // Trim levels that are now crossed by the updated BBO.
