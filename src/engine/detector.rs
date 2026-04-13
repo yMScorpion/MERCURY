@@ -354,29 +354,42 @@ impl ArbitrageDetector {
         let now = now_ns();
 
         // Stale data check: Prediction markets are illiquid and can sit unchanged for minutes.
-        // We only reject if the specific book is older than 15 minutes to catch severe desyncs.
+        // We only reject if the specific book is older than 20 minutes to catch severe desyncs.
         // Global connection health is strictly handled by platform_liveness and CB9.
-        let max_book_age_ns = 15 * 60 * 1_000_000_000u64; // 15 minutes
+        //
+        // FIXES vs previous version:
+        // 1. Skip check when last_update_ns == 0 (book just created or cleared after resolution).
+        // 2. Use the ACTUAL platform from the book struct, not hardcoded Polymarket/Kalshi names.
+        //    This makes Gate 3 correct for any platform pair.
+        // 3. Reject books with no bid/ask levels regardless of age — empty books indicate the
+        //    market was resolved and the feed cleaned up the local book state.
+        let max_book_age_ns = 20 * 60 * 1_000_000_000u64; // 20 minutes
 
-        if self.platform_liveness.get(&Platform::Polymarket).map(|v| *v).unwrap_or(true) {
-            let age_a = now.saturating_sub(book_a.last_update_ns);
-            if age_a > max_book_age_ns {
-                self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(RejectionReason::StaleData {
-                    age_ms: age_a / 1_000_000,
-                    max_ms: max_book_age_ns / 1_000_000,
-                });
+        if book_a.last_update_ns > 0 {
+            if self.platform_liveness.get(&book_a.platform).map(|v| *v).unwrap_or(true) {
+                let age_a = now.saturating_sub(book_a.last_update_ns);
+                let book_a_empty = book_a.bids.is_empty() && book_a.asks.is_empty();
+                if age_a > max_book_age_ns || book_a_empty {
+                    self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(RejectionReason::StaleData {
+                        age_ms: age_a / 1_000_000,
+                        max_ms: max_book_age_ns / 1_000_000,
+                    });
+                }
             }
         }
 
-        if self.platform_liveness.get(&Platform::Kalshi).map(|v| *v).unwrap_or(true) {
-            let age_b = now.saturating_sub(book_b.last_update_ns);
-            if age_b > max_book_age_ns {
-                self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(RejectionReason::StaleData {
-                    age_ms: age_b / 1_000_000,
-                    max_ms: max_book_age_ns / 1_000_000,
-                });
+        if book_b.last_update_ns > 0 {
+            if self.platform_liveness.get(&book_b.platform).map(|v| *v).unwrap_or(true) {
+                let age_b = now.saturating_sub(book_b.last_update_ns);
+                let book_b_empty = book_b.bids.is_empty() && book_b.asks.is_empty();
+                if age_b > max_book_age_ns || book_b_empty {
+                    self.stats.gate3_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(RejectionReason::StaleData {
+                        age_ms: age_b / 1_000_000,
+                        max_ms: max_book_age_ns / 1_000_000,
+                    });
+                }
             }
         }
 

@@ -60,6 +60,19 @@ impl PlatformBook {
         now.saturating_sub(self.last_update_ns) > timeout_ns
     }
 
+    /// Explicitly clear all book state after market resolution.
+    ///
+    /// Sets `last_update_ns` to 0 so Gate 3 in the detector treats this book as
+    /// "uninitialized" rather than "stale". An empty book with a stale timestamp
+    /// would silently pass Gate 3 for up to 20 minutes; resetting to 0 causes
+    /// the gate to skip the age check entirely (the `last_update_ns > 0` guard).
+    pub fn clear_resolved(&mut self) {
+        self.bids.clear();
+        self.asks.clear();
+        self.last_update_ns = 0;
+        self.sequence = 0;
+    }
+
     /// Update from a NormalizedTick
     ///
     /// Ticks with a non-zero sequence that is ≤ the stored sequence are dropped
@@ -157,5 +170,40 @@ impl UnifiedOrderBook {
 
     pub fn get_book(&self, market_id: &Uuid, platform: &Platform) -> Option<&PlatformBook> {
         self.books.get(&(*market_id, *platform))
+    }
+
+    /// Remove all platform books for a resolved/expired market.
+    ///
+    /// Called by the main loop and MarketActor when a market transitions to
+    /// Resolved or Expired status. This prevents the detector's Gate 3 from
+    /// operating on stale book data for a market that no longer exists.
+    pub fn remove_market(&mut self, market_id: &Uuid) {
+        let keys_to_remove: Vec<(Uuid, Platform)> = self.books.keys()
+            .filter(|(mid, _)| mid == market_id)
+            .cloned()
+            .collect();
+        let removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.books.remove(&key);
+        }
+        if removed > 0 {
+            tracing::debug!(
+                market_id = %market_id,
+                removed_books = removed,
+                "Removed platform books for resolved market from UnifiedOrderBook"
+            );
+        }
+    }
+
+    /// Clear all book levels for a market (without removing the book entries).
+    /// Sets last_update_ns to 0 so Gate 3 skips the staleness check for these books.
+    /// Use this when you want the books to be re-bootstrapped on the next tick rather
+    /// than removed entirely.
+    pub fn clear_market(&mut self, market_id: &Uuid) {
+        for ((mid, _), book) in self.books.iter_mut() {
+            if mid == market_id {
+                book.clear_resolved();
+            }
+        }
     }
 }

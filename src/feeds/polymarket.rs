@@ -74,6 +74,8 @@ pub struct PolymarketFeed {
     /// HTTP client for REST book bootstrap calls
     http: reqwest::Client,
     resolved_markets: std::collections::HashSet<Uuid>,
+    condition_id_to_uuid: std::collections::HashMap<String, Uuid>,
+    pending_unsub_tokens: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -239,6 +241,8 @@ impl PolymarketFeed {
             sequence: 0,
             http,
             resolved_markets: std::collections::HashSet::new(),
+            condition_id_to_uuid: std::collections::HashMap::new(),
+            pending_unsub_tokens: Vec::new(),
         }
     }
 
@@ -414,22 +418,60 @@ impl PolymarketFeed {
             }
 
             "market_resolved" => {
-                let market_id = msg.market.clone();
-                let winner = msg.winning_asset_id.as_deref().unwrap_or("unknown");
-                info!(%market_id, %winner, "Market resolved");
-                
-                // Add to resolved set
-                if let Ok(uuid) = Uuid::parse_str(&market_id) {
-                    self.resolved_markets.insert(uuid);
+                let condition_id = msg.market.clone();
+                let winner_asset = msg.winning_asset_id.as_deref().unwrap_or("").to_string();
+                info!(condition_id = %condition_id, winner_asset = %winner_asset, "Market resolved event received");
+
+                let mut resolved_uuid: Option<Uuid> = self.condition_id_to_uuid.get(&condition_id).copied();
+
+                if resolved_uuid.is_none() && !winner_asset.is_empty() {
+                    resolved_uuid = self.yes_token_to_market.get(&winner_asset).copied();
+                    if resolved_uuid.is_none() {
+                        for (pair, uuid) in &self.subscriptions {
+                            let tokens: Vec<&str> = pair.splitn(2, ',').collect();
+                            if tokens.get(1).map(|t| *t == winner_asset.as_str()).unwrap_or(false) {
+                                resolved_uuid = Some(*uuid);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(uuid) = resolved_uuid {
+                        self.condition_id_to_uuid.insert(condition_id.clone(), uuid);
+                    }
                 }
-                
-                // Update market status in DB
-                let db = self.db.clone();
-                let market_uuid = Uuid::parse_str(&market_id).ok();
-                if let Some(uuid) = market_uuid {
+
+                if let Some(uuid) = resolved_uuid {
+                    self.resolved_markets.insert(uuid);
+                    let pairs_to_remove: Vec<String> = self.subscriptions.iter()
+                        .filter(|(_, v)| **v == uuid)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+
+                    for pair in &pairs_to_remove {
+                        let yes_key = yes_token_from_pair(pair);
+                        self.books.remove(&yes_key);
+                        self.yes_token_to_market.remove(&yes_key);
+                        self.fee_rates.remove(&yes_key);
+                        self.pending_unsub_tokens.push(yes_key);
+                        self.subscriptions.remove(pair);
+                    }
+
+                    info!(
+                        condition_id = %condition_id,
+                        uuid = %uuid,
+                        removed_pairs = pairs_to_remove.len(),
+                        "Market resolved — local books cleared, queued for WS unsubscribe"
+                    );
+
+                    let db = self.db.clone();
+                    let cond_clone = condition_id.clone();
                     tokio::spawn(async move {
-                        let _ = db.update_market_status(&uuid, crate::types::MarketStatus::Resolved).await;
+                        if let Err(e) = db.update_market_status(&uuid, crate::types::MarketStatus::Resolved).await {
+                            tracing::warn!(error=%e, condition_id=%cond_clone, "Failed to mark resolved market in DB");
+                        }
                     });
+                } else {
+                    debug!(condition_id = %condition_id, winner_asset = %winner_asset, "market_resolved for untracked market — skipping cleanup");
                 }
             }
 
@@ -710,7 +752,7 @@ impl FeedHandler for PolymarketFeed {
 
         // Polymarket requires PING every 10s
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(15));
 
         loop {
             tokio::select! {
@@ -742,6 +784,24 @@ impl FeedHandler for PolymarketFeed {
                                     return Err(e);
                                 }
                                 warn!(error = %e, "Polymarket message error (non-fatal)");
+                            }
+                            if !self.pending_unsub_tokens.is_empty() {
+                                let tokens: Vec<String> = std::mem::take(&mut self.pending_unsub_tokens);
+                                for chunk in tokens.chunks(50) {
+                                    let unsub = DynamicSubscription {
+                                        operation: "unsubscribe".into(),
+                                        asset_ids: chunk.to_vec(),
+                                        msg_type: "market".into(),
+                                        custom_feature_enabled: true,
+                                    };
+                                    if let Ok(msg_text) = serde_json::to_string(&unsub) {
+                                        if let Err(e) = write.send(Message::Text(msg_text.into())).await {
+                                            warn!(error = %e, "Failed to send WS unsubscribe for resolved market tokens");
+                                        } else {
+                                            info!(count = chunk.len(), tokens = ?chunk, "Sent immediate WS unsubscribe for resolved market tokens");
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(Ok(Message::Ping(data))) => { let _ = write.send(Message::Pong(data)).await; }
