@@ -1,42 +1,34 @@
-// src/feeds/discovery.rs — Complete rewrite
+// src/feeds/discovery.rs
 //
-// ROOT CAUSES FIXED:
+// KEY FIXES IN THIS VERSION:
 //
-// FIX-1 (CRITICAL): Polymarket 15-min crypto markets are structured as *Events*,
-//        not flat Markets. The correct API is:
-//          GET gamma-api.polymarket.com/events/slug/{slug}
-//        where slug = "btc-updown-15m-{timestamp}" and timestamp is the
-//        15-minute window START (rounded to nearest 15m boundary, in seconds).
-//        Mercury was querying /markets with keyword search, which NEVER returns
-//        these markets because they often don't have acceptingOrders=true and
-//        are too short-lived for general searches to catch.
+// FIX-1 (CRITICAL): 15-minute round rollover — when a new 15m window starts,
+//        discovery must find the new market and upsert it. Previously the
+//        confidence=1.0 match meant the same unified_id was reused across rounds
+//        (because compute_unified_market_id hashes the slug which includes the
+//        timestamp). That was correct, but the DB upsert was NOT updating the
+//        platforms map with the new token pair / ticker for the new round.
+//        Fixed: always upsert with updated platform info.
 //
-// FIX-2 (CRITICAL): Direct slug-based discovery for all 4+ crypto assets.
-//        We compute current and adjacent round timestamps and hit the events
-//        endpoint directly — identical to how the reference TypeScript project
-//        (dumpHedgeTrader) works. No NLP/Jaccard matching needed for these.
+// FIX-2 (CRITICAL): Stale/resolved round cleanup — after a 15m round ends,
+//        the discovery loop must mark those DB markets as Resolved so the
+//        feed handlers unsubscribe and the MarketRegistry evicts them.
+//        Previously resolved rounds stayed Active forever.
 //
-// FIX-3 (CRITICAL): Kalshi KXBTC15M tickers look like
-//        "KXBTC15M-26APR12T134500-134500". We must fetch the series markets
-//        to get real tickers, then map them to the Polymarket event by
-//        matching the 15-minute window timestamp.
+// FIX-3 (CRITICAL): Discovery poll interval reduced to 15s (from 30s).
+//        15-minute markets only exist for 900 seconds. A 30s poll means
+//        up to 2 full poll cycles wasted before the new market is discovered.
 //
-// FIX-4 (HIGH): The old Jaccard similarity approach is preserved for
-//        non-crypto markets (sports, politics) where NLP matching makes sense.
-//        Crypto 15m markets use direct slug correlation instead.
+// FIX-4 (HIGH): The reference TS project computes the slug as
+//        "{asset}-updown-15m-{roundedTimestamp}" where roundedTimestamp
+//        is Math.floor(currentTime / 900) * 900. We now try current + ±1
+//        offsets and pick the first active one.
 //
-// FIX-5 (HIGH): Token IDs from Polymarket events: `clobTokenIds` on the
-//        market object within the event is a JSON string like
-//        '["yes_token_id", "no_token_id"]'. We parse this correctly.
-//        The platform_market_id stored is "yes_token,no_token" (comma-separated)
-//        which the execution layer already knows how to split.
-//
-// FIX-6 (MEDIUM): Kalshi BTC 15m markets are per-round, matching
-//        Polymarket's per-round structure. We match them by overlapping
-//        time windows (within 120 seconds of each other).
+// FIX-5 (HIGH): Token ID parsing now correctly handles the clobTokenIds
+//        field from the Gamma event endpoint.
 
 use anyhow::Result;
-use chrono::{DateTime, Utc, Timelike};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -52,26 +44,20 @@ pub struct MatchedMarket {
     pub market: Market,
 }
 
-// ─── Internal structs ──────────────────────────────────────────────────────
+// ─── Internal structs ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct CryptoRound {
-    /// Unix timestamp of the 15-minute window START
     round_start_ts: i64,
-    /// Asset name (lowercase): "btc", "eth", "sol", "xrp"
     asset: String,
-    /// Polymarket: "yes_token,no_token"  OR None if not found
     poly_token_pair: Option<String>,
     poly_question: Option<String>,
     poly_expiration: Option<DateTime<Utc>>,
-    /// Kalshi: full market ticker e.g. "KXBTC15M-26APR12T134500-134500"
     kalshi_ticker: Option<String>,
     kalshi_question: Option<String>,
     kalshi_expiration: Option<DateTime<Utc>>,
     kalshi_fee_bps: u16,
 }
-
-// ─── General (non-crypto) market used for Jaccard matching ────────────────
 
 #[derive(Debug, Clone)]
 struct DiscoveredMarket {
@@ -131,10 +117,7 @@ impl MarketDiscovery {
             ticker.tick().await;
             match self.discover_and_match().await {
                 Ok(matched) => {
-                    let active = matched
-                        .iter()
-                        .filter(|m| m.market.status == MarketStatus::Active)
-                        .count();
+                    let active = matched.iter().filter(|m| m.market.status == MarketStatus::Active).count();
                     info!(total = matched.len(), active, "Discovery cycle complete");
                     for m in matched {
                         if let Err(e) = matched_tx.send(m).await {
@@ -150,7 +133,6 @@ impl MarketDiscovery {
     async fn discover_and_match(&self) -> Result<Vec<MatchedMarket>> {
         let mut results: Vec<MatchedMarket> = Vec::new();
 
-        // ── 1. Direct slug-based 15-minute crypto market matching ─────────
         let crypto_assets = ["btc", "eth", "sol", "xrp"];
         let rounds = self.build_round_candidates(&crypto_assets);
 
@@ -158,19 +140,14 @@ impl MarketDiscovery {
         let kalshi_enabled = self.platforms_config.kalshi.enabled;
 
         for mut round in rounds {
-            // Fetch Polymarket event for this round
             if poly_enabled {
-                if let Some(pair) = self
-                    .fetch_poly_event_tokens(&round.asset, round.round_start_ts)
-                    .await
-                {
+                if let Some(pair) = self.fetch_poly_event_tokens(&round.asset, round.round_start_ts).await {
                     round.poly_token_pair = Some(pair.0);
                     round.poly_question = Some(pair.1);
                     round.poly_expiration = Some(pair.2);
                 }
             }
 
-            // Fetch Kalshi market for this round
             if kalshi_enabled {
                 if let Some(km) = self.fetch_kalshi_15m_market(&round.asset, round.round_start_ts).await {
                     round.kalshi_ticker = Some(km.0);
@@ -180,26 +157,38 @@ impl MarketDiscovery {
                 }
             }
 
-            // Only create a matched pair if both sides are present
             if round.poly_token_pair.is_none() && round.kalshi_ticker.is_none() {
                 continue;
             }
 
-            let matched = self.build_crypto_matched_market(&round);
-            if let Some(m) = matched {
+            if let Some(m) = self.build_crypto_matched_market(&round) {
+                let now_ts = Utc::now().timestamp();
+                let round_end = round.round_start_ts + 900;
+                // Mark as resolved if the round ended more than 30 seconds ago
+                // (give 30s grace for settlement messages to arrive)
+                let status = if round_end < now_ts - 30 {
+                    MarketStatus::Resolved
+                } else {
+                    MarketStatus::Active
+                };
+
+                let mut market_with_status = m.market.clone();
+                market_with_status.status = status;
+
                 info!(
                     asset = %round.asset,
                     round_start = round.round_start_ts,
+                    round_end,
+                    status = ?market_with_status.status,
                     poly = round.poly_token_pair.is_some(),
                     kalshi = round.kalshi_ticker.is_some(),
                     "15m crypto round matched"
                 );
-                results.push(m);
+                results.push(MatchedMarket { market: market_with_status });
             }
         }
 
-        // ── 2. General Jaccard-based matching for sports/politics/finance ──
-        // (Only if both platforms are enabled and we have reasonable data)
+        // General Jaccard-based matching for sports/politics/finance
         if poly_enabled && kalshi_enabled {
             match self.fetch_general_markets().await {
                 Ok((poly_markets, kalshi_markets)) => {
@@ -221,10 +210,12 @@ impl MarketDiscovery {
 
     fn build_round_candidates(&self, assets: &[&str]) -> Vec<CryptoRound> {
         let now_ts = Utc::now().timestamp();
-        let round_secs: i64 = 900; // 15 minutes
+        let round_secs: i64 = 900;
 
-        // Current round start + one previous + one next
         let current_round = (now_ts / round_secs) * round_secs;
+
+        // We care about: previous round (may need cleanup), current round, next round
+        // This ensures we discover the new market as soon as the round boundary crosses
         let offsets: [i64; 3] = [-round_secs, 0, round_secs];
 
         let mut rounds = Vec::new();
@@ -232,10 +223,16 @@ impl MarketDiscovery {
             for &offset in &offsets {
                 let round_start = current_round + offset;
                 let round_end = round_start + round_secs;
-                // Skip rounds already expired more than 60 seconds ago
-                if round_end < now_ts - 60 {
+
+                // Skip rounds that ended more than 5 minutes ago (already cleaned up)
+                if round_end < now_ts - 300 {
                     continue;
                 }
+                // Skip rounds that start more than 1 round in the future
+                if round_start > now_ts + round_secs {
+                    continue;
+                }
+
                 rounds.push(CryptoRound {
                     round_start_ts: round_start,
                     asset: asset.to_string(),
@@ -245,14 +242,14 @@ impl MarketDiscovery {
                     kalshi_ticker: None,
                     kalshi_question: None,
                     kalshi_expiration: None,
-                    kalshi_fee_bps: 5, // 15m crypto markets have low fees (5 bps)
+                    kalshi_fee_bps: 5,
                 });
             }
         }
         rounds
     }
 
-    // ─── Polymarket: fetch event by slug, return (token_pair, question, expiry) ──
+    // ─── Polymarket: fetch event by slug ─────────────────────────────────
 
     async fn fetch_poly_event_tokens(
         &self,
@@ -260,17 +257,12 @@ impl MarketDiscovery {
         round_start_ts: i64,
     ) -> Option<(String, String, DateTime<Utc>)> {
         let slug = format!("{}-updown-15m-{}", asset, round_start_ts);
-        let url = format!(
-            "https://gamma-api.polymarket.com/events/slug/{}",
-            slug
-        );
+        let url = format!("https://gamma-api.polymarket.com/events/slug/{}", slug);
 
         let resp = match tokio::time::timeout(
             Duration::from_secs(8),
             self.http.get(&url).send(),
-        )
-        .await
-        {
+        ).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, slug, "Polymarket event fetch failed");
@@ -283,11 +275,7 @@ impl MarketDiscovery {
         };
 
         if !resp.status().is_success() {
-            tracing::debug!(
-                status = %resp.status(),
-                slug,
-                "Polymarket event not found"
-            );
+            tracing::debug!(status = %resp.status(), slug, "Polymarket event not found");
             return None;
         }
 
@@ -299,15 +287,11 @@ impl MarketDiscovery {
             }
         };
 
-        // The event contains a `markets` array; we want markets[0] and markets[1]
-        // (Up and Down respectively), each with their own clobTokenIds.
-        // We pack them as "up_token,down_token" for the platform_market_id.
         let markets = json.get("markets").and_then(|m| m.as_array())?;
         if markets.is_empty() {
             return None;
         }
 
-        // Find Up and Down markets by outcome name
         let mut up_token: Option<String> = None;
         let mut down_token: Option<String> = None;
         let mut expiration: Option<DateTime<Utc>> = None;
@@ -320,54 +304,36 @@ impl MarketDiscovery {
                 .unwrap_or("")
                 .to_lowercase();
 
-            // Parse clobTokenIds — it's a JSON string like '["id1","id2"]'
             let token_id = parse_first_clob_token_id(market);
             if token_id.is_empty() {
                 continue;
             }
 
-            // For Up/Down markets, there are typically 2 markets:
-            // one with outcome "Up" or "Higher" and one with "Down" or "Lower"
-            if outcome.contains("up")
-                || outcome.contains("higher")
-                || outcome.contains("above")
-                || outcome.contains("yes")
-            {
+            if outcome.contains("up") || outcome.contains("higher") || outcome.contains("above") || outcome.contains("yes") {
                 up_token = Some(token_id);
-            } else if outcome.contains("down")
-                || outcome.contains("lower")
-                || outcome.contains("below")
-                || outcome.contains("no")
-            {
+            } else if outcome.contains("down") || outcome.contains("lower") || outcome.contains("below") || outcome.contains("no") {
                 down_token = Some(token_id);
             }
 
-            // Get expiration from the first market
             if expiration.is_none() {
                 expiration = parse_expiration_from_market(market);
             }
         }
 
-        // Fallback: if we only have one market, use its first two clobTokenIds
+        // Fallback: if we only have one market, parse both token IDs from it
         if up_token.is_none() || down_token.is_none() {
             let first_market = &markets[0];
             let (yes, no) = parse_two_clob_token_ids(first_market);
-            if !yes.is_empty() {
-                up_token = Some(yes);
-            }
-            if !no.is_empty() {
-                down_token = Some(no);
-            }
+            if !yes.is_empty() { up_token = Some(yes); }
+            if !no.is_empty() { down_token = Some(no); }
         }
 
         let up = up_token?;
         let down = down_token?;
         let token_pair = format!("{},{}", up, down);
 
-        // Expiration fallback: round_start + 900s
         let exp = expiration.unwrap_or_else(|| {
-            chrono::DateTime::from_timestamp(round_start_ts + 900, 0)
-                .unwrap_or_else(Utc::now)
+            chrono::DateTime::from_timestamp(round_start_ts + 900, 0).unwrap_or_else(Utc::now)
         });
 
         let question = json
@@ -386,18 +352,17 @@ impl MarketDiscovery {
         asset: &str,
         round_start_ts: i64,
     ) -> Option<(String, String, DateTime<Utc>, u16)> {
-        // Kalshi series ticker for 15m crypto: KXBTC15M, KXETH15M, etc.
         let series_prefix = match asset {
             "btc" => "KXBTC15M",
             "eth" => "KXETH15M",
             "sol" => "KXSOL15M",
             "xrp" => "KXXRP15M",
-            "doge" => "KXDOGE15M",
             _ => return None,
         };
 
+        // Fetch both open and settled markets to identify the current round
         let url = format!(
-            "https://api.elections.kalshi.com/trade-api/v2/markets?status=open&series_ticker={}&limit=50",
+            "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker={}&limit=10",
             series_prefix
         );
 
@@ -427,12 +392,7 @@ impl MarketDiscovery {
 
         let markets = data.get("markets").and_then(|v| v.as_array())?;
 
-        // The round_start_ts is a Unix timestamp.
-        // Kalshi's close_time is an ISO-8601 string.
-        // A 15-minute Kalshi market closes at round_start + 900s.
         let target_close_ts = round_start_ts + 900;
-
-        // Allow ±120 seconds of slack for timezone/rounding differences
         let slack: i64 = 120;
 
         for market in markets {
@@ -449,18 +409,12 @@ impl MarketDiscovery {
                     .and_then(|v| v.as_str())
                     .unwrap_or("BTC 15m")
                     .to_string();
-                let fee_bps = 50u16; // Kalshi 15m crypto: ~0.5% effective taker fee
+                let fee_bps = 50u16;
                 return Some((ticker, title, close_dt, fee_bps));
             }
         }
 
-        // No exact match found; log at debug level only (this is normal for future rounds)
-        tracing::debug!(
-            asset,
-            round_start_ts,
-            target_close = target_close_ts,
-            "No Kalshi 15m market found for this round"
-        );
+        tracing::debug!(asset, round_start_ts, "No Kalshi 15m market found for this round");
         None
     }
 
@@ -475,7 +429,7 @@ impl MarketDiscovery {
                 PlatformMarketInfo {
                     platform: Platform::Polymarket,
                     platform_market_id: token_pair.clone(),
-                    fee_rate_bps: 200, // Polymarket taker fee ~2%
+                    fee_rate_bps: 200,
                     min_order_size: Decimal::ONE,
                     tick_size: Decimal::new(1, 2),
                 },
@@ -499,7 +453,6 @@ impl MarketDiscovery {
             return None;
         }
 
-        // Use both sides' question if available, otherwise construct one
         let question = match (&round.poly_question, &round.kalshi_question) {
             (Some(p), Some(k)) => format!("{} / {}", p, k),
             (Some(p), None) => p.clone(),
@@ -507,7 +460,6 @@ impl MarketDiscovery {
             (None, None) => format!("{} Up or Down - 15 Minutes ({})", round.asset.to_uppercase(), round.round_start_ts),
         };
 
-        // Prefer Kalshi expiration (more precise UTC), fallback to Polymarket
         let expiration = round
             .kalshi_expiration
             .or(round.poly_expiration)
@@ -530,7 +482,7 @@ impl MarketDiscovery {
                 expiration,
                 platforms,
                 category: MarketCategory::Crypto,
-                confidence: 1.0, // Deterministic match — same round, same asset
+                confidence: 1.0,
                 status: MarketStatus::Active,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -538,20 +490,13 @@ impl MarketDiscovery {
         })
     }
 
-    // ─── General market fetching (non-15m crypto) ─────────────────────────
+    // ─── General market fetching ──────────────────────────────────────────
 
-    async fn fetch_general_markets(
-        &self,
-    ) -> Result<(Vec<DiscoveredMarket>, Vec<DiscoveredMarket>)> {
+    async fn fetch_general_markets(&self) -> Result<(Vec<DiscoveredMarket>, Vec<DiscoveredMarket>)> {
         let poly_fut = self.fetch_polymarket_general_markets();
         let kalshi_fut = self.fetch_kalshi_general_markets();
-
         let (poly_result, kalshi_result) = tokio::join!(poly_fut, kalshi_fut);
-
-        let poly = poly_result.unwrap_or_default();
-        let kalshi = kalshi_result.unwrap_or_default();
-
-        Ok((poly, kalshi))
+        Ok((poly_result.unwrap_or_default(), kalshi_result.unwrap_or_default()))
     }
 
     async fn fetch_polymarket_general_markets(&self) -> Result<Vec<DiscoveredMarket>> {
@@ -561,8 +506,6 @@ impl MarketDiscovery {
         let week_out = now + chrono::Duration::days(7);
         let end_max = week_out.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        // Only fetch markets expiring within 7 days — longer markets rarely have
-        // Kalshi equivalents. Skip 15m crypto markets (handled by slug approach above).
         let resp = match tokio::time::timeout(
             Duration::from_secs(12),
             self.http
@@ -575,9 +518,7 @@ impl MarketDiscovery {
                     ("end_date_max", end_max.as_str()),
                 ])
                 .send(),
-        )
-        .await
-        {
+        ).await {
             Ok(Ok(r)) if r.status().is_success() => r,
             _ => return Ok(markets),
         };
@@ -592,33 +533,20 @@ impl MarketDiscovery {
         };
 
         for item in &arr {
-            // Skip 15m crypto markets — handled by dedicated slug approach
             let slug = item.get("slug").and_then(|v| v.as_str()).unwrap_or("");
             if slug.contains("-updown-15m-") || slug.contains("-updown-") {
                 continue;
             }
 
-            let question = item
-                .get("question")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if question.is_empty() {
-                continue;
-            }
+            let question = item.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if question.is_empty() { continue; }
 
             let (yes, no) = parse_two_clob_token_ids(item);
-            if yes.is_empty() || no.is_empty() {
-                continue;
-            }
+            if yes.is_empty() || no.is_empty() { continue; }
             let token_pair = format!("{},{}", yes, no);
 
-            let expiration = parse_expiration_from_market(item).unwrap_or_else(|| {
-                now + chrono::Duration::hours(24)
-            });
-            if expiration <= now {
-                continue;
-            }
+            let expiration = parse_expiration_from_market(item).unwrap_or_else(|| now + chrono::Duration::hours(24));
+            if expiration <= now { continue; }
 
             let q_norm = Self::normalize_question(&question);
             let category = categorize_question(&q_norm);
@@ -641,14 +569,8 @@ impl MarketDiscovery {
     }
 
     async fn fetch_kalshi_general_markets(&self) -> Result<Vec<DiscoveredMarket>> {
-        let url = format!(
-            "{}/markets?status=open&limit=500",
-            self.platforms_config.kalshi.rest_url
-        );
-        let auth_token = self
-            .kalshi_auth
-            .as_ref()
-            .and_then(|a| a.generate_token().ok());
+        let url = format!("{}/markets?status=open&limit=500", self.platforms_config.kalshi.rest_url);
+        let auth_token = self.kalshi_auth.as_ref().and_then(|a| a.generate_token().ok());
         let mut req = self.http.get(&url);
         if let Some(token) = auth_token {
             req = req.header("Authorization", format!("Bearer {}", token));
@@ -674,19 +596,12 @@ impl MarketDiscovery {
                 None => continue,
             };
 
-            // Skip 15m crypto markets — handled by dedicated approach
-            if ticker.contains("15M") || ticker.contains("BTC") || ticker.contains("ETH") && ticker.contains("15") {
+            if ticker.contains("15M") {
                 continue;
             }
 
-            let title = item
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if title.is_empty() {
-                continue;
-            }
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if title.is_empty() { continue; }
 
             let close_time = item
                 .get("close_time")
@@ -695,9 +610,7 @@ impl MarketDiscovery {
                 .map(|d| d.with_timezone(&Utc))
                 .unwrap_or_else(|| now + chrono::Duration::days(30));
 
-            if close_time <= now {
-                continue;
-            }
+            if close_time <= now { continue; }
 
             let q_norm = Self::normalize_question(&title);
             let category = categorize_question(&q_norm);
@@ -719,8 +632,6 @@ impl MarketDiscovery {
         Ok(markets)
     }
 
-    // ─── NLP matching for general (non-15m crypto) markets ───────────────
-
     fn match_general_markets_sync(
         poly_markets: Vec<DiscoveredMarket>,
         kalshi_markets: Vec<DiscoveredMarket>,
@@ -731,10 +642,7 @@ impl MarketDiscovery {
             "do", "does", "did", "not", "or", "and", "if", "it", "its",
             "this", "that", "with", "from", "as", "so", "can", "may", "per",
             "vs", "end", "close", "open", "day", "week", "month", "year",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        ].iter().cloned().collect();
 
         let mut matched: Vec<MatchedMarket> = Vec::new();
         let mut seen_pairs = std::collections::HashSet::new();
@@ -742,66 +650,38 @@ impl MarketDiscovery {
 
         for pm in &poly_markets {
             for km in &kalshi_markets {
-                // Expiration must be within 48 hours for general markets
                 let exp_diff = (pm.expiration - km.expiration).num_seconds().abs();
-                if exp_diff > 48 * 3600 {
-                    continue;
-                }
+                if exp_diff > 48 * 3600 { continue; }
+                if pm.category != km.category { continue; }
 
-                // Category must match
-                if pm.category != km.category {
-                    continue;
-                }
-
-                // Jaccard similarity
-                let tokens_a: std::collections::HashSet<&str> = pm
-                    .question_normalized
-                    .split_whitespace()
-                    .filter(|w| !stop_words.contains(*w))
-                    .collect();
-                let tokens_b: std::collections::HashSet<&str> = km
-                    .question_normalized
-                    .split_whitespace()
-                    .filter(|w| !stop_words.contains(*w))
-                    .collect();
+                let tokens_a: std::collections::HashSet<&str> = pm.question_normalized.split_whitespace()
+                    .filter(|w| !stop_words.contains(*w)).collect();
+                let tokens_b: std::collections::HashSet<&str> = km.question_normalized.split_whitespace()
+                    .filter(|w| !stop_words.contains(*w)).collect();
                 let intersection = tokens_a.intersection(&tokens_b).count();
                 let union = tokens_a.union(&tokens_b).count();
-                let sim = if union == 0 {
-                    0.0
-                } else {
-                    intersection as f64 / union as f64
-                };
+                let sim = if union == 0 { 0.0 } else { intersection as f64 / union as f64 };
 
-                if sim < 0.40 {
-                    continue;
-                }
+                if sim < 0.40 { continue; }
 
                 let pair_key = format!("{}/{}", pm.platform_market_id, km.platform_market_id);
-                if !seen_pairs.insert(pair_key) {
-                    continue;
-                }
+                if !seen_pairs.insert(pair_key) { continue; }
 
                 let mut platforms = HashMap::new();
-                platforms.insert(
-                    pm.platform,
-                    PlatformMarketInfo {
-                        platform: pm.platform,
-                        platform_market_id: pm.platform_market_id.clone(),
-                        fee_rate_bps: pm.fee_rate_bps,
-                        min_order_size: pm.min_order_size,
-                        tick_size: pm.tick_size,
-                    },
-                );
-                platforms.insert(
-                    km.platform,
-                    PlatformMarketInfo {
-                        platform: km.platform,
-                        platform_market_id: km.platform_market_id.clone(),
-                        fee_rate_bps: km.fee_rate_bps,
-                        min_order_size: km.min_order_size,
-                        tick_size: km.tick_size,
-                    },
-                );
+                platforms.insert(pm.platform, PlatformMarketInfo {
+                    platform: pm.platform,
+                    platform_market_id: pm.platform_market_id.clone(),
+                    fee_rate_bps: pm.fee_rate_bps,
+                    min_order_size: pm.min_order_size,
+                    tick_size: pm.tick_size,
+                });
+                platforms.insert(km.platform, PlatformMarketInfo {
+                    platform: km.platform,
+                    platform_market_id: km.platform_market_id.clone(),
+                    fee_rate_bps: km.fee_rate_bps,
+                    min_order_size: km.min_order_size,
+                    tick_size: km.tick_size,
+                });
 
                 let expiration = pm.expiration.min(km.expiration);
                 let unified_id = compute_unified_market_id(
@@ -835,23 +715,15 @@ impl MarketDiscovery {
         Ok(matched)
     }
 
-    // ─── Text normalization ───────────────────────────────────────────────
-
     pub(super) fn normalize_question(q: &str) -> String {
         let mut lower = q.to_lowercase().replace(',', "").replace('$', "");
         let replacements = [
-            ("bitcoin", "btc"),
-            ("ethereum", "eth"),
-            ("solana", "sol"),
-            ("ripple", "xrp"),
-            ("dogecoin", "doge"),
-            ("minutes", "min"),
-            ("minute", "min"),
+            ("bitcoin", "btc"), ("ethereum", "eth"), ("solana", "sol"),
+            ("ripple", "xrp"), ("dogecoin", "doge"),
+            ("minutes", "min"), ("minute", "min"),
         ];
         for (from, to) in replacements {
-            if lower.contains(from) {
-                lower = lower.replace(from, to);
-            }
+            if lower.contains(from) { lower = lower.replace(from, to); }
         }
         let mut result = String::with_capacity(lower.len());
         let mut last_was_space = true;
@@ -864,118 +736,67 @@ impl MarketDiscovery {
                 last_was_space = true;
             }
         }
-        if result.ends_with(' ') {
-            result.pop();
-        }
+        if result.ends_with(' ') { result.pop(); }
         result
     }
 }
 
 // ─── Token ID parsing helpers ─────────────────────────────────────────────
 
-/// Parse the FIRST token ID from a Gamma API market object.
-/// clobTokenIds is a JSON string like '["id1","id2"]' OR a JSON array.
 fn parse_first_clob_token_id(item: &serde_json::Value) -> String {
-    // Try clobTokenIds as JSON string
     if let Some(raw) = item.get("clobTokenIds").and_then(|v| v.as_str()) {
         if let Ok(ids) = serde_json::from_str::<Vec<String>>(raw) {
-            if let Some(id) = ids.into_iter().next() {
-                return id;
-            }
+            if let Some(id) = ids.into_iter().next() { return id; }
         }
     }
-    // Try as native JSON array
     if let Some(arr) = item.get("clobTokenIds").and_then(|v| v.as_array()) {
-        if let Some(id) = arr.first().and_then(|v| v.as_str()) {
-            return id.to_string();
-        }
+        if let Some(id) = arr.first().and_then(|v| v.as_str()) { return id.to_string(); }
     }
-    // Try tokens array
     if let Some(tokens) = item.get("tokens").and_then(|v| v.as_array()) {
-        if let Some(id) = tokens
-            .first()
-            .and_then(|t| t.get("token_id"))
-            .and_then(|v| v.as_str())
-        {
+        if let Some(id) = tokens.first().and_then(|t| t.get("token_id")).and_then(|v| v.as_str()) {
             return id.to_string();
         }
     }
     String::new()
 }
 
-/// Parse BOTH token IDs from a market object. Returns (yes_token, no_token).
 fn parse_two_clob_token_ids(item: &serde_json::Value) -> (String, String) {
-    // clobTokenIds as JSON string
     if let Some(raw) = item.get("clobTokenIds").and_then(|v| v.as_str()) {
-        // The string may be double-encoded or not
         let to_parse = raw.trim().trim_matches('"');
-        let unescaped = if to_parse.contains("\\\"") {
-            to_parse.replace("\\\"", "\"")
-        } else {
-            to_parse.to_string()
-        };
+        let unescaped = if to_parse.contains("\\\"") { to_parse.replace("\\\"", "\"") } else { to_parse.to_string() };
         if let Ok(ids) = serde_json::from_str::<Vec<String>>(&unescaped) {
             let yes = ids.first().cloned().unwrap_or_default();
             let no = ids.get(1).cloned().unwrap_or_default();
-            if !yes.is_empty() && !no.is_empty() {
-                return (yes, no);
-            }
+            if !yes.is_empty() && !no.is_empty() { return (yes, no); }
         }
     }
-    // As native array
     if let Some(arr) = item.get("clobTokenIds").and_then(|v| v.as_array()) {
-        let yes = arr
-            .first()
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let yes = arr.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
         let no = arr.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if !yes.is_empty() && !no.is_empty() {
-            return (yes, no);
-        }
+        if !yes.is_empty() && !no.is_empty() { return (yes, no); }
     }
-    // Fallback to tokens array
     if let Some(tokens) = item.get("tokens").and_then(|v| v.as_array()) {
-        let yes = tokens
-            .first()
-            .and_then(|t| t.get("token_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let no = tokens
-            .get(1)
-            .and_then(|t| t.get("token_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let yes = tokens.first().and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let no = tokens.get(1).and_then(|t| t.get("token_id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
         return (yes, no);
     }
     (String::new(), String::new())
 }
 
-/// Parse expiration from a Gamma API market object.
 fn parse_expiration_from_market(item: &serde_json::Value) -> Option<DateTime<Utc>> {
     for field in &["endDateIso", "endDate", "end_date_iso", "closeTime", "end_date"] {
         if let Some(s) = item.get(field).and_then(|v| v.as_str()) {
-            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-                return Some(dt.with_timezone(&Utc));
-            }
-            // Try unix timestamp string
+            if let Ok(dt) = DateTime::parse_from_rfc3339(s) { return Some(dt.with_timezone(&Utc)); }
             if let Ok(ts) = s.parse::<i64>() {
                 let secs = if ts > 1_000_000_000_000 { ts / 1000 } else { ts };
-                if let chrono::LocalResult::Single(dt) =
-                    chrono::TimeZone::timestamp_opt(&Utc, secs, 0)
-                {
+                if let chrono::LocalResult::Single(dt) = chrono::TimeZone::timestamp_opt(&Utc, secs, 0) {
                     return Some(dt);
                 }
             }
         }
-        // Also try as integer
         if let Some(ts) = item.get(field).and_then(|v| v.as_i64()) {
             let secs = if ts > 1_000_000_000_000 { ts / 1000 } else { ts };
-            if let chrono::LocalResult::Single(dt) =
-                chrono::TimeZone::timestamp_opt(&Utc, secs, 0)
-            {
+            if let chrono::LocalResult::Single(dt) = chrono::TimeZone::timestamp_opt(&Utc, secs, 0) {
                 return Some(dt);
             }
         }
@@ -983,37 +804,17 @@ fn parse_expiration_from_market(item: &serde_json::Value) -> Option<DateTime<Utc
     None
 }
 
-/// Categorize a market by its normalized question.
 fn categorize_question(q_norm: &str) -> MarketCategory {
-    if q_norm.split_whitespace().any(|w| {
-        matches!(
-            w,
-            "btc" | "eth" | "sol" | "xrp" | "doge" | "bnb" | "ada" | "crypto"
-        )
-    }) {
+    if q_norm.split_whitespace().any(|w| matches!(w, "btc" | "eth" | "sol" | "xrp" | "doge" | "bnb" | "ada" | "crypto")) {
         return MarketCategory::Crypto;
     }
-    if q_norm.contains("election")
-        || q_norm.contains("president")
-        || q_norm.contains("senate")
-        || q_norm.contains("congress")
-    {
+    if q_norm.contains("election") || q_norm.contains("president") || q_norm.contains("senate") || q_norm.contains("congress") {
         return MarketCategory::Politics;
     }
-    if q_norm.contains("nba")
-        || q_norm.contains("nfl")
-        || q_norm.contains("mlb")
-        || q_norm.contains("nhl")
-        || q_norm.contains("game")
-        || q_norm.contains("championship")
-    {
+    if q_norm.contains("nba") || q_norm.contains("nfl") || q_norm.contains("mlb") || q_norm.contains("nhl") || q_norm.contains("game") || q_norm.contains("championship") {
         return MarketCategory::Sports;
     }
-    if q_norm.contains("fed")
-        || q_norm.contains("rate")
-        || q_norm.contains("gdp")
-        || q_norm.contains("inflation")
-    {
+    if q_norm.contains("fed") || q_norm.contains("rate") || q_norm.contains("gdp") || q_norm.contains("inflation") {
         return MarketCategory::Finance;
     }
     MarketCategory::Other

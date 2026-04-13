@@ -1,6 +1,7 @@
 #![allow(dead_code, clippy::too_many_arguments, clippy::large_enum_variant, clippy::needless_range_loop, clippy::unnecessary_get_then_check)]
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::Parser;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -925,67 +926,172 @@ async fn main() -> Result<()> {
 
             // ── Market Discovery Results ──
             Some(matched) = matched_market_rx.recv() => {
-                    let market_id = matched.market.unified_id;
-                    let mut reg = registry.write().unwrap();
-                    let is_update = reg.get_market(&market_id).is_some();
-                    
-                    if is_update {
-                        // Market already known — but it might have discovered a new platform (e.g. Kalshi listed it late)
-                        let existing = reg.get_market(&market_id).unwrap().clone();
-                        let mut updated = existing.clone();
-                        let mut platforms_added = 0;
-                        for (plat, info) in matched.market.platforms {
-                            if updated.platforms.insert(plat, info).is_none() {
-                                platforms_added += 1;
-                            }
-                        }
-                        if platforms_added > 0 {
-                            reg.register_market(updated.clone());
-                            let db_clone = db.clone();
-                            tokio::spawn(async move {
-                                let _ = db_clone.upsert_market(&updated).await;
-                            });
-                            info!(
-                                market_id = %market_id,
-                                total_markets = reg.market_count(),
-                                total_arb_pairs = reg.arb_pair_count(),
-                                "Registry updated — new platform added to existing market"
-                            );
-                        }
-                        continue;
-                    }
-                    {
-                        let status = matched.market.status;
-                        let confidence = matched.market.confidence;
-                        let platform_names: Vec<_> = matched.market.platforms.keys().collect();
-                        info!(
-                            market_id = %market_id,
-                            question = %matched.market.question,
-                            platforms = ?platform_names,
-                            status = ?status,
-                            confidence,
-                            "NEW cross-platform market discovered and registered"
-                        );
+    let market_id = matched.market.unified_id;
+    let new_status = matched.market.status;
 
+    {
+        let mut reg = registry.write().unwrap();
+        let existing = reg.get_market(&market_id).cloned();
+
+        match new_status {
+            // ── Case 1: Market resolved/expired — clean up ──────────────
+            MarketStatus::Resolved | MarketStatus::Expired => {
+                if let Some(ref ex) = existing {
+                    if ex.status == MarketStatus::Active {
+                        // Build the updated market with resolved status
+                        let mut updated = ex.clone();
+                        // Merge any new platform info (e.g. updated token pair)
+                        for (plat, info) in &matched.market.platforms {
+                            updated.platforms.insert(*plat, info.clone());
+                        }
+                        updated.status = new_status;
+                        updated.updated_at = Utc::now();
+                        reg.register_market(updated.clone());
+
+                        // Persist status change to DB
                         let db_clone = db.clone();
-                        let market_clone = matched.market.clone();
+                        let status_copy = new_status;
                         tokio::spawn(async move {
-                            if let Err(e) = db_clone.upsert_market(&market_clone).await {
-                                tracing::error!(error = %e, "Failed to persist new market");
+                            if let Err(e) = db_clone.update_market_status(&market_id, status_copy).await {
+                                tracing::error!(error = %e, "Failed to update market status to resolved");
+                            }
+                            // Also upsert to capture any last-minute platform updates
+                            if let Err(e) = db_clone.upsert_market(&updated).await {
+                                tracing::error!(error = %e, "Failed to upsert resolved market");
                             }
                         });
 
-                        let mut reg = registry.write().unwrap();
-                        reg.register_market(matched.market);
-                        let total_markets = reg.market_count();
-                        let total_arb_pairs = reg.arb_pair_count();
                         info!(
-                            total_markets,
-                            total_arb_pairs,
-                            "Registry updated — arb pairs available for trading"
+                            market_id = %market_id,
+                            status = ?new_status,
+                            "Market resolved — closing actor channel and removing from registry"
                         );
+
+                        // Close the MarketActor for this market by dropping the sender.
+                        // The actor's recv() will return None and it will exit cleanly.
+                        if let Some(_sender) = market_channels.remove(&market_id) {
+                            tracing::info!(market_id = %market_id, "Dropped MarketActor channel for resolved market");
+                        }
                     }
                 }
+                // Evict from registry so it's not included in arb pair calculation
+                let evicted = reg.evict_stale_markets();
+                for id in &evicted {
+                    if let Some(_sender) = market_channels.remove(id) {
+                        tracing::info!(market_id = %id, "Dropped MarketActor channel during eviction");
+                    }
+                }
+            }
+
+            // ── Case 2: Active market — new or updated ───────────────────
+            MarketStatus::Active => {
+                if let Some(ref ex) = existing {
+                    // Market already known — check if platform info has changed
+                    // (this is the key fix: new 15m rounds have the same unified_id
+                    //  but DIFFERENT token pairs / kalshi tickers)
+                    let mut platforms_changed = false;
+                    for (plat, new_info) in &matched.market.platforms {
+                        match ex.platforms.get(plat) {
+                            None => { platforms_changed = true; }
+                            Some(old_info) => {
+                                if old_info.platform_market_id != new_info.platform_market_id {
+                                    platforms_changed = true;
+                                    tracing::info!(
+                                        market_id = %market_id,
+                                        platform = ?plat,
+                                        old_id = %old_info.platform_market_id,
+                                        new_id = %new_info.platform_market_id,
+                                        "Platform market ID changed — new round detected"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if platforms_changed || ex.status != MarketStatus::Active {
+                        let mut updated = ex.clone();
+                        for (plat, info) in matched.market.platforms.clone() {
+                            updated.platforms.insert(plat, info);
+                        }
+                        updated.status = MarketStatus::Active;
+                        updated.updated_at = Utc::now();
+                        reg.register_market(updated.clone());
+
+                        let db_clone = db.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = db_clone.upsert_market(&updated).await {
+                                tracing::error!(error = %e, "Failed to persist updated market");
+                            }
+                        });
+
+                        // If the platform market IDs changed (new round), we need to
+                        // clear the old MarketActor so it rebuilds with fresh book state.
+                        // The new ticks will have the new unified_id (same) but the
+                        // feed handlers will have subscribed to the new token/ticker,
+                        // so the existing actor will work — but we must clear its books
+                        // to avoid stale price comparisons.
+                        if platforms_changed {
+                            tracing::info!(
+                                market_id = %market_id,
+                                "Platform IDs changed — dropping old MarketActor to force book reset"
+                            );
+                            // Drop old actor; it will be recreated on the next tick
+                            market_channels.remove(&market_id);
+                        }
+
+                        info!(
+                            market_id = %market_id,
+                            total_markets = reg.market_count(),
+                            total_arb_pairs = reg.arb_pair_count(),
+                            "Registry updated — market platforms changed"
+                        );
+                    }
+                    // else: no change, nothing to do
+                } else {
+                    // Truly new market
+                    let platform_names: Vec<_> = matched.market.platforms.keys().collect();
+                    info!(
+                        market_id = %market_id,
+                        question = %matched.market.question,
+                        platforms = ?platform_names,
+                        "NEW cross-platform market discovered and registered"
+                    );
+
+                    let db_clone = db.clone();
+                    let market_clone = matched.market.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = db_clone.upsert_market(&market_clone).await {
+                            tracing::error!(error = %e, "Failed to persist new market");
+                        }
+                    });
+
+                    reg.register_market(matched.market);
+                    let total_markets = reg.market_count();
+                    let total_arb_pairs = reg.arb_pair_count();
+                    info!(
+                        total_markets,
+                        total_arb_pairs,
+                        "Registry updated — new market added"
+                    );
+                }
+            }
+
+            MarketStatus::Suspended => {
+                // Suspended: keep in registry but don't trade
+                if let Some(ref ex) = existing {
+                    let mut updated = ex.clone();
+                    updated.status = MarketStatus::Suspended;
+                    updated.updated_at = Utc::now();
+                    reg.register_market(updated.clone());
+                    let db_clone = db.clone();
+                    tokio::spawn(async move {
+                        let _ = db_clone.update_market_status(&market_id, MarketStatus::Suspended).await;
+                    });
+                }
+            }
+        }
+    }
+}
 
             // ── Config Hot Reload ──
             Some(new_config) = config_reload_rx.recv() => {

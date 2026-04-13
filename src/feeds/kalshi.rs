@@ -20,18 +20,21 @@ pub struct KalshiFeed {
     config: KalshiConfig,
     auth: Option<Arc<KalshiAuth>>,
     db: Arc<dyn crate::db::Database>,
+    /// Key: ticker -> unified market UUID
     subscriptions: std::collections::HashMap<String, Uuid>,
     books: std::collections::HashMap<String, KalshiOrderBook>,
-    /// HTTP client for REST book bootstrap calls
     http: reqwest::Client,
     latest_seq: u64,
+    /// The subscription ID returned by Kalshi for the orderbook_delta channel.
+    /// Required for update_subscription (add/remove markets) commands.
+    orderbook_sid: Option<u64>,
+    /// Next command id counter
+    cmd_id: u64,
 }
 
 #[derive(Debug, Default)]
 struct KalshiOrderBook {
-    // yes bids in dollar format [0.0 - 1.0]
     pub yes_bids: std::collections::BTreeMap<Decimal, Decimal>,
-    // no bids in dollar format [0.0 - 1.0]
     pub no_bids: std::collections::BTreeMap<Decimal, Decimal>,
     pub is_initialized: bool,
     pub seq: u64,
@@ -40,12 +43,10 @@ struct KalshiOrderBook {
 impl KalshiOrderBook {
     fn new() -> Self { Self::default() }
 
-    /// Best YES bid price
     fn best_yes_bid(&self) -> Option<(Decimal, Decimal)> {
         self.yes_bids.iter().next_back().map(|(&p, &s)| (p, s))
     }
 
-    /// Best YES ask = 1 - best NO bid (highest NO bid)
     fn best_yes_ask(&self) -> Option<(Decimal, Decimal)> {
         self.no_bids.iter().next_back().map(|(&no_price, &size)| {
             (Decimal::ONE - no_price, size)
@@ -66,17 +67,36 @@ impl KalshiOrderBook {
 
 // ── Wire message shapes ────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Initial subscription: subscribe to a channel for a list of tickers.
+#[derive(Debug, Serialize)]
 struct KalshiSubscribe {
     id: u64,
     cmd: String,
     params: KalshiSubParams,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 struct KalshiSubParams {
     channels: Vec<String>,
     market_tickers: Vec<String>,
+}
+
+/// Dynamic add/remove markets to an existing subscription using its sid.
+/// This is the correct way to add markets mid-session per Kalshi docs.
+#[derive(Debug, Serialize)]
+struct KalshiUpdateSubscription {
+    id: u64,
+    cmd: String,
+    params: KalshiUpdateSubParams,
+}
+
+#[derive(Debug, Serialize)]
+struct KalshiUpdateSubParams {
+    /// The subscription ID(s) to update (returned in the "subscribed" response as "sid")
+    sids: Vec<u64>,
+    market_tickers: Vec<String>,
+    /// "add_markets" or "delete_markets"
+    action: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,10 +104,10 @@ struct KalshiEnvelope {
     #[serde(rename = "type")]
     msg_type: String,
     seq: Option<u64>,
+    sid: Option<u64>,
     msg: Option<serde_json::Value>,
 }
 
-/// REST API response for GET /markets/{ticker}/orderbook
 #[derive(Debug, Deserialize)]
 struct KalshiRestOrderbook {
     #[serde(default)]
@@ -96,10 +116,8 @@ struct KalshiRestOrderbook {
 
 #[derive(Debug, Deserialize, Default)]
 struct KalshiRestBook {
-    /// YES bids: [[price_cents, quantity], ...]
     #[serde(default)]
     yes: Vec<Vec<serde_json::Value>>,
-    /// NO bids: [[price_cents, quantity], ...]
     #[serde(default)]
     no: Vec<Vec<serde_json::Value>>,
 }
@@ -134,8 +152,16 @@ impl KalshiFeed {
             books: std::collections::HashMap::new(),
             http,
             latest_seq: 0,
+            orderbook_sid: None,
+            cmd_id: 1,
         }
-        }
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.cmd_id;
+        self.cmd_id += 1;
+        id
+    }
 
     // ── Message dispatcher ──────────────────────────────────────────────────
 
@@ -147,10 +173,26 @@ impl KalshiFeed {
             "orderbook_snapshot" => self.handle_snapshot(&env, tick_tx),
             "orderbook_delta"    => self.handle_delta(&env, tick_tx),
             "subscribed" => {
+                if let Some(sid) = env.sid {
+                    // Store the sid so we can use update_subscription later
+                    if self.orderbook_sid.is_none() {
+                        self.orderbook_sid = Some(sid);
+                        tracing::info!(sid, "Kalshi orderbook_delta subscription confirmed, sid stored");
+                    }
+                }
                 if let Some(msg) = &env.msg {
                     let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let sid = msg.get("sid").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let sid = env.sid.or_else(|| msg.get("sid").and_then(|v| v.as_u64())).unwrap_or(0);
                     tracing::debug!(channel, sid, "Kalshi subscription confirmed");
+                }
+                Ok(())
+            }
+            "ok" => {
+                // Response to update_subscription — log any market list changes
+                if let Some(msg) = &env.msg {
+                    if let Some(tickers) = msg.get("market_tickers").and_then(|v| v.as_array()) {
+                        tracing::debug!(count = tickers.len(), "Kalshi subscription update acknowledged");
+                    }
                 }
                 Ok(())
             }
@@ -229,18 +271,12 @@ impl KalshiFeed {
             return Ok(());
         }
 
-        // Global sequence tracking
         if seq > 0 && self.latest_seq > 0 && seq < self.latest_seq {
             return Ok(());
         }
 
         if seq > 0 && self.latest_seq > 0 && seq > self.latest_seq + 1 {
-            tracing::warn!(
-                ticker,
-                expected = self.latest_seq + 1,
-                got = seq,
-                "Kalshi sequence gap detected."
-            );
+            tracing::warn!(ticker, expected = self.latest_seq + 1, got = seq, "Kalshi sequence gap detected.");
         }
         self.latest_seq = seq.max(self.latest_seq);
 
@@ -251,11 +287,7 @@ impl KalshiFeed {
         ) {
             let price = Self::parse_decimal_field(price_val)?;
             let delta = Self::parse_decimal_field(delta_val)?;
-            let price = if price > Decimal::ONE {
-                price / Decimal::from(100)
-            } else {
-                price
-            };
+            let price = if price > Decimal::ONE { price / Decimal::from(100) } else { price };
             let target = if side_val == "yes" { &mut book.yes_bids } else { &mut book.no_bids };
             let current = target.get(&price).copied().unwrap_or(Decimal::ZERO);
             let new_qty = (current + delta).max(Decimal::ZERO);
@@ -277,20 +309,14 @@ impl KalshiFeed {
     fn parse_price_size_entry(entry: &serde_json::Value) -> Result<(Decimal, Decimal)> {
         if let Some(arr) = entry.as_array() {
             let p = arr.get(0)
-                .and_then(|v| v.as_str())
-                .and_then(|s| Decimal::from_str(s).ok())
+                .and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok())
                 .or_else(|| arr.get(0).and_then(|v| v.as_f64()).and_then(|f| Decimal::try_from(f).ok()))
                 .context("bad price in entry")?;
             let s = arr.get(1)
-                .and_then(|v| v.as_str())
-                .and_then(|s| Decimal::from_str(s).ok())
+                .and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok())
                 .or_else(|| arr.get(1).and_then(|v| v.as_f64()).and_then(|f| Decimal::try_from(f).ok()))
                 .context("bad size in entry")?;
-            let p = if p > Decimal::ONE {
-                p / Decimal::from(100)
-            } else {
-                p
-            };
+            let p = if p > Decimal::ONE { p / Decimal::from(100) } else { p };
             return Ok((p, s));
         }
         anyhow::bail!("unexpected entry shape: {entry}")
@@ -314,7 +340,6 @@ impl KalshiFeed {
         let bid = book.best_yes_bid().unwrap_or((Decimal::ZERO, Decimal::ZERO));
         let ask = book.best_yes_ask().unwrap_or((Decimal::ZERO, Decimal::ZERO));
 
-        // Only emit if we have at least one valid side
         if bid.0 == Decimal::ZERO && ask.0 == Decimal::ZERO { return None; }
 
         let mid = match (bid.0 > Decimal::ZERO, ask.0 > Decimal::ZERO) {
@@ -324,7 +349,6 @@ impl KalshiFeed {
             _ => return None,
         };
 
-        // Validate prices are in [0,1]
         if bid.0 > Decimal::ONE || ask.0 > Decimal::ONE { return None; }
 
         let fee_bps = if ticker.contains("15M") || ticker.contains("BTC") || ticker.contains("ETH") {
@@ -350,12 +374,6 @@ impl KalshiFeed {
         })
     }
 
-    /// Fetch current orderbook via Kalshi REST API and bootstrap the local book.
-    /// Called after subscribing to a ticker (both initial and dynamic) to ensure
-    /// we have immediate book state rather than waiting for the first WS snapshot.
-    ///
-    /// Kalshi REST endpoint: GET /trade-api/v2/markets/{ticker}/orderbook
-    /// Returns { orderbook: { yes: [[price_cents, qty], ...], no: [[price_cents, qty], ...] } }
     async fn bootstrap_book_via_rest(
         &mut self,
         ticker: &str,
@@ -412,8 +430,6 @@ impl KalshiFeed {
         book.yes_bids.clear();
         book.no_bids.clear();
 
-        // REST API returns prices in CENTS (integers 1-99)
-        // Convert to dollar format (divide by 100)
         for entry in &data.orderbook.yes {
             if entry.len() >= 2 {
                 let price_cents = entry[0].as_i64().unwrap_or(0);
@@ -437,7 +453,7 @@ impl KalshiFeed {
         }
 
         book.is_initialized = true;
-        book.seq = 0; // Will be updated on first WS delta
+        book.seq = 0;
 
         let yes_count = book.yes_bids.len();
         let no_count = book.no_bids.len();
@@ -454,7 +470,122 @@ impl KalshiFeed {
             let _ = tick_tx.send(tick);
         } else {
             tracing::debug!(ticker, yes_levels = yes_count, no_levels = no_count,
-                "Kalshi REST orderbook fetched but no valid BBO (market may have no resting orders)");
+                "Kalshi REST orderbook fetched but no valid BBO");
+        }
+    }
+
+    /// Subscribe new tickers using the correct Kalshi WS protocol:
+    /// - If we have a sid from the initial subscribe, use update_subscription with add_markets
+    /// - Otherwise fall back to a new subscribe command
+    async fn subscribe_new_tickers(
+        &mut self,
+        new_tickers: &[String],
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message,
+        >,
+        tick_tx: &broadcast::Sender<NormalizedTick>,
+    ) {
+        if new_tickers.is_empty() {
+            return;
+        }
+
+        info!(count = new_tickers.len(), tickers = ?new_tickers, "Dynamically subscribing to new Kalshi markets");
+
+        // Ensure book state exists for each new ticker before subscribing
+        for ticker in new_tickers {
+            self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
+        }
+
+        if let Some(sid) = self.orderbook_sid {
+            // Use update_subscription with add_markets — the correct incremental approach
+            for chunk in new_tickers.chunks(50) {
+                let id = self.next_id();
+                let update = KalshiUpdateSubscription {
+                    id,
+                    cmd: "update_subscription".to_string(),
+                    params: KalshiUpdateSubParams {
+                        sids: vec![sid],
+                        market_tickers: chunk.to_vec(),
+                        action: "add_markets".to_string(),
+                    },
+                };
+                if let Ok(msg_text) = serde_json::to_string(&update) {
+                    if let Err(e) = write.send(Message::Text(msg_text.into())).await {
+                        warn!(error = %e, "Failed to send Kalshi update_subscription");
+                    } else {
+                        tracing::debug!(sid, count = chunk.len(), "Sent Kalshi update_subscription add_markets");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } else {
+            // No sid yet — use a fresh subscribe command
+            for chunk in new_tickers.chunks(50) {
+                let id = self.next_id();
+                let sub = KalshiSubscribe {
+                    id,
+                    cmd: "subscribe".to_string(),
+                    params: KalshiSubParams {
+                        channels: vec!["orderbook_delta".into()],
+                        market_tickers: chunk.to_vec(),
+                    },
+                };
+                if let Ok(msg_text) = serde_json::to_string(&sub) {
+                    if let Err(e) = write.send(Message::Text(msg_text.into())).await {
+                        warn!(error = %e, "Failed to send Kalshi subscribe");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // Bootstrap books via REST for the newly subscribed tickers
+        for ticker in new_tickers {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            self.bootstrap_book_via_rest(ticker, tick_tx).await;
+        }
+    }
+
+    /// Remove stale/resolved tickers from the WS subscription and clean up local state.
+    async fn unsubscribe_tickers(
+        &mut self,
+        old_tickers: &[String],
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message,
+        >,
+    ) {
+        if old_tickers.is_empty() {
+            return;
+        }
+
+        info!(count = old_tickers.len(), tickers = ?old_tickers, "Unsubscribing from resolved Kalshi markets");
+
+        if let Some(sid) = self.orderbook_sid {
+            for chunk in old_tickers.chunks(50) {
+                let id = self.next_id();
+                let update = KalshiUpdateSubscription {
+                    id,
+                    cmd: "update_subscription".to_string(),
+                    params: KalshiUpdateSubParams {
+                        sids: vec![sid],
+                        market_tickers: chunk.to_vec(),
+                        action: "delete_markets".to_string(),
+                    },
+                };
+                if let Ok(msg_text) = serde_json::to_string(&update) {
+                    if let Err(e) = write.send(Message::Text(msg_text.into())).await {
+                        warn!(error = %e, "Failed to send Kalshi update_subscription delete_markets");
+                    }
+                }
+            }
+        }
+
+        // Clean up local state
+        for ticker in old_tickers {
+            self.books.remove(ticker);
+            self.subscriptions.remove(ticker);
         }
     }
 }
@@ -470,6 +601,9 @@ impl FeedHandler for KalshiFeed {
             book.is_initialized = false;
             book.seq = 0;
         }
+        // Reset the sid so we re-capture it on reconnect
+        self.orderbook_sid = None;
+        self.latest_seq = 0;
     }
 
     async fn connect_and_run(&mut self, tick_tx: broadcast::Sender<NormalizedTick>) -> Result<()> {
@@ -516,12 +650,17 @@ impl FeedHandler for KalshiFeed {
 
         let (mut write, mut read) = ws_stream.split();
 
+        // Reset sid on new connection — will be set when we receive the "subscribed" response
+        self.orderbook_sid = None;
+        self.latest_seq = 0;
+
         // Subscribe to orderbook_delta for all known tickers
         let tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
         if !tickers.is_empty() {
             for chunk in tickers.chunks(50) {
+                let id = self.next_id();
                 let sub = KalshiSubscribe {
-                    id: 1,
+                    id,
                     cmd: "subscribe".into(),
                     params: KalshiSubParams {
                         channels: vec!["orderbook_delta".into()],
@@ -541,10 +680,7 @@ impl FeedHandler for KalshiFeed {
             self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
         }
 
-        // Bootstrap all initial tickers via REST immediately.
-        // Kalshi DOES send automatic orderbook_snapshot on WS subscription,
-        // but fetching via REST ensures we have data right away without waiting
-        // for the WS snapshot to arrive (which can take several seconds).
+        // Bootstrap books via REST immediately for initial tickers
         {
             let initial_tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
             for ticker in &initial_tickers {
@@ -592,44 +728,44 @@ impl FeedHandler for KalshiFeed {
                 }
 
                 _ = sync_interval.tick() => {
-                    // Dynamically subscribe to newly discovered markets
+                    // Sync with DB: find new markets and resolved/expired ones
                     match self.db.get_active_markets().await {
-                        Ok(markets) => {
+                        Ok(active_markets) => {
+                            // Determine which tickers are new (in DB but not subscribed)
                             let mut new_tickers = Vec::new();
-                            for m in markets {
+                            let mut current_ticker_to_uuid: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
+
+                            for m in &active_markets {
                                 if let Some(info) = m.platforms.get(&Platform::Kalshi) {
                                     let ticker = info.platform_market_id.clone();
+                                    current_ticker_to_uuid.insert(ticker.clone(), m.unified_id);
                                     if !self.subscriptions.contains_key(&ticker) {
-                                        self.subscriptions.insert(ticker.clone(), m.unified_id);
-                                        self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
                                         new_tickers.push(ticker);
                                     }
                                 }
                             }
-                            if !new_tickers.is_empty() {
-                                info!(count = new_tickers.len(), tickers = ?new_tickers, "Dynamically subscribing to new Kalshi markets");
-                                for chunk in new_tickers.chunks(50) {
-                                    let sub = KalshiSubscribe {
-                                        id: 2,
-                                        cmd: "subscribe".into(),
-                                        params: KalshiSubParams {
-                                            channels: vec!["orderbook_delta".into()],
-                                            market_tickers: chunk.to_vec(),
-                                        },
-                                    };
-                                    if let Ok(msg_text) = serde_json::to_string(&sub) {
-                                        let _ = write.send(Message::Text(msg_text.into())).await;
-                                    }
-                                }
 
-                                // FIX: Bootstrap book state via REST for dynamically added tickers.
-                                // The Kalshi WS sends an orderbook_snapshot after subscribing, but
-                                // it can take several seconds. REST bootstrap ensures immediate data.
-                                for ticker in &new_tickers {
-                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                    self.bootstrap_book_via_rest(ticker, &tick_tx).await;
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            // Determine which tickers are stale (subscribed but no longer active)
+                            let stale_tickers: Vec<String> = self.subscriptions.keys()
+                                .filter(|t| !current_ticker_to_uuid.contains_key(*t))
+                                .cloned()
+                                .collect();
+
+                            // Add new subscriptions to our map before subscribing
+                            for ticker in &new_tickers {
+                                if let Some(uuid) = current_ticker_to_uuid.get(ticker) {
+                                    self.subscriptions.insert(ticker.clone(), *uuid);
                                 }
+                            }
+
+                            // Subscribe to new tickers
+                            if !new_tickers.is_empty() {
+                                self.subscribe_new_tickers(&new_tickers, &mut write, &tick_tx).await;
+                            }
+
+                            // Unsubscribe from stale tickers
+                            if !stale_tickers.is_empty() {
+                                self.unsubscribe_tickers(&stale_tickers, &mut write).await;
                             }
                         }
                         Err(e) => warn!(error = %e, "Kalshi feed: DB refresh failed"),

@@ -19,9 +19,7 @@ pub struct ArbPair {
 }
 
 impl Default for MarketRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl MarketRegistry {
@@ -32,35 +30,54 @@ impl MarketRegistry {
         }
     }
 
-    /// Remove markets that have expired or been resolved. Call periodically
-    /// to prevent unbounded memory growth during long-running sessions.
+    /// Remove markets that have resolved, expired, or whose expiry passed.
+    ///
+    /// Markets are evicted when:
+    ///   1. Status is Resolved or Expired
+    ///   2. Status is Active but expiration is more than 5 minutes in the past
+    ///      (safety net for markets that never received a Resolved status update)
+    ///
+    /// Returns IDs of evicted markets so the tick router can drop actor channels.
     pub fn evict_stale_markets(&mut self) -> Vec<Uuid> {
         let now = chrono::Utc::now();
         let stale_ids: Vec<Uuid> = self.markets.iter()
             .filter(|(_, m)| {
-                matches!(m.status, crate::types::MarketStatus::Resolved | crate::types::MarketStatus::Expired)
-                || m.expiration < now - chrono::Duration::hours(1)
+                matches!(m.status, MarketStatus::Resolved | MarketStatus::Expired)
+                // Safety net: evict Active markets that expired > 5 minutes ago
+                // (covers cases where the Resolved message was never received)
+                || (m.status == MarketStatus::Active && m.expiration < now - chrono::Duration::minutes(5))
             })
             .map(|(id, _)| *id)
             .collect();
+
         for id in &stale_ids {
             self.markets.remove(id);
             self.arb_pairs.remove(id);
         }
-        stale_ids // Return IDs so the tick router can drop the actor channels
+
+        if !stale_ids.is_empty() {
+            tracing::info!(count = stale_ids.len(), "Evicted stale/resolved markets from registry");
+        }
+
+        stale_ids
     }
 
-    /// Register a market. Idempotent: re-registering the same market_id updates
-    /// the market definition but does not create duplicate arb pairs.
+    /// Register (or update) a market.
+    ///
+    /// Idempotent: re-registering the same market_id updates the market
+    /// definition including platform info and status. This is critical for
+    /// 15-minute markets where the token IDs change each round.
     pub fn register_market(&mut self, market: Market) {
         let market_id = market.unified_id;
         let platforms: Vec<Platform> = market.platforms.keys().cloned().collect();
         let confidence = market.confidence;
+        let status = market.status;
 
         self.markets.insert(market_id, market);
 
-        let mut pairs = Vec::new();
-        if confidence >= 0.2 {
+        // Only build arb pairs for active markets with sufficient confidence
+        if matches!(status, MarketStatus::Active) && confidence >= 0.2 {
+            let mut pairs = Vec::new();
             for i in 0..platforms.len() {
                 for j in (i + 1)..platforms.len() {
                     pairs.push(ArbPair {
@@ -71,11 +88,13 @@ impl MarketRegistry {
                     });
                 }
             }
-        }
-        
-        if !pairs.is_empty() {
-            self.arb_pairs.insert(market_id, pairs);
+            if !pairs.is_empty() {
+                self.arb_pairs.insert(market_id, pairs);
+            } else {
+                self.arb_pairs.remove(&market_id);
+            }
         } else {
+            // Resolved/Suspended/Expired markets have no arb pairs
             self.arb_pairs.remove(&market_id);
         }
     }
@@ -98,5 +117,10 @@ impl MarketRegistry {
 
     pub fn arb_pair_count(&self) -> usize {
         self.arb_pairs.values().map(|v| v.len()).sum()
+    }
+
+    /// Returns the number of currently active (tradeable) markets
+    pub fn active_market_count(&self) -> usize {
+        self.markets.values().filter(|m| m.status == MarketStatus::Active).count()
     }
 }
