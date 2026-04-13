@@ -22,6 +22,9 @@ pub struct KalshiFeed {
     db: Arc<dyn crate::db::Database>,
     subscriptions: std::collections::HashMap<String, Uuid>,
     books: std::collections::HashMap<String, KalshiOrderBook>,
+    /// HTTP client for REST book bootstrap calls
+    http: reqwest::Client,
+    latest_seq: u64,
 }
 
 #[derive(Debug, Default)]
@@ -63,10 +66,6 @@ impl KalshiOrderBook {
 
 // ── Wire message shapes ────────────────────────────────────────────────────
 
-/// Subscribe command — only use "orderbook_delta" as the channel.
-/// Kalshi will automatically send an "orderbook_snapshot" message first,
-/// then stream "orderbook_delta" updates. "orderbook_snapshot" is NOT a
-/// valid channel name and will return error code 8 if included.
 #[derive(Debug, Serialize, Deserialize)]
 struct KalshiSubscribe {
     id: u64,
@@ -80,15 +79,29 @@ struct KalshiSubParams {
     market_tickers: Vec<String>,
 }
 
-/// Top-level envelope from Kalshi WebSocket.
-/// The `type` field identifies the message kind:
-///   "orderbook_snapshot" | "orderbook_delta" | "subscribed" | "error" | ...
 #[derive(Debug, Deserialize)]
 struct KalshiEnvelope {
     #[serde(rename = "type")]
     msg_type: String,
     seq: Option<u64>,
     msg: Option<serde_json::Value>,
+}
+
+/// REST API response for GET /markets/{ticker}/orderbook
+#[derive(Debug, Deserialize)]
+struct KalshiRestOrderbook {
+    #[serde(default)]
+    orderbook: KalshiRestBook,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct KalshiRestBook {
+    /// YES bids: [[price_cents, quantity], ...]
+    #[serde(default)]
+    yes: Vec<Vec<serde_json::Value>>,
+    /// NO bids: [[price_cents, quantity], ...]
+    #[serde(default)]
+    no: Vec<Vec<serde_json::Value>>,
 }
 
 impl KalshiFeed {
@@ -105,14 +118,24 @@ impl KalshiFeed {
                 }
             }
         }
+
+        let http = reqwest::Client::builder()
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build Kalshi REST client");
+
         Self {
             config,
             auth: auth.map(Arc::new),
             db,
             subscriptions: subs_map,
             books: std::collections::HashMap::new(),
+            http,
+            latest_seq: 0,
         }
-    }
+        }
 
     // ── Message dispatcher ──────────────────────────────────────────────────
 
@@ -121,11 +144,9 @@ impl KalshiFeed {
             .map_err(|e| anyhow::anyhow!("JSON parse error: {e}"))?;
 
         match env.msg_type.as_str() {
-            // Kalshi sends "orderbook_snapshot" automatically after subscribing to "orderbook_delta"
             "orderbook_snapshot" => self.handle_snapshot(&env, tick_tx),
             "orderbook_delta"    => self.handle_delta(&env, tick_tx),
             "subscribed" => {
-                // Log successful subscription confirmation
                 if let Some(msg) = &env.msg {
                     let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("unknown");
                     let sid = msg.get("sid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -143,7 +164,6 @@ impl KalshiFeed {
                 };
                 anyhow::bail!("Kalshi WS error {}: {}", code, msg_text);
             }
-            // Silently ignore heartbeats, acks, and unknown control messages
             _ => Ok(()),
         }
     }
@@ -158,9 +178,6 @@ impl KalshiFeed {
         book.yes_bids.clear();
         book.no_bids.clear();
 
-        // Kalshi sends dollar-format prices: yes_dollars_fp / no_dollars_fp
-        // Each entry is ["price_as_dollar_string", "quantity_as_dollar_string"]
-        // e.g. ["0.4200", "300.00"] means bid at $0.42 for $300 notional
         for field in &["yes_dollars_fp", "yes"] {
             if let Some(arr) = msg.get(field).and_then(|v| v.as_array()) {
                 for entry in arr {
@@ -204,31 +221,29 @@ impl KalshiFeed {
 
         let book = match self.books.get_mut(ticker) {
             Some(b) => b,
-            None => return Ok(()), // not subscribed
+            None => return Ok(()),
         };
 
         if !book.is_initialized {
-            // Silently skip deltas before first snapshot
             tracing::debug!(ticker, "Skipping delta for uninitialized book — waiting for snapshot");
             return Ok(());
         }
 
-        // Sequence validation
-        if seq > 0 && book.seq > 0 && seq != book.seq + 1 {
-            if seq <= book.seq {
-                // Duplicate — ignore silently
-                return Ok(());
-            }
-            // Gap — log warning, accept new sequence
-            tracing::warn!(
-                ticker,
-                expected = book.seq + 1,
-                got = seq,
-                "Kalshi sequence gap. Book may be slightly out of sync."
-            );
+        // Global sequence tracking
+        if seq > 0 && self.latest_seq > 0 && seq < self.latest_seq {
+            return Ok(());
         }
 
-        // Delta format: price_dollars (dollar string) + delta_fp (dollar amount) + side
+        if seq > 0 && self.latest_seq > 0 && seq > self.latest_seq + 1 {
+            tracing::warn!(
+                ticker,
+                expected = self.latest_seq + 1,
+                got = seq,
+                "Kalshi sequence gap detected."
+            );
+        }
+        self.latest_seq = seq.max(self.latest_seq);
+
         if let (Some(price_val), Some(delta_val), Some(side_val)) = (
             msg.get("price_dollars"),
             msg.get("delta_fp"),
@@ -236,7 +251,6 @@ impl KalshiFeed {
         ) {
             let price = Self::parse_decimal_field(price_val)?;
             let delta = Self::parse_decimal_field(delta_val)?;
-            // Normalize price from cents if > 1
             let price = if price > Decimal::ONE {
                 price / Decimal::from(100)
             } else {
@@ -260,7 +274,6 @@ impl KalshiFeed {
         Ok(())
     }
 
-    /// Parse a [price, size] entry — handles both dollar-string arrays and numeric arrays.
     fn parse_price_size_entry(entry: &serde_json::Value) -> Result<(Decimal, Decimal)> {
         if let Some(arr) = entry.as_array() {
             let p = arr.get(0)
@@ -273,8 +286,6 @@ impl KalshiFeed {
                 .and_then(|s| Decimal::from_str(s).ok())
                 .or_else(|| arr.get(1).and_then(|v| v.as_f64()).and_then(|f| Decimal::try_from(f).ok()))
                 .context("bad size in entry")?;
-            // Normalize price: Kalshi uses dollar format (0.0–1.0).
-            // If price > 1 it's old cent format — convert.
             let p = if p > Decimal::ONE {
                 p / Decimal::from(100)
             } else {
@@ -316,7 +327,6 @@ impl KalshiFeed {
         // Validate prices are in [0,1]
         if bid.0 > Decimal::ONE || ask.0 > Decimal::ONE { return None; }
 
-        // Fee: Kalshi 15-min crypto markets ~5 bps; standard markets ~175 bps
         let fee_bps = if ticker.contains("15M") || ticker.contains("BTC") || ticker.contains("ETH") {
             5u16
         } else {
@@ -338,6 +348,114 @@ impl KalshiFeed {
             fee_rate_bps: fee_bps,
             sequence: book.seq,
         })
+    }
+
+    /// Fetch current orderbook via Kalshi REST API and bootstrap the local book.
+    /// Called after subscribing to a ticker (both initial and dynamic) to ensure
+    /// we have immediate book state rather than waiting for the first WS snapshot.
+    ///
+    /// Kalshi REST endpoint: GET /trade-api/v2/markets/{ticker}/orderbook
+    /// Returns { orderbook: { yes: [[price_cents, qty], ...], no: [[price_cents, qty], ...] } }
+    async fn bootstrap_book_via_rest(
+        &mut self,
+        ticker: &str,
+        tick_tx: &broadcast::Sender<NormalizedTick>,
+    ) {
+        let url = format!("{}/markets/{}/orderbook", self.config.rest_url, ticker);
+
+        let auth_header = if let Some(auth) = &self.auth {
+            match auth.auth_header().await {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    warn!(ticker, error = %e, "Failed to get Kalshi auth header for REST bootstrap");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut req = self.http.get(&url);
+        if let Some(header) = auth_header {
+            req = req.header("Authorization", header);
+        }
+
+        let resp = match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            req.send(),
+        ).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                warn!(ticker, error = %e, "Kalshi REST orderbook fetch failed");
+                return;
+            }
+            Err(_) => {
+                warn!(ticker, "Kalshi REST orderbook fetch timed out");
+                return;
+            }
+        };
+
+        if !resp.status().is_success() {
+            warn!(ticker, status = %resp.status(), "Kalshi REST orderbook returned non-2xx");
+            return;
+        }
+
+        let data: KalshiRestOrderbook = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(ticker, error = %e, "Failed to parse Kalshi REST orderbook response");
+                return;
+            }
+        };
+
+        let book = self.books.entry(ticker.to_string()).or_insert_with(KalshiOrderBook::new);
+        book.yes_bids.clear();
+        book.no_bids.clear();
+
+        // REST API returns prices in CENTS (integers 1-99)
+        // Convert to dollar format (divide by 100)
+        for entry in &data.orderbook.yes {
+            if entry.len() >= 2 {
+                let price_cents = entry[0].as_i64().unwrap_or(0);
+                let qty = entry[1].as_i64().unwrap_or(0);
+                if price_cents > 0 && price_cents < 100 && qty > 0 {
+                    let price = Decimal::from(price_cents) / Decimal::from(100);
+                    book.yes_bids.insert(price, Decimal::from(qty));
+                }
+            }
+        }
+
+        for entry in &data.orderbook.no {
+            if entry.len() >= 2 {
+                let price_cents = entry[0].as_i64().unwrap_or(0);
+                let qty = entry[1].as_i64().unwrap_or(0);
+                if price_cents > 0 && price_cents < 100 && qty > 0 {
+                    let price = Decimal::from(price_cents) / Decimal::from(100);
+                    book.no_bids.insert(price, Decimal::from(qty));
+                }
+            }
+        }
+
+        book.is_initialized = true;
+        book.seq = 0; // Will be updated on first WS delta
+
+        let yes_count = book.yes_bids.len();
+        let no_count = book.no_bids.len();
+
+        if let Some(tick) = self.emit_tick(ticker) {
+            info!(
+                ticker,
+                bid = %tick.bid_price,
+                ask = %tick.ask_price,
+                yes_levels = yes_count,
+                no_levels = no_count,
+                "Kalshi REST orderbook bootstrap successful — tick emitted"
+            );
+            let _ = tick_tx.send(tick);
+        } else {
+            tracing::debug!(ticker, yes_levels = yes_count, no_levels = no_count,
+                "Kalshi REST orderbook fetched but no valid BBO (market may have no resting orders)");
+        }
     }
 }
 
@@ -375,7 +493,6 @@ impl FeedHandler for KalshiFeed {
             "MERCURY/0.1.0".try_into().unwrap(),
         );
 
-        // Kalshi requires RSA-signed authentication headers on the WebSocket handshake
         let headers = auth.generate_ws_headers()?;
         for (key, val) in headers {
             use std::str::FromStr;
@@ -399,10 +516,7 @@ impl FeedHandler for KalshiFeed {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // FIX: Only subscribe to "orderbook_delta".
-        // "orderbook_snapshot" is NOT a valid channel name (error code 8).
-        // Kalshi automatically sends an orderbook_snapshot message immediately
-        // after a successful orderbook_delta subscription, then streams deltas.
+        // Subscribe to orderbook_delta for all known tickers
         let tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
         if !tickers.is_empty() {
             for chunk in tickers.chunks(50) {
@@ -427,23 +541,39 @@ impl FeedHandler for KalshiFeed {
             self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
         }
 
+        // Bootstrap all initial tickers via REST immediately.
+        // Kalshi DOES send automatic orderbook_snapshot on WS subscription,
+        // but fetching via REST ensures we have data right away without waiting
+        // for the WS snapshot to arrive (which can take several seconds).
+        {
+            let initial_tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
+            for ticker in &initial_tickers {
+                self.bootstrap_book_via_rest(ticker, &tick_tx).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !initial_tickers.is_empty() {
+                info!(count = initial_tickers.len(), "Bootstrapped initial Kalshi books via REST");
+            }
+        }
+
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         loop {
             tokio::select! {
-                msg_opt = read.next() => {
+                msg_opt = tokio::time::timeout(std::time::Duration::from_secs(90), read.next()) => {
                     let msg = match msg_opt {
-                        Some(Ok(m)) => m,
-                        Some(Err(e)) => return Err(e.into()),
-                        None => break,
+                        Ok(Some(Ok(m))) => m,
+                        Ok(Some(Err(e))) => return Err(e.into()),
+                        Ok(None) => break,
+                        Err(_) => return Err(anyhow::anyhow!("Kalshi read timeout")),
                     };
                     match msg {
                         Message::Text(text) => {
                             if let Err(e) = self.handle_message(&text, &tick_tx) {
                                 let es = e.to_string();
                                 if es.contains("sequence gap") || es.contains("snapshot first") {
-                                    return Err(e); // force reconnect
+                                    return Err(e);
                                 }
                                 tracing::warn!(error = %e, "Kalshi message handling non-fatal error");
                             }
@@ -479,7 +609,6 @@ impl FeedHandler for KalshiFeed {
                             if !new_tickers.is_empty() {
                                 info!(count = new_tickers.len(), tickers = ?new_tickers, "Dynamically subscribing to new Kalshi markets");
                                 for chunk in new_tickers.chunks(50) {
-                                    // FIX: Only "orderbook_delta" — never "orderbook_snapshot"
                                     let sub = KalshiSubscribe {
                                         id: 2,
                                         cmd: "subscribe".into(),
@@ -492,6 +621,15 @@ impl FeedHandler for KalshiFeed {
                                         let _ = write.send(Message::Text(msg_text.into())).await;
                                     }
                                 }
+
+                                // FIX: Bootstrap book state via REST for dynamically added tickers.
+                                // The Kalshi WS sends an orderbook_snapshot after subscribing, but
+                                // it can take several seconds. REST bootstrap ensures immediate data.
+                                for ticker in &new_tickers {
+                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                    self.bootstrap_book_via_rest(ticker, &tick_tx).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
                             }
                         }
                         Err(e) => warn!(error = %e, "Kalshi feed: DB refresh failed"),
@@ -503,3 +641,7 @@ impl FeedHandler for KalshiFeed {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "kalshi_tests.rs"]
+mod kalshi_tests;

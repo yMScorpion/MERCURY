@@ -872,7 +872,7 @@ async fn main() -> Result<()> {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("HFT Engine lagging! Missed {} feed ticks. Dropping old packets to recover.", n);
                         // 1.3.B FIX: Apply backpressure by pausing detection
-                        let pause_until = crate::types::now_ns() + 2_000_000_000; // Pause 2 seconds
+                        let pause_until = crate::types::now_ns() + 200_000_000; // Pause 200ms
                         detector.write().unwrap().pause_detection_until(pause_until);
                         continue;
                     }
@@ -909,6 +909,7 @@ async fn main() -> Result<()> {
                         tick.market_id,
                         rx,
                         opportunity_tx.clone(),
+                        alert_tx.clone(),
                         detector.clone(),
                         spread_engine.clone(),
                         bankroll_handle.clone(),
@@ -1026,6 +1027,11 @@ async fn main() -> Result<()> {
             // ── Trade Results ──
             Some(raw_result) = trade_result_rx.recv() => {
                 let result = bankroll_handle.process_trade(raw_result).await;
+
+                // Reliable notification delivery
+                if let Err(e) = alert_tx.send(AlertMessage::TradeComplete(Box::new(result.clone()))).await {
+                    error!(error = %e, "Failed to send trade notification");
+                }
 
                 let db_clone = db.clone();
                 let res_for_db = result.clone();
@@ -1264,9 +1270,13 @@ async fn main() -> Result<()> {
             }
         }
     }
-    // Abort all remaining tasks and wait for them to finish.
-    join_set.abort_all();
+    // Signal shutdown to all tasks
+    info!("Shutdown signal received. Starting graceful shutdown...");
+    cancel_token.cancel();
+    
+    // Wait for all tasks to finish cleanly.
     while join_set.join_next().await.is_some() {}
+    info!("All subsystems shutdown.");
 
     // HIGH-5 FIX: Final WAL checkpoint to ensure all recent writes are durable.
     // Without this, the last few minutes of trades/audit entries could be lost

@@ -1,13 +1,13 @@
 trading:
   kelly_fraction_multiplier: 0.25
-  min_net_spread_threshold: "0.02"
+  min_net_spread_threshold: "0.005"
   max_single_trade_pct: "0.02"
   max_daily_loss_pct: "0.03"
   max_drawdown_pct: "0.10"
   max_platform_exposure_pct: "0.40"
   stale_data_timeout_ms: 5000
   max_concurrent_arbs: 3
-  gas_price_max_gwei: 50
+  gas_price_max_gwei: 200
   rebalance_threshold_pct: "0.15"
   max_open_positions: 20
   initial_bankroll: "10000.00"

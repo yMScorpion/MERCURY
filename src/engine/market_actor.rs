@@ -28,6 +28,7 @@ pub struct MarketActor {
     open_positions: Arc<AtomicUsize>,
     in_flight_trades: Arc<AtomicUsize>,
     metrics: Arc<Metrics>,
+    alert_tx: mpsc::Sender<crate::types::AlertMessage>,
 }
 
 impl MarketActor {
@@ -35,6 +36,7 @@ impl MarketActor {
         market_id: Uuid,
         rx: mpsc::Receiver<NormalizedTick>,
         execution_tx: mpsc::Sender<ValidatedOpportunity>,
+        alert_tx: mpsc::Sender<crate::types::AlertMessage>,
         detector: Arc<std::sync::RwLock<ArbitrageDetector>>,
         spread_engine: Arc<RwLock<NetSpreadEngine>>,
         bankroll: BankrollHandle,
@@ -50,6 +52,7 @@ impl MarketActor {
             uob_shard: UnifiedOrderBook::new(),
             rx,
             execution_tx,
+            alert_tx,
             detector,
             spread_engine,
             bankroll,
@@ -68,43 +71,42 @@ impl MarketActor {
 
     async fn run(&mut self) {
         debug!(market_id = %self.market_id, "MarketActor started");
-         while let Some(tick) = self.rx.recv().await {
-            let mid = tick.mid_price;
-            let market_id = tick.market_id;
+
+        let alert_tx = self.alert_tx.clone();
+        let metrics = self.metrics.clone();
+        let open_positions = self.open_positions.clone();
+        let in_flight_trades = self.in_flight_trades.clone();
+        let bankroll = self.bankroll.clone();
+        let execution_tx = self.execution_tx.clone();
+        let circuit_breakers = self.circuit_breakers.clone();
+        let kelly = self.kelly.clone();
+        let detector = self.detector.clone();
+        let market_id = self.market_id;
+
+        while let Some(tick) = self.rx.recv().await {
             self.uob_shard.update(&tick);
-
-            debug!(
-                market_id = %market_id,
-                platform = ?tick.platform,
-                bid = %tick.bid_price,
-                ask = %tick.ask_price,
-                mid = %mid,
-                bid_size = %tick.bid_size,
-                ask_size = %tick.ask_size,
-                "Tick received — running arb detection"
-            );
-
-            // Update volatility before detection so the gate uses current vol multiplier
-            self.detector.write().unwrap().update_volatility(market_id, mid);
+            self.metrics.inc_ticks_for_platform(tick.platform);
 
             let opps = {
-                self.detector.read().unwrap().detect_for_market(
-                    &self.market_id,
+                detector.read().unwrap().detect_for_market(
+                    &market_id,
                     &self.registry.read().unwrap(),
                     &self.uob_shard,
                     &self.spread_engine.read().unwrap(),
-                    rust_decimal_macros::dec!(10_000.0) // Evaluate deep liquidity, sizing capped downstream by Kelly
+                    rust_decimal_macros::dec!(10_000.0)
                 )
             };
 
-            for opp in opps {
-                let bankroll = self.bankroll.clone();
-                let exec_tx = self.execution_tx.clone();
-                let cbs = self.circuit_breakers.clone();
-                let kelly = self.kelly.clone();
-                let open_positions = self.open_positions.clone();
-                let in_flight_trades = self.in_flight_trades.clone();
-                let metrics = self.metrics.clone();
+            for o in &opps {
+                let opp = o.clone();
+                let bankroll = bankroll.clone();
+                let exec_tx = execution_tx.clone();
+                let cbs = circuit_breakers.clone();
+                let kelly = kelly.clone();
+                let open_positions = open_positions.clone();
+                let in_flight_trades = in_flight_trades.clone();
+                let metrics = metrics.clone();
+                let alert_tx = alert_tx.clone();
                 
                 tokio::spawn(async move {
                     // Pre-flight TTL check before spending bankroll actor capacity
@@ -179,7 +181,7 @@ impl MarketActor {
 
                     // 3. Evaluate 10-Gate Circuit Breakers
                     let combined_price = opp.leg_a.price + opp.leg_b.price;
-                    let passed_cbs = {
+                    let (passed_cbs, violations) = {
                         let mut cb_guard = cbs.write().unwrap();
                         let params = CheckParams {
                             trade_size: approved_size * combined_price, // Convert contracts to USD notional
@@ -193,16 +195,26 @@ impl MarketActor {
                             market_exposure_pct: state.market_exposure_pct,
                             total_exposure_pct: state.total_exposure_pct,
                         };
-                        cb_guard.check_all(&params).is_empty()
+                        let v = cb_guard.check_all(&params);
+                        (v.is_empty(), v)
                     };
 
                     if !passed_cbs {
+                        let violations_msg = format!("{:?}", violations);
                         warn!(
                             opp_id = %opp.opp_id,
                             market_id = %opp.market_id,
                             approved_size = %approved_size,
+                            ?violations,
                             "Opportunity BLOCKED by circuit breakers"
                         );
+                        let _ = alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
+                            severity: "warning".into(),
+                            message: format!(
+                                "Opportunity {} BLOCKED by circuit breakers on market {}: {}",
+                                opp.opp_id, opp.market_id, violations_msg
+                            ),
+                        });
                         return;
                     }
 

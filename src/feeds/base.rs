@@ -45,42 +45,40 @@ pub async fn run_with_reconnect(
         info!(%platform, "Connecting feed handler");
         let _ = liveness_tx.send((platform, true)).await; // Mark Alive
         
-        let connect_time = std::time::Instant::now();
+        let _connect_time = std::time::Instant::now();
 
-        tokio::select! {
+        // Run the connection until cancelled or terminated
+        let result = tokio::select! {
             _ = token.cancelled() => {
-                info!(%platform, "Feed handler cancelled via token");
-                break;
+                info!(%platform, "Feed handler cancelled");
+                Ok(())
             }
-            result = handler.connect_and_run(tick_tx.clone()) => {
-                handler.clear_books();
-                let _ = liveness_tx.send((platform, false)).await; // Mark Dead
+            res = handler.connect_and_run(tick_tx.clone()) => {
+                res
+            }
+        };
 
-                // Reset backoff only if the connection survived for at least 60 seconds
-                if connect_time.elapsed().as_secs() > 60 {
-                    backoff_secs = 1;
-                    consecutive_failures = 0;
-                    max_backoff = 5;
-                }
+        handler.clear_books();
+        let _ = liveness_tx.send((platform, false)).await; // Mark Dead
 
-                match result {
-                    Ok(()) => {
-                        info!(%platform, "Feed handler disconnected cleanly — books cleared");
-                    }
-                    Err(e) => {
-                        error!(%platform, error = %e, "Feed handler error — books cleared");
-                        // Alert IMMEDIATELY on disconnect — the orchestrator must
-                        // halt trading on this platform until the book is rebuilt.
-                        // Use try_send (non-blocking) to avoid blocking the reconnect loop.
-                        let _ = alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
-                            severity: "critical".into(),
-                            message: format!(
-                                "{platform} feed DISCONNECTED — market data is stale, \
-                                 trading halted on this platform until reconnect and book rebuild: {e}"
-                            ),
-                        });
-                    }
-                }
+        if token.is_cancelled() {
+            info!(%platform, "Feed handler exited cleanly after cancellation");
+            break;
+        }
+
+        match result {
+            Ok(()) => {
+                info!(%platform, "Feed handler disconnected cleanly — books cleared");
+            }
+            Err(e) => {
+                error!(%platform, error = %e, "Feed handler error — books cleared");
+                let _ = alert_tx.try_send(crate::types::AlertMessage::SystemAlert {
+                    severity: "critical".into(),
+                    message: format!(
+                        "{platform} feed DISCONNECTED — market data is stale, \
+                            trading halted on this platform until reconnect and book rebuild: {e}"
+                    ),
+                });
             }
         }
 
