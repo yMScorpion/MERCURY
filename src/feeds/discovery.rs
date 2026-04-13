@@ -360,9 +360,10 @@ impl MarketDiscovery {
             _ => return None,
         };
 
-        // Fetch both open and settled markets to identify the current round
+        // Fetch only open markets. limit=5 is sufficient since 15m markets roll
+        // every 900s and we only care about the current and next rounds.
         let url = format!(
-            "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker={}&limit=10",
+            "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker={}&status=open&limit=5",
             series_prefix
         );
 
@@ -393,7 +394,10 @@ impl MarketDiscovery {
         let markets = data.get("markets").and_then(|v| v.as_array())?;
 
         let target_close_ts = round_start_ts + 900;
-        let slack: i64 = 120;
+        // 300s slack: covers late discovery cycles and minor clock skew between
+        // MERCURY and Kalshi servers. Safe because 15m markets are 900s long —
+        // a 300s window cannot accidentally match the wrong round.
+        let slack: i64 = 300;
 
         for market in markets {
             let close_time_str = market.get("close_time").and_then(|v| v.as_str())?;

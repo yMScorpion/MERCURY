@@ -76,6 +76,9 @@ pub struct PolymarketFeed {
     resolved_markets: std::collections::HashSet<Uuid>,
     condition_id_to_uuid: std::collections::HashMap<String, Uuid>,
     pending_unsub_tokens: Vec<String>,
+    /// Tokens discovered via new_market WS events that need a DynamicSubscription
+    /// sent on the next sync_interval tick.
+    pending_new_tokens: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -155,6 +158,12 @@ struct WsMessage {
     question: Option<String>,
     #[serde(default)]
     winning_asset_id: Option<String>,
+    /// YES/NO token IDs from new_market / market_resolved events.
+    #[serde(default)]
+    assets_ids: Option<Vec<String>>,
+    /// Condition ID — also in "condition_id" field of new_market events.
+    #[serde(default)]
+    condition_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -243,6 +252,7 @@ impl PolymarketFeed {
             resolved_markets: std::collections::HashSet::new(),
             condition_id_to_uuid: std::collections::HashMap::new(),
             pending_unsub_tokens: Vec::new(),
+            pending_new_tokens: Vec::new(),
         }
     }
 
@@ -399,17 +409,22 @@ impl PolymarketFeed {
             }
 
             "best_bid_ask" => {
+                // best_bid_ask carries BBO price only — no size. Never wipe the book.
+                // The depth from REST bootstrap / prior `book` snapshots must survive.
                 let asset_id = if !msg.asset_id.is_empty() { msg.asset_id.clone() } else { return Ok(()) };
                 if let (Some(best_bid_str), Some(best_ask_str)) = (&msg.best_bid, &msg.best_ask) {
                     if let (Ok(bid), Ok(ask)) = (Decimal::from_str(best_bid_str), Decimal::from_str(best_ask_str)) {
+                        if bid <= Decimal::ZERO || ask <= Decimal::ZERO || bid >= ask {
+                            return Ok(());  // crossed/stale BBO — ignore
+                        }
                         if let Some(book) = self.books.get_mut(&asset_id) {
-                            book.bids.clear();
-                            book.bids.insert(bid, Decimal::ONE); // Best Bids don't have size in best_bid_ask event, using 1 as proxy
-                            book.asks.clear();
-                            book.asks.insert(ask, Decimal::ONE); // Best Asks don't have size in best_bid_ask event
-                            book.last_trade_price = (bid + ask) / Decimal::from(2);
-                            
-                            if let Some(mut tick) = self.emit_tick(&asset_id) {
+                            // Trim levels that are now crossed by the updated BBO.
+                            book.bids.retain(|&p, _| p <= bid);
+                            book.asks.retain(|&p, _| p >= ask);
+                            // Ensure the BBO level exists with at least a sentinel size.
+                            book.bids.entry(bid).or_insert(Decimal::ONE);
+                            book.asks.entry(ask).or_insert(Decimal::ONE);
+                            if let Some(tick) = self.emit_tick(&asset_id) {
                                 let _ = tick_tx.send(tick);
                             }
                         }
@@ -477,7 +492,25 @@ impl PolymarketFeed {
 
             "new_market" => {
                 let question = msg.question.as_deref().unwrap_or("unknown");
-                info!(market_id = %msg.market, %question, "New market detected");
+                info!(market_id = %msg.market, question = %question, "New market detected");
+                // Pre-register YES/NO token IDs from assets_ids so the feed is ready
+                // to receive ticks as soon as the market opens, without waiting for
+                // the next discovery polling cycle.
+                if let Some(ref ids) = msg.assets_ids {
+                    if ids.len() >= 2 {
+                        let yes_token = ids[0].clone();
+                        let no_token  = ids[1].clone();
+                        let pair = format!("{},{}", yes_token, no_token);
+                        if !self.subscriptions.contains_key(&pair) {
+                            let placeholder_id = uuid::Uuid::new_v4();
+                            self.subscriptions.insert(pair, placeholder_id);
+                            self.fee_rates.insert(yes_token.clone(), 200);
+                            self.yes_token_to_market.insert(yes_token.clone(), placeholder_id);
+                            self.books.entry(yes_token.clone()).or_insert_with(LocalOrderBook::new);
+                            self.pending_new_tokens.push(yes_token);
+                        }
+                    }
+                }
             }
 
             "tick_size_change" => {
@@ -874,6 +907,14 @@ impl FeedHandler for PolymarketFeed {
                                 if let Ok(msg_text) = serde_json::to_string(&unsub) {
                                     let _ = write.send(Message::Text(msg_text.into())).await;
                                 }
+                            }
+                        }
+
+                        // Flush tokens pre-registered from new_market WS events.
+                        let pending: Vec<String> = std::mem::take(&mut self.pending_new_tokens);
+                        for token in pending {
+                            if !new_yes_tokens.contains(&token) {
+                                new_yes_tokens.push(token);
                             }
                         }
 
