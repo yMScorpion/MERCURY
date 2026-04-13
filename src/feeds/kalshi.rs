@@ -555,10 +555,13 @@ impl KalshiFeed {
             }
         }
 
-        // Bootstrap books via REST for the newly subscribed tickers
-        for ticker in new_tickers {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            self.bootstrap_book_via_rest(ticker, tick_tx).await;
+        // Bootstrap books via REST for newly subscribed tickers.
+        // Process in batches of 3 with 300ms between batches to stay within REST rate limits.
+        for chunk in new_tickers.chunks(3) {
+            for ticker in chunk {
+                self.bootstrap_book_via_rest(ticker, tick_tx).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     }
 
@@ -695,14 +698,18 @@ impl FeedHandler for KalshiFeed {
             self.books.entry(ticker.clone()).or_insert_with(KalshiOrderBook::new);
         }
 
-        // Bootstrap books via REST immediately for initial tickers
+        // Bootstrap books via REST for initial tickers.
+        // Rate-limit to 3 concurrent requests with 200ms inter-request delay to avoid
+        // triggering Kalshi's REST rate limiter during reconnect storms.
         {
             let initial_tickers: Vec<String> = self.subscriptions.keys().cloned().collect();
-            for ticker in &initial_tickers {
-                self.bootstrap_book_via_rest(ticker, &tick_tx).await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
             if !initial_tickers.is_empty() {
+                for chunk in initial_tickers.chunks(3) {
+                    for ticker in chunk {
+                        self.bootstrap_book_via_rest(ticker, &tick_tx).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
                 info!(count = initial_tickers.len(), "Bootstrapped initial Kalshi books via REST");
             }
         }

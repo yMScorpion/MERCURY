@@ -1,15 +1,71 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use std::collections::HashMap;
 use crate::types::Platform;
+
+/// Per-platform flat atomics — zero lock contention on the hot tick path.
+#[derive(Debug)]
+pub struct PerPlatformCounters {
+    pub ticks_polymarket: AtomicU64,
+    pub ticks_kalshi: AtomicU64,
+    pub ticks_cdna: AtomicU64,
+    pub ticks_forecastex: AtomicU64,
+    pub last_ns_polymarket: AtomicU64,
+    pub last_ns_kalshi: AtomicU64,
+    pub last_ns_cdna: AtomicU64,
+    pub last_ns_forecastex: AtomicU64,
+}
+
+impl PerPlatformCounters {
+    fn new() -> Self {
+        Self {
+            ticks_polymarket: AtomicU64::new(0),
+            ticks_kalshi: AtomicU64::new(0),
+            ticks_cdna: AtomicU64::new(0),
+            ticks_forecastex: AtomicU64::new(0),
+            last_ns_polymarket: AtomicU64::new(0),
+            last_ns_kalshi: AtomicU64::new(0),
+            last_ns_cdna: AtomicU64::new(0),
+            last_ns_forecastex: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn inc_ticks(&self, platform: Platform, now_ns: u64) {
+        match platform {
+            Platform::Polymarket | Platform::PolymarketUs => {
+                self.ticks_polymarket.fetch_add(1, Ordering::Relaxed);
+                self.last_ns_polymarket.store(now_ns, Ordering::Relaxed);
+            }
+            Platform::Kalshi => {
+                self.ticks_kalshi.fetch_add(1, Ordering::Relaxed);
+                self.last_ns_kalshi.store(now_ns, Ordering::Relaxed);
+            }
+            Platform::Cdna => {
+                self.ticks_cdna.fetch_add(1, Ordering::Relaxed);
+                self.last_ns_cdna.store(now_ns, Ordering::Relaxed);
+            }
+            Platform::ForecastEx => {
+                self.ticks_forecastex.fetch_add(1, Ordering::Relaxed);
+                self.last_ns_forecastex.store(now_ns, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn last_ns(&self, platform: Platform) -> u64 {
+        match platform {
+            Platform::Polymarket | Platform::PolymarketUs => self.last_ns_polymarket.load(Ordering::Relaxed),
+            Platform::Kalshi => self.last_ns_kalshi.load(Ordering::Relaxed),
+            Platform::Cdna => self.last_ns_cdna.load(Ordering::Relaxed),
+            Platform::ForecastEx => self.last_ns_forecastex.load(Ordering::Relaxed),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Metrics {
     pub ticks_received: AtomicU64,
-    pub ticks_per_platform: std::sync::RwLock<HashMap<Platform, AtomicU64>>,
-    pub last_tick_ns_per_platform: std::sync::RwLock<HashMap<Platform, AtomicU64>>,
-    pub reconnects_per_platform: std::sync::RwLock<HashMap<Platform, AtomicU32>>,
+    pub per_platform: PerPlatformCounters,
     pub spreads_evaluated: AtomicU64,
     pub opportunities_detected: AtomicU64,
     pub opportunities_executed: AtomicU64,
@@ -23,21 +79,9 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Arc<Self> {
-        let platforms = vec![Platform::Polymarket, Platform::Kalshi, Platform::Cdna, Platform::ForecastEx];
-        let mut ticks = HashMap::new();
-        let mut last_ticks = HashMap::new();
-        let mut reconnects = HashMap::new();
-        for p in platforms {
-            ticks.insert(p, AtomicU64::new(0));
-            last_ticks.insert(p, AtomicU64::new(0));
-            reconnects.insert(p, AtomicU32::new(0));
-        }
-
         Arc::new(Self {
             ticks_received: AtomicU64::new(0),
-            ticks_per_platform: std::sync::RwLock::new(ticks),
-            last_tick_ns_per_platform: std::sync::RwLock::new(last_ticks),
-            reconnects_per_platform: std::sync::RwLock::new(reconnects),
+            per_platform: PerPlatformCounters::new(),
             spreads_evaluated: AtomicU64::new(0),
             opportunities_detected: AtomicU64::new(0),
             opportunities_executed: AtomicU64::new(0),
@@ -51,21 +95,15 @@ impl Metrics {
     }
 
     pub fn uptime_secs(&self) -> u64 { self.start_time.elapsed().as_secs() }
-    pub fn inc_ticks_for_platform(&self, platform: crate::types::Platform) {
+
+    #[inline]
+    pub fn inc_ticks_for_platform(&self, platform: Platform) {
         self.ticks_received.fetch_add(1, Ordering::Relaxed);
         let now = crate::types::now_ns();
         self.last_tick_ns.store(now, Ordering::Relaxed);
-        if let Ok(map) = self.last_tick_ns_per_platform.read() {
-            if let Some(counter) = map.get(&platform) {
-                counter.store(now, Ordering::Relaxed);
-            }
-        }
-        if let Ok(map) = self.ticks_per_platform.read() {
-            if let Some(counter) = map.get(&platform) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        self.per_platform.inc_ticks(platform, now);
     }
+
     pub fn inc_spreads(&self) { self.spreads_evaluated.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_detected(&self) { self.opportunities_detected.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_executed(&self) { self.opportunities_executed.fetch_add(1, Ordering::Relaxed); }
@@ -74,12 +112,10 @@ impl Metrics {
     pub fn inc_reconnects(&self) { self.ws_reconnects.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_api_errors(&self) { self.api_errors.fetch_add(1, Ordering::Relaxed); }
 
-       /// Returns milliseconds since the last tick was received, or u64::MAX if none received yet.
+    /// Returns milliseconds since the last tick was received, or u64::MAX if none received yet.
     pub fn ms_since_last_tick(&self) -> u64 {
         let last = self.last_tick_ns.load(Ordering::Relaxed);
-        if last == 0 {
-            return u64::MAX;
-        }
+        if last == 0 { return u64::MAX; }
         let now = crate::types::now_ns();
         now.saturating_sub(last) / 1_000_000
     }

@@ -778,19 +778,19 @@ impl FeedHandler for PolymarketFeed {
         }
 
         // Bootstrap books for initially subscribed markets via REST.
-        // The WS server sends automatic book snapshots for initial subscriptions,
-        // but we fetch REST anyway to ensure we have data immediately rather than
-        // waiting for the first WS push (which may not come if no one is trading).
+        // Batched at 5 per 250ms to stay within Polymarket's REST rate limits
+        // during reconnect storms with many subscribed markets.
         {
             let initial_tokens: Vec<String> = self.subscriptions.keys()
                 .map(|a| yes_token_from_pair(a))
                 .collect();
-            for token in &initial_tokens {
-                self.bootstrap_book_via_rest(token, &tick_tx).await;
-                // Small delay to avoid hammering the REST API
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
             if !initial_tokens.is_empty() {
+                for chunk in initial_tokens.chunks(5) {
+                    for token in chunk {
+                        self.bootstrap_book_via_rest(token, &tick_tx).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
                 info!(count = initial_tokens.len(), "Bootstrapped initial Polymarket books via REST");
             }
         }

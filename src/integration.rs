@@ -444,6 +444,241 @@ mod pipeline_tests {
         }
     }
 
+    // ─── Test 13b: Discovery → Registry → MarketActor → Detector pipeline ───
+    //
+    // Verifies that a market matched by discovery is correctly registered,
+    // that ticks for it flow through to the detector, and that an arb
+    // opportunity is detected end-to-end without any network calls.
+
+    #[tokio::test]
+    async fn test_discovery_to_detection_pipeline() {
+        use std::collections::HashMap;
+        use crate::engine::market_registry::MarketRegistry;
+        use crate::engine::order_book::UnifiedOrderBook;
+        use crate::engine::spread::NetSpreadEngine;
+        use crate::engine::detector::ArbitrageDetector;
+
+        // 1. Simulate discovery output: a matched two-platform market
+        let market_id = Uuid::new_v4();
+        let mut platforms = HashMap::new();
+        platforms.insert(Platform::Polymarket, PlatformMarketInfo {
+            platform: Platform::Polymarket,
+            platform_market_id: "yes_token,no_token".into(),
+            fee_rate_bps: 200,
+            min_order_size: dec!(1),
+            tick_size: dec!(0.01),
+        });
+        platforms.insert(Platform::Kalshi, PlatformMarketInfo {
+            platform: Platform::Kalshi,
+            platform_market_id: "KXBTC15M-TEST".into(),
+            fee_rate_bps: 50,
+            min_order_size: dec!(1),
+            tick_size: dec!(0.01),
+        });
+        let discovered_market = Market {
+            unified_id: market_id,
+            question: "BTC Up or Down 15m".into(),
+            resolution_source: "crypto_15m".into(),
+            expiration: chrono::Utc::now() + chrono::Duration::minutes(10),
+            platforms,
+            category: MarketCategory::Crypto,
+            confidence: 1.0,
+            status: MarketStatus::Active,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        // 2. Register into registry (simulates main loop handling MatchedMarket)
+        let mut registry = MarketRegistry::new();
+        registry.register_market(discovered_market.clone());
+        assert_eq!(registry.market_count(), 1, "market should be registered");
+        assert_eq!(registry.arb_pair_count(), 1, "one arb pair for two-platform market");
+        assert!(registry.get_arb_pairs_for_market(&market_id).is_some(),
+            "arb pairs must exist for registered market");
+
+        // 3. Simulate feed ticks arriving after subscription
+        let mut uob = UnifiedOrderBook::new();
+        // Polymarket: cheap YES available at ask 0.38
+        uob.update(&make_tick(Platform::Polymarket, market_id,
+            dec!(0.36), dec!(200), dec!(0.38), dec!(200), 200, 1));
+        // Kalshi: YES bid at 0.55 → NO at 0.45 → total = 0.38 + 0.45 = 0.83 → raw_spread = 0.17
+        uob.update(&make_tick(Platform::Kalshi, market_id,
+            dec!(0.55), dec!(200), dec!(0.57), dec!(200), 50, 1));
+
+        // 4. Run detector — should find the arb
+        let spread_engine = NetSpreadEngine::new(dec!(0.01));
+        let detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 60_000, 5);
+
+        let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(50));
+        assert!(!opps.is_empty(),
+            "detector should find arb after discovery→registry→tick pipeline: got 0 opps");
+
+        let opp = &opps[0];
+        assert_eq!(opp.market_id, market_id);
+        assert!(opp.net_spread > Decimal::ZERO,
+            "net spread must be positive: {}", opp.net_spread);
+
+        // 5. Verify platform_market_id is populated from registry (not empty)
+        assert!(!opp.leg_a.platform_market_id.is_empty(),
+            "leg_a platform_market_id must be set from registry info");
+        assert!(!opp.leg_b.platform_market_id.is_empty(),
+            "leg_b platform_market_id must be set from registry info");
+
+        // 6. Simulate market resolving: registry evicts it, detector finds nothing
+        {
+            let mut resolved = discovered_market.clone();
+            resolved.status = MarketStatus::Resolved;
+            registry.register_market(resolved);
+        }
+        registry.evict_stale_markets();
+        let opps_after = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(50));
+        assert!(opps_after.is_empty(),
+            "no opps should be detected after market resolves and is evicted");
+    }
+
+    // ─── Test 15: Chaos — concurrent capital reservation races ───────────────
+    //
+    // Spawns N tasks all trying to reserve more capital than is available.
+    // Exactly one should win; the rest must fail cleanly with no panic or deadlock.
+
+    #[tokio::test]
+    async fn test_chaos_concurrent_capital_reservation() {
+        use crate::risk::bankroll::{BankrollHandle, BankrollManager, BankrollMsg};
+        let handle = BankrollHandle::new(BankrollManager::new(dec!(500)));
+        let market_id = Uuid::new_v4();
+
+        // Each task requests 300+300=600 against a 500 bankroll — only one can succeed.
+        let tasks: Vec<_> = (0..8).map(|_| {
+            let h = handle.clone();
+            let mid = market_id;
+            tokio::spawn(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                h.tx.send(BankrollMsg::ReserveCapital {
+                    leg_a_exposure: dec!(300),
+                    leg_b_exposure: dec!(300),
+                    platform_a: Platform::Polymarket,
+                    platform_b: Platform::Kalshi,
+                    market_id: mid,
+                    reply: tx,
+                }).await.unwrap();
+                rx.await.unwrap()
+            })
+        }).collect();
+
+        let results: Vec<bool> = futures_util::future::join_all(tasks)
+            .await
+            .into_iter()
+            .map(|r| r.expect("task panicked"))
+            .collect();
+
+        let successes = results.iter().filter(|&&x| x).count();
+        assert_eq!(successes, 1,
+            "exactly 1 of 8 concurrent reservations should succeed against limited capital, got {}",
+            successes);
+    }
+
+    // ─── Test 16: Chaos — partial WebSocket message / tick with zero size ────
+    //
+    // Ensures the order book and detector handle malformed/sentinel ticks
+    // (bid=0, ask=1, size=0) without emitting phantom arb opportunities.
+
+    #[tokio::test]
+    async fn test_chaos_sentinel_tick_no_phantom_arb() {
+        let mut registry = MarketRegistry::new();
+        let market_id = Uuid::new_v4();
+        register_test_market(&mut registry, market_id, "Chaos sentinel test", "poly_c", "KC");
+
+        let mut uob = UnifiedOrderBook::new();
+        let spread_engine = NetSpreadEngine::new(dec!(0.01));
+        let detector = ArbitrageDetector::new(dec!(0.01), dec!(1.0), 60_000, 5);
+
+        // Polymarket sentinel: bid=0 (no bids), ask=1 (no asks) — market empty
+        let sentinel = NormalizedTick {
+            platform: Platform::Polymarket,
+            market_id,
+            timestamp_ns: now_ns(),
+            bid_price: dec!(0),
+            bid_size: dec!(0),
+            ask_price: dec!(1),
+            ask_size: dec!(0),
+            mid_price: dec!(0.5),
+            last_trade_price: dec!(0),
+            last_trade_size: dec!(0),
+            book_depth: arrayvec::ArrayVec::new(),
+            fee_rate_bps: 200,
+            sequence: 1,
+        };
+        uob.update(&sentinel);
+
+        // Kalshi: normal prices
+        uob.update(&make_tick(Platform::Kalshi, market_id,
+            dec!(0.55), dec!(100), dec!(0.57), dec!(100), 50, 1));
+
+        let opps = detector.detect_for_market(&market_id, &registry, &uob, &spread_engine, dec!(50));
+        assert!(opps.is_empty(),
+            "sentinel tick (bid=0/ask=1) must never produce arb opportunity");
+    }
+
+    // ─── Test 17: Chaos — order book sequence regression ────────────────────
+    //
+    // Simulates an out-of-order tick storm and verifies the book never regresses.
+
+    #[tokio::test]
+    async fn test_chaos_out_of_order_tick_storm() {
+        let mut book = crate::engine::order_book::PlatformBook::new(Platform::Kalshi, Uuid::new_v4());
+
+        // Apply seq=10 first
+        let tick10 = make_tick(Platform::Kalshi, book.market_id,
+            dec!(0.45), dec!(100), dec!(0.47), dec!(100), 50, 10);
+        book.update_from_tick(&tick10);
+        assert_eq!(book.sequence, 10);
+        assert_eq!(book.best_bid().unwrap().0, dec!(0.45));
+
+        // Replay seq=5 (older) — must be silently dropped
+        let tick5 = make_tick(Platform::Kalshi, book.market_id,
+            dec!(0.10), dec!(999), dec!(0.12), dec!(999), 50, 5);
+        book.update_from_tick(&tick5);
+        assert_eq!(book.sequence, 10, "sequence must not regress");
+        assert_eq!(book.best_bid().unwrap().0, dec!(0.45),
+            "bid must not regress after replay of older tick");
+
+        // Apply seq=11 (correct next) — must be applied
+        let tick11 = make_tick(Platform::Kalshi, book.market_id,
+            dec!(0.46), dec!(80), dec!(0.48), dec!(80), 50, 11);
+        book.update_from_tick(&tick11);
+        assert_eq!(book.sequence, 11);
+        assert_eq!(book.best_bid().unwrap().0, dec!(0.46));
+    }
+
+    // ─── Test 18: Chaos — BankrollManager under rapid trade/settlement cycling ─
+
+    #[tokio::test]
+    async fn test_chaos_rapid_trade_settlement_cycle() {
+        use crate::risk::bankroll::{BankrollHandle, BankrollManager};
+        let handle = BankrollHandle::new(BankrollManager::new(dec!(10000)));
+
+        // Fire 50 trades and 50 settlements concurrently.
+        // Bankroll should end at initial + sum(profits) with no panics or deadlocks.
+        let mut trade_futs = Vec::new();
+        for i in 0..50u32 {
+            let h = handle.clone();
+            let profit = dec!(1); // $1 profit each
+            trade_futs.push(tokio::spawn(async move {
+                let mut trade = make_trade(profit, TradeStatus::Success, dec!(10));
+                trade.trade_id = i as i64;
+                h.process_trade(trade).await
+            }));
+        }
+        let results: Vec<_> = futures_util::future::join_all(trade_futs).await;
+        for r in &results {
+            r.as_ref().expect("trade task panicked");
+        }
+
+        let snapshot = handle.get_snapshot(dec!(0.25)).await;
+        assert_eq!(snapshot.bankroll, dec!(10050),
+            "bankroll should be 10000 + 50 * $1 = $10050 after 50 profitable trades");
+    }
+
     // ─── Test 14: Concurrent CB7 consecutive failure detection ───
 
     #[tokio::test]

@@ -82,14 +82,11 @@ async fn handle_health_request(
             use crate::types::Platform;
             let platforms = [Platform::Polymarket, Platform::Kalshi, Platform::Cdna, Platform::ForecastEx];
             let platform_json = {
-                let last_ticks = metrics.last_tick_ns_per_platform.read().unwrap();
                 let now_ns = crate::types::now_ns();
                 let mut json = String::from("{");
                 for (i, plat) in platforms.iter().enumerate() {
-                    let ms = if let Some(last) = last_ticks.get(plat) {
-                        let last_val = last.load(std::sync::atomic::Ordering::Relaxed);
-                        if last_val == 0 { u64::MAX } else { now_ns.saturating_sub(last_val) / 1_000_000 }
-                    } else { u64::MAX };
+                    let last_val = metrics.per_platform.last_ns(*plat);
+                    let ms = if last_val == 0 { u64::MAX } else { now_ns.saturating_sub(last_val) / 1_000_000 };
                     let plat_status = if ms < stale_timeout_ms || ms == u64::MAX { "healthy" } else { "degraded" };
                     let ms_str = if ms == u64::MAX { "null".to_string() } else { ms.to_string() };
                     let plat_name = format!("{}", plat).to_lowercase().replace(' ', "_");
@@ -101,7 +98,7 @@ async fn handle_health_request(
                 }
                 json.push('}');
                 json
-            }; // RwLockReadGuard dropped here, before any .await
+            };
 
             let body = format!(
                 r#"{{"status":"{}","uptime_secs":{},"ms_since_last_tick":{},"platforms":{}}}"#,

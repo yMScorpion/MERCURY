@@ -1160,8 +1160,11 @@ async fn main() -> Result<()> {
 
                 let _ = in_flight_trades.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(1)));
 
+                // Only decrement on Fail here. On Success/Partial the position stays open
+                // until settlement; the settlement handler decrements it then.
+                // This is the single authoritative decrement path for failed trades.
                 if result.status == TradeStatus::Fail {
-                    let _ = cached_open_positions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(1)));
+                    cached_open_positions.fetch_sub(1, Ordering::Relaxed);
                 }
 
                 if let Err(e) = trade_result_tx2.try_send(result.clone()) {
@@ -1185,9 +1188,11 @@ async fn main() -> Result<()> {
             }
 
             // ── Settlement PnL Sink ──
+            // Settlement is the authoritative close event for successful/partial trades.
+            // Decrement here is the single path for non-failed trade position close.
             Some(settlement) = settlement_rx.recv() => {
                 bankroll_handle.record_settlement(settlement).await;
-                let _ = cached_open_positions.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(1)));
+                cached_open_positions.fetch_sub(1, Ordering::Relaxed);
             }
 
             // ── Periodic State Sync ──
@@ -1204,13 +1209,11 @@ async fn main() -> Result<()> {
                 }
 
                 if let Ok(count) = db.get_open_arb_count().await {
-                    // DB count is ground truth for settled positions. In-flight trades are tracked
-                    // separately by in_flight_trades counter. We deliberately do NOT add in_flight
-                    // here because the trade result handler already adjusts cached_open_positions.
-                    // Only sync the DB-confirmed count to correct any drift from missed decrements.
-                    let current_in_flight = in_flight_trades.load(Ordering::Relaxed);
-                    let total = count.saturating_add(current_in_flight);
-                    cached_open_positions.store(total, Ordering::Relaxed);
+                    // Use DB as the single source of truth for open position count.
+                    // The in-memory counter can drift due to missed decrements on panics;
+                    // this periodic sync corrects it. We do NOT add in_flight_trades here
+                    // because in-flight opportunities have not yet produced DB-confirmed positions.
+                    cached_open_positions.store(count, Ordering::Relaxed);
                 }
 
                 let (detected, passed, gate1, gate2, gate3, gate4, gate5) = {

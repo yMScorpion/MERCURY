@@ -151,22 +151,42 @@ async fn test_process_trade_failure_releases_exposure() {
         "exposure should be released after failed trade, got {}", state.platform_a_exposure_pct);
 }
 
-// ─── F6: RecordSettlement increments bankroll and updates peak ───────────────
+// ─── F6: RecordSettlement frees exposure but does NOT change bankroll ─────────
+// Profit is booked at execution time via ProcessTrade. Settlement only releases
+// the capital that was reserved when the position was opened.
 
 #[tokio::test]
-async fn test_record_settlement_updates_bankroll_and_peak() {
+async fn test_record_settlement_frees_exposure_not_bankroll() {
     let handle = make_handle(dec!(1000));
+
+    // First reserve capital so we have something to free.
+    let market_id = Uuid::new_v4();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle.tx.send(BankrollMsg::ReserveCapital {
+        leg_a_exposure: dec!(100),
+        leg_b_exposure: dec!(100),
+        platform_a: Platform::Polymarket,
+        platform_b: Platform::Kalshi,
+        market_id,
+        reply: reply_tx,
+    }).await.unwrap();
+    assert!(reply_rx.await.unwrap(), "reserve should succeed");
+
+    // Settle one leg — exposure freed, bankroll unchanged.
     handle.record_settlement(crate::types::SettlementResult {
-        realized_pnl: dec!(50),
+        realized_pnl: dec!(50), // ignored by record_settlement
         platform: Platform::Polymarket,
-        market_id: Uuid::new_v4(),
+        market_id,
         quantity: dec!(10),
-        avg_entry_price: dec!(0.5),
+        avg_entry_price: dec!(0.5), // frees 10 * 0.5 = 5 exposure
     }).await;
 
     let snapshot = handle.get_snapshot(dec!(0.25)).await;
-    assert_eq!(snapshot.bankroll, dec!(1050), "bankroll should be 1050 after settlement");
-    assert_eq!(snapshot.peak_bankroll, dec!(1050), "peak should update to 1050");
+    assert_eq!(snapshot.bankroll, dec!(1000),
+        "bankroll must NOT change on settlement — profit is booked at trade time");
+    // Peak also unchanged since bankroll did not grow.
+    assert_eq!(snapshot.peak_bankroll, dec!(1000),
+        "peak must not change if bankroll did not change");
 }
 
 // ─── F7: GetRiskState returns correct percentages ────────────────────────────

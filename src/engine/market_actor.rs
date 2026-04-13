@@ -79,9 +79,15 @@ impl MarketActor {
         let detector = self.detector.clone();
         let market_id = self.market_id;
         let cached_open_positions = self.cached_open_positions.clone();
+        // Snapshot of the local UOB shard for per-position stop-loss checks inside spawned tasks.
+        // We pass a clone of the Arc so the spawned task can read current book state without
+        // holding a reference to &self across an await point.
+        let uob_for_stoploss = Arc::new(std::sync::RwLock::new(UnifiedOrderBook::new()));
 
         while let Some(tick) = self.rx.recv().await {
             self.uob_shard.update(&tick);
+            // Keep the stop-loss snapshot in sync so spawned tasks see current prices.
+            uob_for_stoploss.write().unwrap().update(&tick);
             self.metrics.inc_ticks_for_platform(tick.platform);
 
             let opps = {
@@ -103,6 +109,7 @@ impl MarketActor {
                 let metrics = metrics.clone();
                 let _alert_tx_inner = _alert_tx.clone();
                 let cached_open_pos = cached_open_positions.clone();
+                let uob_for_stoploss = uob_for_stoploss.clone();
                 
                 tokio::spawn(async move {
                     let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
@@ -129,9 +136,39 @@ impl MarketActor {
                         (size, fraction)
                     };
 
+                    // Per-position stop-loss: if the current mid-prices have already moved
+                    // against us by more than 3% since detection, the opportunity is stale
+                    // and executing it is expected-negative. Drop it immediately rather than
+                    // waiting for the unwind watchdog to fire 5 minutes later.
+                    {
+                        let current_spread = {
+                            let uob = uob_for_stoploss.read().unwrap();
+                            uob.get_book(&opp.market_id, &opp.leg_a.platform)
+                                .and_then(|ba| uob.get_book(&opp.market_id, &opp.leg_b.platform)
+                                    .map(|bb| {
+                                        let ask_a = ba.best_ask().map(|(p,_)| p).unwrap_or(rust_decimal::Decimal::ONE);
+                                        let bid_b = bb.best_bid().map(|(p,_)| p).unwrap_or(rust_decimal::Decimal::ZERO);
+                                        rust_decimal::Decimal::ONE - ask_a - (rust_decimal::Decimal::ONE - bid_b)
+                                    }))
+                        };
+                        if let Some(live_spread) = current_spread {
+                            let spread_decay = opp.raw_spread - live_spread;
+                            let decay_threshold = rust_decimal_macros::dec!(0.03);
+                            if spread_decay > decay_threshold {
+                                tracing::debug!(
+                                    opp_id = %opp.opp_id,
+                                    detected_spread = %opp.raw_spread,
+                                    live_spread = %live_spread,
+                                    decay = %spread_decay,
+                                    "Per-position stop-loss triggered: spread decayed beyond threshold before execution"
+                                );
+                                return;
+                            }
+                        }
+                    }
+
                     let too_small = false;
                     let scaled_size = approved_size;
-                    // ... (size scaling logic)
                     if too_small || scaled_size <= rust_decimal::Decimal::ZERO { return; }
                     let approved_size = scaled_size;
 

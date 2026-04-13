@@ -121,18 +121,21 @@ impl BankrollManager {
         }
     }
 
-    /// Credits the bankroll with realized PnL from an expired/settled market.
-    /// Winning legs pay $1.00 per contract; losing legs pay $0.00. 
+    /// Frees exposure that was reserved when the position was opened.
+    ///
+    /// IMPORTANT: This does NOT change `total_bankroll`. The arbitrage profit was
+    /// already credited via `record_trade` at execution time. Adding `realized_pnl`
+    /// here would double-count it and corrupt Kelly sizing over time.
     pub fn record_settlement(&mut self, settlement: &crate::types::SettlementResult) {
-        // CRITICAL FIX: Do NOT add realized_pnl to total_bankroll here.
-        // The arbitrage profit was already added to total_bankroll in `record_trade`.
-        // Adding settlement PnL double-counts (or incorrectly subtracts) the legs.
-        
         let exposure_freed = settlement.quantity * settlement.avg_entry_price;
         self.remove_exposure(settlement.platform, exposure_freed);
         self.remove_market_exposure(settlement.market_id, exposure_freed);
-        
-        tracing::info!(realized_pnl = %settlement.realized_pnl, exposure_freed = %exposure_freed, bankroll = %self.total_bankroll, "Settlement processed and exposure freed");
+        tracing::info!(
+            realized_pnl = %settlement.realized_pnl,
+            exposure_freed = %exposure_freed,
+            bankroll = %self.total_bankroll,
+            "Settlement processed — exposure freed, bankroll unchanged (profit already booked at execution)"
+        );
     }
 
     pub fn record_trade(&mut self, result: &TradeResult) {
@@ -291,15 +294,19 @@ mod tests {
         assert_eq!(bm.total_bankroll(), dec!(1000.8));
         assert_eq!(bm.success_today(), 1);
         
+        // Settlement frees exposure only — bankroll does NOT change.
+        // The profit was already booked by record_trade above.
         bm.record_settlement(&crate::types::SettlementResult {
             realized_pnl: dec!(10),
             platform: Platform::Polymarket,
             market_id: Uuid::new_v4(),
             quantity: dec!(10),
             avg_entry_price: dec!(0.5),
-        }); 
-        assert_eq!(bm.total_bankroll(), dec!(1010.8));
-        assert_eq!(bm.peak_bankroll(), dec!(1010.8));
+        });
+        assert_eq!(bm.total_bankroll(), dec!(1000.8),
+            "settlement must NOT change bankroll — profit already booked at trade time");
+        assert_eq!(bm.peak_bankroll(), dec!(1000.8),
+            "peak must reflect trade profit only");
     }
 }
 
@@ -404,7 +411,10 @@ impl BankrollHandle {
                         manager.remove_exposure(platform_b, leg_b_exposure);
                         manager.remove_market_exposure(market_id, leg_a_exposure + leg_b_exposure);
                     }
-                    BankrollMsg::RecordSettlement(settlement) => manager.record_settlement(&settlement),
+                    BankrollMsg::RecordSettlement(settlement) => {
+                        // record_settlement only frees exposure; it does NOT touch total_bankroll.
+                        manager.record_settlement(&settlement);
+                    }
                     BankrollMsg::GetSnapshot(kelly_frac, reply) => {
                         let _ = reply.send(manager.daily_snapshot(kelly_frac));
                     }
