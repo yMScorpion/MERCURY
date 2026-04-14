@@ -100,6 +100,24 @@ impl KalshiAuth {
         }
         Ok(format!("Bearer {}", token))
     }
+
+    /// Generate Kalshi REST API authentication headers using RSA-PSS (v2 API).
+    /// Returns the three required headers for all authenticated REST endpoints.
+    pub fn generate_rest_headers(&self, method: &str, path: &str) -> Result<Vec<(String, String)>> {
+        let timestamp = Self::now_millis().to_string();
+        // Strip query parameters before signing (per Kalshi docs)
+        let path_without_query = path.split('?').next().unwrap_or(path);
+        let message = format!("{}{}{}", timestamp, method, path_without_query);
+        
+        let signature = self.signing_key.sign_with_rng(&mut OsRng, message.as_bytes());
+        let signature_b64 = STANDARD.encode(signature.to_bytes());
+        
+        Ok(vec![
+            ("KALSHI-ACCESS-KEY".to_string(), self.api_key_id.clone()),
+            ("KALSHI-ACCESS-SIGNATURE".to_string(), signature_b64),
+            ("KALSHI-ACCESS-TIMESTAMP".to_string(), timestamp),
+        ])
+    }
     
     /// Generate Kalshi WebSockets Headers
     pub fn generate_ws_headers(&self) -> Result<Vec<(String, String)>> {

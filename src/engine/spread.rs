@@ -213,12 +213,13 @@ impl NetSpreadEngine {
     fn compute_fee(&self, platform: Platform, price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
         match platform {
             Platform::Polymarket | Platform::PolymarketUs => {
-                normalizer::polymarket_fee(price, quantity, fee_rate_bps)
+                // Default to Taker until order type propagation is implemented
+                normalizer::polymarket_fee(price, quantity, normalizer::OrderType::Taker)
             }
             Platform::Kalshi => {
                 // Delegate to the centralized normalizer to ensure consistency
                 // between spread estimation and execution fill accounting.
-                normalizer::kalshi_fee(price, quantity, fee_rate_bps)
+                normalizer::kalshi_fee(price, quantity, normalizer::OrderType::Taker)
             }
             Platform::Cdna => {
                 let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);

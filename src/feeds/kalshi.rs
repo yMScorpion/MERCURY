@@ -390,11 +390,11 @@ impl KalshiFeed {
     ) {
         let url = format!("{}/markets/{}/orderbook", self.config.rest_url, ticker);
 
-        let auth_header = if let Some(auth) = &self.auth {
-            match auth.auth_header().await {
+        let rest_headers: Option<Vec<(String, String)>> = if let Some(auth) = &self.auth {
+            match auth.generate_rest_headers("GET", &format!("/trade-api/v2/markets/{}/orderbook", ticker)) {
                 Ok(h) => Some(h),
                 Err(e) => {
-                    warn!(ticker, error = %e, "Failed to get Kalshi auth header for REST bootstrap");
+                    warn!(ticker, error = %e, "Failed to get Kalshi auth headers for REST bootstrap");
                     None
                 }
             }
@@ -403,8 +403,10 @@ impl KalshiFeed {
         };
 
         let mut req = self.http.get(&url);
-        if let Some(header) = auth_header {
-            req = req.header("Authorization", header);
+        if let Some(headers) = rest_headers {
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
         }
 
         let resp = match tokio::time::timeout(

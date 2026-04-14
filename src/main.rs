@@ -1252,6 +1252,15 @@ async fn main() -> Result<()> {
                 ).await.ok().and_then(|t| t.last().map(|r| r.executed_at.date_naive()));
                 if let Some(last_date) = last_trade_date {
                     if last_date < today {
+                        // Persist yesterday's final snapshot before resetting counters
+                        let current_kelly = kelly.read().unwrap().fraction();
+                        let final_snapshot = bankroll_handle.get_snapshot(current_kelly).await;
+                        let db_snap = db.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = db_snap.insert_daily_snapshot(&final_snapshot).await {
+                                tracing::error!(error = %e, "Failed to persist end-of-day snapshot before reset");
+                            }
+                        });
                         bankroll_handle.reset_daily().await;
                         tracing::info!("Daily bankroll counters reset for new day: {}", today);
                     }

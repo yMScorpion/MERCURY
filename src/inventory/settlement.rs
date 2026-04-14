@@ -49,13 +49,30 @@ impl SettlementMonitor {
                     MarketStatus::Resolved => {
                         info!(position_id = position.id, market = %market.question, "Market resolved - position ready for settlement");
                         
-                        // Since bankroll is already updated at trade time, we just record ZERO here
-                        // to avoid skewing any DB aggregate queries that might sum realized_pnl.
-                        // The actual arb profit is locked in at execution.
-                        let realized_pnl = Decimal::ZERO;
+                        // Query the actual platform payout so DB records are accurate for audit.
+                        // For arb positions the profit was already booked at execution; realized_pnl
+                        // here is used only for the audit trail and settlement queue — NOT added to
+                        // bankroll again (record_settlement only frees exposure).
+                        let realized_pnl = if let Some(ref kalshi) = self.kalshi_client {
+                            if let Some(info) = market.platforms.get(&position.platform) {
+                                if position.platform == crate::types::Platform::Kalshi {
+                                    kalshi.fetch_settlement_payout(
+                                        &info.platform_market_id,
+                                        position.quantity,
+                                        position.avg_entry_price,
+                                    ).await.unwrap_or(Decimal::ZERO)
+                                } else {
+                                    Decimal::ZERO
+                                }
+                            } else {
+                                Decimal::ZERO
+                            }
+                        } else {
+                            Decimal::ZERO
+                        };
                         
                         if let Some(_info) = market.platforms.get(&position.platform) {
-                            tracing::info!(position_id = position.id, platform = %position.platform, "Settlement recorded for platform");
+                            tracing::info!(position_id = position.id, platform = %position.platform, realized_pnl = %realized_pnl, "Settlement recorded for platform");
                         }
                         
                         let audit = AuditEntry {

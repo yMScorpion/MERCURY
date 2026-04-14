@@ -222,7 +222,13 @@ impl PlatformOrderClient for PolymarketClient {
 
         if body.success {
             let order_id_str = body.order_id.unwrap_or_default();
-            let fill_size = taker_amount_scaled / scale;
+            // fill_size is always the number of contracts (tokens), regardless of buy/sell direction.
+            // For BUY: taker_amount = tokens received = size. For SELL: taker_amount = USDC received.
+            // Always report fill_size in contracts.
+            let fill_size = match action {
+                OrderAction::Buy => taker_amount_scaled / scale,
+                OrderAction::Sell => maker_amount_scaled / scale, // maker gives tokens
+            };
             let actual_price = price;
             
             // 1.2 EXECUTION SAFETY: Non-blocking confirmation.
@@ -268,7 +274,7 @@ impl PlatformOrderClient for PolymarketClient {
             }
 
             let filled = fill_size > Decimal::ZERO;
-            let estimated_fee = crate::feeds::normalizer::polymarket_fee(actual_price, fill_size, fee_rate_bps as u16);
+            let estimated_fee = crate::feeds::normalizer::polymarket_fee(actual_price, fill_size, crate::feeds::normalizer::OrderType::Taker);
 
             Ok(OrderResult {
                 filled,
@@ -317,28 +323,32 @@ impl PolymarketClient {
         let url = format!("{}{}", self.rest_url, path);
         let headers = self.l2_auth_headers("GET", path, "")?;
         let mut req = self.http.get(&url);
-        for (k, v) in &headers {
-            req = req.header(*k, v);
+        for (k, v) in headers {
+            req = req.header(k, v);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("Polymarket get_balance failed: {}", resp.status());
         }
         let body: serde_json::Value = resp.json().await?;
-        // Polymarket CLOB /balance returns { "usdcBalance": "1234.56", ... }
-        let balance_str = body.get("usdcBalance").and_then(|v| v.as_str()).unwrap_or("0");
+        // Polymarket CLOB /balance returns { "balance": "1234.56" } or "usdcBalance" depending on version
+        let balance_str = body.get("balance")
+            .and_then(|v| v.as_str())
+            .or_else(|| body.get("usdcBalance").and_then(|v| v.as_str()))
+            .unwrap_or("0");
         Ok(Decimal::from_str(balance_str).unwrap_or(Decimal::ZERO))
     }
 
     /// Queries the Polymarket API for all active positions
     pub async fn get_positions(&self) -> Result<Vec<(String, Decimal)>> {
-        let url = format!("{}/positions", self.rest_url);
-        let resp = self.http.get(&url)
-            .header("POLY_API_KEY", self.api_key.as_str())
-            .header("POLY_SECRET", self.api_secret.as_str())
-            .header("POLY_PASSPHRASE", self.api_passphrase.as_str())
-            .send()
-            .await?;
+        let path = "/positions";
+        let url = format!("{}{}", self.rest_url, path);
+        let headers = self.l2_auth_headers("GET", path, "")?;
+        let mut req = self.http.get(&url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
         
         if !resp.status().is_success() {
             anyhow::bail!("Polymarket get_positions failed: {}", resp.status());

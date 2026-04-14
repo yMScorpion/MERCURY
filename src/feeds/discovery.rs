@@ -413,7 +413,9 @@ impl MarketDiscovery {
                     .and_then(|v| v.as_str())
                     .unwrap_or("BTC 15m")
                     .to_string();
-                let fee_bps = 50u16;
+                // Kalshi 15-minute crypto markets charge 5 bps (0.05%), NOT 50 bps.
+                // Verify via Kalshi API: /markets/{ticker} -> taker_fee_bps field.
+                let fee_bps = 5u16;
                 return Some((ticker, title, close_dt, fee_bps));
             }
         }

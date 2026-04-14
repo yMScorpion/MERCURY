@@ -20,11 +20,21 @@ pub fn compute_unified_market_id(question: &str, resolution_source: &str, expiry
     Uuid::from_bytes(bytes)
 }
 
-/// Calculate Polymarket fee for given price and fee_rate_bps
-pub fn polymarket_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
-    let rate = Decimal::from(fee_rate_bps) / Decimal::from(10000);
-    let max_side = price.max(Decimal::ONE - price);
-    rate * quantity * max_side
+pub enum OrderType {
+    Maker,
+    Taker,
+}
+
+/// Calculate Polymarket fee for given price and quantity using 7.2% rate formula.
+/// Maker gets 20% rebate on their fee.
+pub fn polymarket_fee(price: Decimal, quantity: Decimal, order_type: OrderType) -> Decimal {
+    let rate = rust_decimal_macros::dec!(0.072);
+    let fee = quantity * rate * price * (Decimal::ONE - price);
+    
+    match order_type {
+        OrderType::Taker => fee,
+        OrderType::Maker => fee * rust_decimal_macros::dec!(0.80),
+    }
 }
 
 /// Calculate VWAP slippage for a target order size against order book depth.
@@ -76,17 +86,16 @@ pub fn estimate_slippage(target_size: Decimal, depth: &[PriceLevel]) -> Option<D
     Some((vwap - best_price).abs())
 }
 
-pub fn kalshi_fee(price: Decimal, quantity: Decimal, fee_rate_bps: u16) -> Decimal {
-    if fee_rate_bps < 100 {
-        // e.g. 5 bps for 15M crypto markets. Calculate as a standard percentage of the wager.
-        let rate = Decimal::from(fee_rate_bps) / rust_decimal_macros::dec!(10000);
-        rate * quantity * price
-    } else {
-        // Standard Kalshi fee: 10% of wager capped at 7c per contract
-        let max_fee = rust_decimal_macros::dec!(0.07);
-        let implied_fee = price * rust_decimal_macros::dec!(0.10);
-        max_fee.min(implied_fee) * quantity
-    }
+pub fn kalshi_fee(price: Decimal, quantity: Decimal, order_type: OrderType) -> Decimal {
+    let rate = match order_type {
+        OrderType::Taker => rust_decimal_macros::dec!(0.07),
+        OrderType::Maker => rust_decimal_macros::dec!(0.0175),
+    };
+
+    let fee = rate * quantity * price * (Decimal::ONE - price);
+    
+    // Ceiling rounding to the nearest cent (0.01)
+    fee.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::AwayFromZero)
 }
 
 #[cfg(test)]
@@ -96,15 +105,17 @@ mod tests {
 
     #[test]
     fn test_polymarket_fee() {
-        // Price > 0.5 (e.g. 0.6), quantity = 100, fee = 200 bps (0.02)
-        // Fee = 0.02 * 100 * max(0.6, 0.4) = 2 * 0.6 = 1.2
-        let fee = polymarket_fee(dec!(0.6), dec!(100), 200);
-        assert_eq!(fee, dec!(1.20));
+        // Price = 0.50, quantity = 100
+        // fee = 100 * 0.072 * 0.5 * (1 - 0.5)
+        // fee = 100 * 0.072 * 0.5 * 0.5
+        // fee = 100 * 0.072 * 0.25
+        // fee = 25 * 0.072 = 1.8
+        let fee = polymarket_fee(dec!(0.50), dec!(100), OrderType::Taker);
+        assert_eq!(fee, dec!(1.8));
 
-        // Price < 0.5 (e.g. 0.2), quantity = 50, fee = 100 bps (0.01)
-        // Fee = 0.01 * 50 * max(0.2, 0.8) = 0.5 * 0.8 = 0.4
-        let fee2 = polymarket_fee(dec!(0.2), dec!(50), 100);
-        assert_eq!(fee2, dec!(0.40));
+        // Maker fee = 1.8 * 0.8 = 1.44
+        let fee_maker = polymarket_fee(dec!(0.50), dec!(100), OrderType::Maker);
+        assert_eq!(fee_maker, dec!(1.44));
     }
 
     #[test]
