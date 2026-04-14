@@ -1241,7 +1241,24 @@ async fn main() -> Result<()> {
 
             // ── Periodic State Sync ──
             _ = sync_interval.tick() => {
-                let evicted_markets = registry.write().unwrap().evict_stale_markets();
+            // Daily counter reset at midnight UTC
+            {
+                let today = chrono::Utc::now().date_naive();
+                let _snapshot_today = db.get_daily_snapshot(today).await;
+                // If we have no snapshot for today yet, check if we need to reset
+                // (i.e., it's a new day vs last recorded trade)
+                let last_trade_date = db.get_trades_since(
+                    chrono::Utc::now() - chrono::Duration::hours(25)
+                ).await.ok().and_then(|t| t.last().map(|r| r.executed_at.date_naive()));
+                if let Some(last_date) = last_trade_date {
+                    if last_date < today {
+                        bankroll_handle.reset_daily().await;
+                        tracing::info!("Daily bankroll counters reset for new day: {}", today);
+                    }
+                }
+            }
+
+            let evicted_markets = registry.write().unwrap().evict_stale_markets();
                 for id in &evicted_markets {
                     if let Some(sender) = market_channels.remove(id) {
                         tracing::info!(market_id = %id, "Evicting stale market — closing actor channel");
@@ -1338,7 +1355,9 @@ async fn main() -> Result<()> {
                     }
                 });
 
-                // Bankroll reset logic should eventually be handled via the Actor
+                // Reset daily counters after persisting the snapshot
+                bankroll_handle.reset_daily().await;
+                tracing::info!("Daily bankroll counters reset after report generation");
             }
             
 

@@ -379,6 +379,7 @@ pub enum BankrollMsg {
         market_id: Uuid,
         reply: oneshot::Sender<RiskState>,
     },
+    ResetDaily,
 }
 
 #[derive(Clone)]
@@ -460,6 +461,9 @@ impl BankrollHandle {
                         };
                         let _ = reply.send(state);
                     }
+                    BankrollMsg::ResetDaily => {
+                        manager.reset_daily();
+                    }
                 }
             }
         });
@@ -486,5 +490,9 @@ impl BankrollHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.tx.send(BankrollMsg::GetRiskState { platform_a, platform_b, market_id, reply: reply_tx }).await;
         reply_rx.await.expect("Bankroll actor died")
+    }
+
+    pub async fn reset_daily(&self) {
+        let _ = self.tx.send(BankrollMsg::ResetDaily).await;
     }
 }

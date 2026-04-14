@@ -547,15 +547,15 @@ mod pipeline_tests {
         let handle = BankrollHandle::new(BankrollManager::new(dec!(500)));
         let market_id = Uuid::new_v4();
 
-        // Each task requests 300+300=600 against a 500 bankroll — only one can succeed.
+        // Each task requests 250+250=500 against a 500 bankroll — only one can succeed.
         let tasks: Vec<_> = (0..8).map(|_| {
             let h = handle.clone();
             let mid = market_id;
             tokio::spawn(async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 h.tx.send(BankrollMsg::ReserveCapital {
-                    leg_a_exposure: dec!(300),
-                    leg_b_exposure: dec!(300),
+                    leg_a_exposure: dec!(250),
+                    leg_b_exposure: dec!(250),
                     platform_a: Platform::Polymarket,
                     platform_b: Platform::Kalshi,
                     market_id: mid,
@@ -651,6 +651,37 @@ mod pipeline_tests {
     }
 
     // ─── Test 18: Chaos — BankrollManager under rapid trade/settlement cycling ─
+
+    fn make_trade(profit: Decimal, status: TradeStatus, approved_size: Decimal) -> TradeResult {
+        TradeResult {
+            trade_id: 1,
+            opp_id: Uuid::new_v4(),
+            market_id: Uuid::new_v4(),
+            market_question: "Test".into(),
+            leg_a_platform: Platform::Polymarket,
+            leg_a_side: Side::Yes,
+            leg_a_price: rust_decimal_macros::dec!(0.40),
+            leg_a_size: approved_size,
+            leg_a_fill_price: rust_decimal_macros::dec!(0.40),
+            leg_a_fee: rust_decimal_macros::dec!(0.01),
+            leg_b_platform: Platform::Kalshi,
+            leg_b_side: Side::No,
+            leg_b_price: rust_decimal_macros::dec!(0.50),
+            leg_b_size: approved_size,
+            leg_b_fill_price: rust_decimal_macros::dec!(0.50),
+            leg_b_fee: rust_decimal_macros::dec!(0.01),
+            raw_spread: rust_decimal_macros::dec!(0.10),
+            net_spread: rust_decimal_macros::dec!(0.08),
+            profit,
+            status,
+            failure_reason: None,
+            execution_ms: 50,
+            executed_at: chrono::Utc::now(),
+            bankroll_after: Decimal::ZERO,
+            bankroll_change_pct: Decimal::ZERO,
+            approved_size,
+        }
+    }
 
     #[tokio::test]
     async fn test_chaos_rapid_trade_settlement_cycle() {

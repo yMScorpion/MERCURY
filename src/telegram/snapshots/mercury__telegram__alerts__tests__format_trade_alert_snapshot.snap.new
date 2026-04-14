@@ -1,0 +1,18 @@
+---
+source: src/telegram/alerts.rs
+assertion_line: 191
+expression: alert
+---
+✅ <b>ARBITRAGE #123 — PROFIT</b>
+
+<b>Market:</b> "Will Bitcoin hit $100k?"
+Leg A: BUY YES @ $0.61 on Polymarket (100 contracts)
+Leg B: BUY NO @ $0.36 on Kalshi (100 contracts)
+
+Raw Spread: 5.00% | Net Spread: 3.00%
+Fees: $0.5 + $0.1 = $0.6
+
+💰 <b>Profit: +$5.0</b>
+📊 Bankroll: $1005.0 (+0.005%)
+⏱️ Execution: 120ms
+🆔 Opp ID: <code>00000000-0000-0000-0000-000000000000</code>

@@ -311,7 +311,7 @@ mod tests {
 
         let report = DailyReport {
             snapshot: DailySnapshot {
-                date: chrono::Utc::now().date_naive(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
                 bankroll: dec!(10050.0),
                 peak_bankroll: dec!(10100.0),
                 net_pnl: dec!(150.0),

@@ -85,6 +85,15 @@ impl Reconciler {
                         message: format!("Kalshi Balance Mismatch: API=${live}, DB=${db_bal}"),
                     });
                 }
+                // Always persist the live balance to DB so reports are accurate
+                let _ = self.db.update_balance(&crate::types::PlatformBalance {
+                    platform: Platform::Kalshi,
+                    available: live,
+                    reserved: Decimal::ZERO,
+                    pending_settlement: Decimal::ZERO,
+                    total: live,
+                    updated_at: chrono::Utc::now(),
+                }).await;
             }
         }
 
@@ -98,6 +107,15 @@ impl Reconciler {
                         message: format!("Polymarket Balance Mismatch: API=${live}, DB=${db_bal}"),
                     });
                 }
+                // Always persist the live balance to DB so reports are accurate
+                let _ = self.db.update_balance(&crate::types::PlatformBalance {
+                    platform: Platform::Polymarket,
+                    available: live,
+                    reserved: Decimal::ZERO,
+                    pending_settlement: Decimal::ZERO,
+                    total: live,
+                    updated_at: chrono::Utc::now(),
+                }).await;
             }
         }
 

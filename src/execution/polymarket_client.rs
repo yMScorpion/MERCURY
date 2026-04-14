@@ -313,17 +313,19 @@ impl PlatformOrderClient for PolymarketClient {
 impl PolymarketClient {
     /// Queries the Polymarket API for the actual live balance of the wallet
     pub async fn get_balance(&self) -> Result<Decimal> {
-        let url = format!("{}/balance", self.rest_url);
-        let resp = self.http.get(&url)
-            .header("POLY_API_KEY", self.api_key.as_str())
-            .header("POLY_SECRET", self.api_secret.as_str())
-            .header("POLY_PASSPHRASE", self.api_passphrase.as_str())
-            .send()
-            .await?;
+        let path = "/balance";
+        let url = format!("{}{}", self.rest_url, path);
+        let headers = self.l2_auth_headers("GET", path, "")?;
+        let mut req = self.http.get(&url);
+        for (k, v) in &headers {
+            req = req.header(*k, v);
+        }
+        let resp = req.send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("Polymarket get_balance failed: {}", resp.status());
         }
         let body: serde_json::Value = resp.json().await?;
+        // Polymarket CLOB /balance returns { "usdcBalance": "1234.56", ... }
         let balance_str = body.get("usdcBalance").and_then(|v| v.as_str()).unwrap_or("0");
         Ok(Decimal::from_str(balance_str).unwrap_or(Decimal::ZERO))
     }

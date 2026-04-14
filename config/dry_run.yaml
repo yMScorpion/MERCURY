@@ -10,7 +10,7 @@ trading:
   gas_price_max_gwei: 200
   rebalance_threshold_pct: "0.15"
   max_open_positions: 20
-  initial_bankroll: "1000.00"
+  initial_bankroll: "100.00"
 
 platforms:
   polymarket:

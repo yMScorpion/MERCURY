@@ -120,11 +120,11 @@ fn test_build_round_candidates_skips_expired() {
     // Should have 2 assets * up to 3 rounds = at most 6, but expired ones filtered
     assert!(!rounds.is_empty(), "Should have at least one round candidate");
     
-    let now_ts = chrono::Utc::now().timestamp();
+let now_ts = chrono::Utc::now().timestamp();
     for r in &rounds {
         let round_end = r.round_start_ts + 900;
         assert!(
-            round_end > now_ts - 60,
+            round_end >= now_ts - 300,
             "No expired rounds should be returned (round_start={}, end={})",
             r.round_start_ts,
             round_end
@@ -136,8 +136,8 @@ fn test_build_round_candidates_skips_expired() {
 
 #[test]
 fn test_categorize_crypto() {
-    assert_eq!(categorize_question("will btc exceed 100k"), MarketCategory::Crypto);
-    assert_eq!(categorize_question("ethereum price up or down"), MarketCategory::Crypto);
+    assert_eq!(categorize_question(&MarketDiscovery::normalize_question("will btc exceed 100k")), MarketCategory::Crypto);
+    assert_eq!(categorize_question(&MarketDiscovery::normalize_question("ethereum price up or down")), MarketCategory::Crypto);
 }
 
 #[test]

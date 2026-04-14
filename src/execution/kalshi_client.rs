@@ -262,7 +262,12 @@ impl KalshiClient {
             anyhow::bail!("Kalshi get_balance failed: {}", resp.status());
         }
         let body: serde_json::Value = resp.json().await?;
-        let balance_cents = body.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+        // Kalshi API docs: balance is in cents (integer). Field name is "balance".
+        // Also try "available_balance" as a fallback for subaccounts.
+        let balance_cents = body.get("balance")
+            .and_then(|v| v.as_i64())
+            .or_else(|| body.get("available_balance_cents").and_then(|v| v.as_i64()))
+            .unwrap_or(0);
         Ok(Decimal::from(balance_cents) / Decimal::from(100))
     }
 

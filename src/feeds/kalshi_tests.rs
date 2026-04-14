@@ -41,11 +41,9 @@
 #[cfg(test)]
 mod kalshi_feed_tests {
     use crate::feeds::kalshi::KalshiFeed;
-    use crate::feeds::base::FeedHandler;
     use crate::config::KalshiConfig;
-    use crate::types::Platform;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use tokio::sync::broadcast;
     use uuid::Uuid;
     use std::sync::Arc;
 
@@ -87,7 +85,7 @@ mod kalshi_feed_tests {
         async fn backup_to_file(&self, _: &str) -> anyhow::Result<()> { Ok(()) }
     }
 
-    fn make_feed(ticker: &str) -> (KalshiFeed, Uuid) {
+    fn make_feed(_ticker: &str) -> (KalshiFeed, Uuid) {
         let config = KalshiConfig {
             enabled: true,
             ws_url: "ws://test".into(),
@@ -107,7 +105,6 @@ mod kalshi_feed_tests {
     fn test_yes_dollars_fp_price_format_not_divided_by_100() {
         // Verify that prices like "0.4200" are NOT divided by 100 again
         // The API sends dollar-format strings, not cent integers
-        use rust_decimal::Decimal;
         use std::str::FromStr;
         
         let price_str = "0.4200";
