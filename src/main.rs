@@ -1358,6 +1358,7 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     let report = build_daily_report(db_clone.clone(), snapshot, uptime_secs, ws_reconnects, api_errors).await;
                     let _ = db_clone.insert_daily_snapshot(&report.snapshot).await;
+                    let _ = db_clone.mark_report_sent(chrono::Utc::now().date_naive()).await;
 
                     if reports_enabled {
                         let _ = report_tx_clone.try_send(report);

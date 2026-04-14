@@ -77,16 +77,10 @@ impl SqliteDb {
     }
 
     pub async fn db_size_bytes(&self) -> Result<u64> {
-        // Checking filesystem directly to avoid full SQLite page counting blocking
-        let metadata = std::fs::metadata("/opt/mercury/data/mercury.db")?;
-        let wal_metadata = std::fs::metadata("/opt/mercury/data/mercury.db-wal").ok();
-        
-        let mut size = metadata.len();
-        if let Some(wal) = wal_metadata {
-            size += wal.len();
-        }
-        
-        Ok(size)
+        // Use PRAGMA to get DB size without hardcoding the path
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(&self.pool).await?;
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size").fetch_one(&self.pool).await?;
+        Ok((page_count * page_size) as u64)
     }
 }
 

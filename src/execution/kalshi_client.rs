@@ -277,7 +277,6 @@ impl KalshiClient {
         // Also try "available_balance" as a fallback for subaccounts.
         let balance_cents = body.get("balance")
             .and_then(|v| v.as_i64())
-            .or_else(|| body.get("portfolio_value").and_then(|v| v.as_i64()))
             .unwrap_or(0);
         Ok(Decimal::from(balance_cents) / Decimal::from(100))
     }

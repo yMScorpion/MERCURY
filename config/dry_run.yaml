@@ -20,8 +20,8 @@ platforms:
     sports_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/sports"
   kalshi:
     enabled: true
-    rest_url: "https://api.elections.kalshi.com/trade-api/v2"
-    ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    rest_url: "https://trading-api.kalshi.com/trade-api/v2"
+    ws_url: "wss://trading-api.kalshi.com/trade-api/ws/v2"
   cdna:
     enabled: false
     rest_url: ""

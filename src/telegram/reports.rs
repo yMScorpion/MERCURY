@@ -173,7 +173,7 @@ fn format_daily_report(report: &DailyReport) -> String {
         Decimal::ZERO
     };
 
-    let pnl_sign = if s.net_pnl >= Decimal::ZERO { "+" } else { "" };
+    let pnl_sign = if s.net_pnl >= Decimal::ZERO { "+" } else { "-" };
 
     let mut msg = format!(
         "📈 <b>MERCURY DAILY REPORT — {date}</b>\n\
@@ -191,7 +191,7 @@ fn format_daily_report(report: &DailyReport) -> String {
         date = s.date,
         gross = s.gross_pnl.round_dp(2).abs(),
         fees = s.fees_paid.round_dp(2),
-        net = s.net_pnl.round_dp(2).abs(),
+        net = s.net_pnl.round_dp(2),
         total = s.trades_count,
         success = s.success_count,
         fail = s.fail_count,
