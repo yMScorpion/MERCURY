@@ -256,8 +256,23 @@ async fn main() -> Result<()> {
     let tg_daily_token = std::env::var("TELEGRAM_BOT_TOKEN")
         .or_else(|_| std::env::var("TELEGRAM_DAILY_TOKEN"))
         .unwrap_or_default();
-    let tg_alerts_chat = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_default();
+    let tg_alerts_chat_raw = std::env::var("TELEGRAM_ALERTS_CHAT_ID").unwrap_or_default();
     let tg_report_chat = std::env::var("TELEGRAM_REPORT_CHAT_ID").unwrap_or_default();
+
+    // Fall back to the report chat if the alerts chat is unset or still set to the
+    // placeholder. Without this fallback a missing TELEGRAM_ALERTS_CHAT_ID silently
+    // disables every per-trade notification while daily reports continue to fire,
+    // producing the symptom: "report shows profits but no trade pings arrived."
+    let tg_alerts_chat = if tg_alerts_chat_raw.is_empty() || tg_alerts_chat_raw == "YOUR_CHAT_ID_HERE" {
+        if !tg_report_chat.is_empty() && tg_report_chat != "YOUR_CHAT_ID_HERE" {
+            warn!("TELEGRAM_ALERTS_CHAT_ID not set — falling back to TELEGRAM_REPORT_CHAT_ID for trade notifications");
+            tg_report_chat.clone()
+        } else {
+            tg_alerts_chat_raw
+        }
+    } else {
+        tg_alerts_chat_raw
+    };
 
     let tg_alerts_enabled = mercury_config.telegram.enabled
         && !tg_notification_token.is_empty()
@@ -1186,8 +1201,18 @@ async fn main() -> Result<()> {
                     // FIX: Send Telegram alert AFTER getting the real trade ID to prevent duplicate message drops
                     if tg_alerts_enabled {
                         if let Err(e) = alert_tx_clone.send(AlertMessage::TradeComplete(Box::new(final_result.clone()))).await {
-                            tracing::warn!(error = %e, trade_id = final_result.trade_id, "Telegram alert channel closed — dropping notification");
+                            tracing::error!(error = %e, trade_id = final_result.trade_id,
+                                "CRITICAL: Telegram alert channel closed — trade notification DROPPED. \
+                                 This causes daily-report mismatch with real profits. \
+                                 Check TELEGRAM_BOT_TOKEN and TELEGRAM_ALERTS_CHAT_ID env vars.");
+                        } else {
+                            tracing::info!(trade_id = final_result.trade_id, "Trade notification dispatched to internal Telegram queue");
                         }
+                    } else {
+                        tracing::warn!(trade_id = final_result.trade_id, profit = %final_result.profit,
+                            "Trade NOT sent to Telegram — tg_alerts_enabled=false. \
+                             This is why daily report won't match real trade pings. \
+                             Verify telegram.enabled=true in config AND TELEGRAM_ALERTS_CHAT_ID is set.");
                     }
 
                     if let Err(e) = trade_result_tx2_clone.send(final_result.clone()).await {
