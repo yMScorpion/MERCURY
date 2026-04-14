@@ -17,7 +17,16 @@ impl AlertService {
     }
 
     pub async fn run(mut self) {
-        info!("Telegram alert service started");
+        info!("Telegram alert service started — sending startup ping");
+        if let Err(e) = self.bot.send_message(
+            &self.chat_id,
+            "🟢 <b>MERCURY ONLINE</b>\n\nAlert service connected. Trade notifications are active.",
+        ).await {
+            error!(error = %e, chat_id = %self.chat_id, "CRITICAL: Telegram startup ping failed — check bot token and chat_id. Trade notifications will NOT be delivered.");
+        } else {
+            info!("Telegram startup ping delivered successfully");
+        }
+
         while let Some(msg) = self.rx.recv().await {
             let text = match &msg {
                 AlertMessage::TradeComplete(trade) => format_trade_alert(trade),
@@ -30,7 +39,7 @@ impl AlertService {
             };
 
             if let Err(e) = self.bot.send_message(&self.chat_id, &text).await {
-                error!(error = %e, "Failed to send Telegram alert");
+                error!(error = %e, chat_id = %self.chat_id, msg_type = ?std::mem::discriminant(&msg), "Failed to send Telegram alert — verify bot token and chat_id are correct");
             }
         }
         info!("Telegram alert service stopped");

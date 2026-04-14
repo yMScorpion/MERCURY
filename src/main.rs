@@ -277,9 +277,15 @@ async fn main() -> Result<()> {
         let bot = telegram::bot::TelegramBot::new(tg_notification_token.clone());
         let alert_service = telegram::alerts::AlertService::new(bot, tg_alerts_chat.clone(), alert_rx);
         join_set.spawn(alert_service.run());
-        info!("Telegram alerts enabled (MERCURY_NOTIFICATION bot)");
+        info!(chat_id = %tg_alerts_chat, "Telegram alerts ENABLED — startup ping will be sent");
     } else {
-        warn!("Telegram alerts disabled — set TELEGRAM_NOTIFICATION_TOKEN and TELEGRAM_ALERTS_CHAT_ID");
+        warn!(
+            telegram_enabled = mercury_config.telegram.enabled,
+            has_token = !tg_notification_token.is_empty(),
+            has_chat_id = !tg_alerts_chat.is_empty(),
+            chat_id_placeholder = (tg_alerts_chat == "YOUR_CHAT_ID_HERE"),
+            "Telegram alerts DISABLED — trade notifications will NOT be sent. Check: telegram.enabled=true in config, TELEGRAM_BOT_TOKEN env var, TELEGRAM_ALERTS_CHAT_ID env var"
+        );
         drop(alert_rx);
     }
 

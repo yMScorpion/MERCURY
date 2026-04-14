@@ -1,6 +1,6 @@
 trading:
   kelly_fraction_multiplier: 0.50
-  min_net_spread_threshold: "0.10"
+  min_net_spread_threshold: "0.05"
   max_single_trade_pct: "0.10"
   max_daily_loss_pct: "0.03"
   max_drawdown_pct: "0.10"
