@@ -1,16 +1,16 @@
 trading:
   kelly_fraction_multiplier: 0.50
-  min_net_spread_threshold: "0.10"
+  min_net_spread_threshold: "0.05"
   max_single_trade_pct: "0.10"
   max_daily_loss_pct: "0.03"
   max_drawdown_pct: "0.10"
   max_platform_exposure_pct: "0.40"
   stale_data_timeout_ms: 10000
   max_concurrent_arbs: 3
-  gas_price_max_gwei: 200
+  gas_price_max_gwei: 500
   rebalance_threshold_pct: "0.15"
-  max_open_positions: 20
-  initial_bankroll: "1000.00"
+  max_open_positions: 500
+  initial_bankroll: "118.68"
 
 platforms:
   polymarket:
@@ -20,8 +20,8 @@ platforms:
     sports_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/sports"
   kalshi:
     enabled: true
-    rest_url: "https://trading-api.kalshi.com/trade-api/v2"
-    ws_url: "wss://trading-api.kalshi.com/trade-api/ws/v2"
+    rest_url: "https://api.elections.kalshi.com/trade-api/v2"
+    ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
   cdna:
     enabled: false
     rest_url: ""

@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 pub struct MarketActor {
     market_id: Uuid,
-    uob_shard: UnifiedOrderBook,
+    uob_shard: Arc<RwLock<UnifiedOrderBook>>,
     rx: mpsc::Receiver<NormalizedTick>,
     execution_tx: mpsc::Sender<ValidatedOpportunity>,
     detector: Arc<std::sync::RwLock<ArbitrageDetector>>,
@@ -48,7 +48,7 @@ impl MarketActor {
     ) {
         let mut actor = Self {
             market_id,
-            uob_shard: UnifiedOrderBook::new(),
+            uob_shard: Arc::new(RwLock::new(UnifiedOrderBook::new())),
             rx,
             execution_tx,
             alert_tx,
@@ -79,22 +79,17 @@ impl MarketActor {
         let detector = self.detector.clone();
         let market_id = self.market_id;
         let cached_open_positions = self.cached_open_positions.clone();
-        // Snapshot of the local UOB shard for per-position stop-loss checks inside spawned tasks.
-        // We pass a clone of the Arc so the spawned task can read current book state without
-        // holding a reference to &self across an await point.
-        let uob_for_stoploss = Arc::new(std::sync::RwLock::new(UnifiedOrderBook::new()));
+        let uob_shard = self.uob_shard.clone();
 
         while let Some(tick) = self.rx.recv().await {
-            self.uob_shard.update(&tick);
-            // Keep the stop-loss snapshot in sync so spawned tasks see current prices.
-            uob_for_stoploss.write().unwrap().update(&tick);
+            uob_shard.write().unwrap().update(&tick);
             self.metrics.inc_ticks_for_platform(tick.platform);
 
             let opps = {
                 detector.read().unwrap().detect_for_market(
                     &market_id,
                     &self.registry.read().unwrap(),
-                    &self.uob_shard,
+                    &uob_shard.read().unwrap(),
                     &self.spread_engine.read().unwrap(),
                     rust_decimal_macros::dec!(500)
                 )
@@ -109,11 +104,14 @@ impl MarketActor {
                 let metrics = metrics.clone();
                 let _alert_tx_inner = _alert_tx.clone();
                 let cached_open_pos = cached_open_positions.clone();
-                let uob_for_stoploss = uob_for_stoploss.clone();
+                let uob_shard = uob_shard.clone();
                 
                 tokio::spawn(async move {
                     let expiration_ns = opp.detected_at + (opp.ttl_ms as u64 * 1_000_000);
-                    if crate::types::now_ns() > expiration_ns { return; }
+                    if crate::types::now_ns() > expiration_ns {
+                        tracing::warn!(opp_id = %opp.opp_id, "Opportunity TTL expired in market actor — dropping");
+                        return;
+                    }
 
                     let state = bankroll.get_risk_state(opp.leg_a.platform, opp.leg_b.platform, opp.market_id).await;
                     
@@ -145,20 +143,26 @@ impl MarketActor {
                     // waiting for the unwind watchdog to fire 5 minutes later.
                     {
                         let current_spread = {
-                            let uob = uob_for_stoploss.read().unwrap();
+                            let uob = uob_shard.read().unwrap();
                             uob.get_book(&opp.market_id, &opp.leg_a.platform)
                                 .and_then(|ba| uob.get_book(&opp.market_id, &opp.leg_b.platform)
                                     .map(|bb| {
-                                        let ask_a = ba.best_ask().map(|(p,_)| p).unwrap_or(rust_decimal::Decimal::ONE);
-                                        let bid_b = bb.best_bid().map(|(p,_)| p).unwrap_or(rust_decimal::Decimal::ZERO);
-                                        rust_decimal::Decimal::ONE - ask_a - (rust_decimal::Decimal::ONE - bid_b)
+                                        let live_price_a = match opp.leg_a.side {
+                                            Side::Yes => ba.best_ask().map(|(p,_)| p).unwrap_or(rust_decimal::Decimal::ONE),
+                                            Side::No => ba.best_bid().map(|(p,_)| rust_decimal::Decimal::ONE - p).unwrap_or(rust_decimal::Decimal::ONE),
+                                        };
+                                        let live_price_b = match opp.leg_b.side {
+                                            Side::Yes => bb.best_ask().map(|(p,_)| p).unwrap_or(rust_decimal::Decimal::ONE),
+                                            Side::No => bb.best_bid().map(|(p,_)| rust_decimal::Decimal::ONE - p).unwrap_or(rust_decimal::Decimal::ONE),
+                                        };
+                                        rust_decimal::Decimal::ONE - live_price_a - live_price_b
                                     }))
                         };
                         if let Some(live_spread) = current_spread {
                             let spread_decay = opp.raw_spread - live_spread;
                             let decay_threshold = rust_decimal_macros::dec!(0.03);
                             if spread_decay > decay_threshold {
-                                tracing::debug!(
+                                tracing::warn!(
                                     opp_id = %opp.opp_id,
                                     detected_spread = %opp.raw_spread,
                                     live_spread = %live_spread,
@@ -172,7 +176,15 @@ impl MarketActor {
 
                     let too_small = false;
                     let scaled_size = approved_size;
-                    if too_small || scaled_size <= rust_decimal::Decimal::ZERO { return; }
+                    if too_small || scaled_size <= rust_decimal::Decimal::ZERO {
+                        tracing::warn!(
+                            opp_id = %opp.opp_id,
+                            recommended_size = %opp.recommended_size,
+                            approved_size = %approved_size,
+                            "Opportunity dropped: Kelly sizing produced zero size"
+                        );
+                        return;
+                    }
                     let approved_size = scaled_size;
 
                     let combined_price = opp.leg_a.price + opp.leg_b.price;
@@ -194,7 +206,11 @@ impl MarketActor {
                         (v.is_empty(), v)
                     };
 
-                    if !passed_cbs { return; }
+                    if !passed_cbs {
+                        let breaker_types: Vec<&str> = _violations.iter().map(|t| t.breaker_type.as_str()).collect();
+                        tracing::warn!(opp_id = %opp.opp_id, breakers = ?breaker_types, "Opportunity dropped: circuit breaker check failed");
+                        return;
+                    }
 
                     let leg_a_exposure = approved_size * opp.leg_a.price;
                     let leg_b_exposure = approved_size * opp.leg_b.price;
@@ -221,11 +237,12 @@ impl MarketActor {
                     }
                     let reserved = matches!(res_rx.await, Ok(true));
                     if !reserved {
-                        tracing::debug!(opp_id = %opp.opp_id, "Insufficient capital for reservation — dropping opportunity");
+                        tracing::warn!(opp_id = %opp.opp_id, leg_a_exposure = %leg_a_exposure, leg_b_exposure = %leg_b_exposure, "Capital reservation failed — dropping opportunity");
                         return;
                     }
                     // Capital reserved — forward to executor. On send failure, release
                     // immediately so the capital is not stranded.
+                    tracing::info!(opp_id = %opp.opp_id, approved_size = %approved_size, "Capital reserved — forwarding to executor");
                     let validated = ValidatedOpportunity { opportunity: opp.clone(), approved_size, risk_score };
                     if exec_tx.send(validated).await.is_err() {
                         tracing::warn!(opp_id = %opp.opp_id, "Executor channel closed — releasing reserved capital");

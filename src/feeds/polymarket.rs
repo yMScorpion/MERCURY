@@ -516,7 +516,7 @@ impl PolymarketFeed {
                         if !self.subscriptions.contains_key(&pair) {
                             let placeholder_id = uuid::Uuid::new_v4();
                             self.subscriptions.insert(pair, placeholder_id);
-                            self.fee_rates.insert(yes_token.clone(), 200);
+                            self.fee_rates.insert(yes_token.clone(), 1000);
                             self.yes_token_to_market.insert(yes_token.clone(), placeholder_id);
                             self.books.entry(yes_token.clone()).or_insert_with(LocalOrderBook::new);
                             self.pending_new_tokens.push(yes_token);

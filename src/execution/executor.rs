@@ -502,34 +502,47 @@ impl ExecutionEngine {
 
 
     /// Executes a synthetic automated unwind.
-    /// By natively SELLING the stranded contracts back to the resting bids, 
+    /// By natively SELLING the stranded contracts back to the resting bids,
     /// we cap our risk instantly and free up capital without locking collateral.
     async fn attempt_unwind(
         &mut self,
         stranded_leg: &LegDetail,
         original_fill: &OrderResult,
     ) -> Result<OrderResult> {
-        // Sell at 0.01 to aggressively cross the spread and ensure the FOK SELL order
-        // executes against whatever bids are resting on the book.
-        let aggressive_sell_price = rust_decimal_macros::dec!(0.01);
-
         warn!(
             platform = %stranded_leg.platform,
             market_id = %stranded_leg.platform_market_id,
             stranded_side = %stranded_leg.side,
             size = %original_fill.fill_size,
-            "Hedge failed. Executing aggressive FOK SELL unwind to dump inventory."
+            "Hedge failed. Executing aggressive unwind to dump inventory."
         );
 
-        let unwind_result = self.execute_leg(
-            &stranded_leg.platform,
-            &stranded_leg.platform_market_id,
-            OrderAction::Sell,
-            stranded_leg.side, // Same side! We sell the exact inventory we hold.
-            Usd(aggressive_sell_price),
-            original_fill.fill_size,
-            BasisPoints(stranded_leg.fee_rate_bps),
-        ).await;
+        // Kalshi: use IOC (immediate_or_cancel) which accepts partial fills.
+        // FOK fails entirely when resting bid volume < position size — common on thin 15-min books.
+        // With IOC, whatever bids exist at ≥ 1¢ are consumed immediately; remainder is cancelled.
+        let unwind_result = if stranded_leg.platform == Platform::Kalshi {
+            if let Some(client) = &self.kalshi_client {
+                client.submit_ioc_sell(
+                    &stranded_leg.platform_market_id,
+                    stranded_leg.side,
+                    original_fill.fill_size,
+                ).await
+            } else {
+                anyhow::bail!("Kalshi client not configured for unwind")
+            }
+        } else {
+            // Other platforms: FOK sell at 1 cent
+            let aggressive_sell_price = rust_decimal_macros::dec!(0.01);
+            self.execute_leg(
+                &stranded_leg.platform,
+                &stranded_leg.platform_market_id,
+                OrderAction::Sell,
+                stranded_leg.side,
+                Usd(aggressive_sell_price),
+                original_fill.fill_size,
+                BasisPoints(stranded_leg.fee_rate_bps),
+            ).await
+        };
 
         match unwind_result {
             Ok(fill) if fill.filled => {

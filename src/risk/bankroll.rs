@@ -189,6 +189,16 @@ impl BankrollManager {
         }
     }
 
+    pub fn sync_total_bankroll(&mut self, actual_total: Decimal) {
+        if actual_total > Decimal::ZERO && (self.total_bankroll - actual_total).abs() > dec!(0.1) {
+            tracing::info!(old_bankroll = %self.total_bankroll, new_bankroll = %actual_total, "Syncing total bankroll with API balances");
+            self.total_bankroll = actual_total;
+            if self.total_bankroll > self.peak_bankroll {
+                self.peak_bankroll = self.total_bankroll;
+            }
+        }
+    }
+
     pub fn reset_daily(&mut self) {
         self.daily_pnl = Decimal::ZERO;
         self.daily_fees = Decimal::ZERO;
@@ -379,6 +389,7 @@ pub enum BankrollMsg {
         market_id: Uuid,
         reply: oneshot::Sender<RiskState>,
     },
+    SyncTotalBankroll(Decimal),
     ResetDaily,
 }
 
@@ -395,15 +406,23 @@ impl BankrollHandle {
             while let Some(msg) = rx.recv().await {
                 match msg {
                     BankrollMsg::ReserveCapital { leg_a_exposure, leg_b_exposure, platform_a, platform_b, market_id, reply } => {
-                        let total_amount = leg_a_exposure + leg_b_exposure;
-                        let available = (manager.total_bankroll() - manager.total_exposure()).max(Decimal::ZERO);
-                        if available >= total_amount {
-                            manager.add_exposure(platform_a, leg_a_exposure);
-                            manager.add_exposure(platform_b, leg_b_exposure);
-                            manager.add_market_exposure(market_id, total_amount);
-                            let _ = reply.send(true);
-                        } else {
+                        // Deduplicate: only one active trade per market at a time.
+                        // Multiple concurrent tasks for the same market all pass the capacity
+                        // check independently (bankroll >> trade size), so we must explicitly
+                        // gate on existing market exposure to prevent duplicate order submission.
+                        if manager.market_exposure(&market_id) > rust_decimal::Decimal::ZERO {
                             let _ = reply.send(false);
+                        } else {
+                            let total_amount = leg_a_exposure + leg_b_exposure;
+                            let available = (manager.total_bankroll() - manager.total_exposure()).max(Decimal::ZERO);
+                            if available >= total_amount {
+                                manager.add_exposure(platform_a, leg_a_exposure);
+                                manager.add_exposure(platform_b, leg_b_exposure);
+                                manager.add_market_exposure(market_id, total_amount);
+                                let _ = reply.send(true);
+                            } else {
+                                let _ = reply.send(false);
+                            }
                         }
                     }
                     BankrollMsg::ProcessTrade(mut trade, reply) => {
@@ -461,6 +480,9 @@ impl BankrollHandle {
                         };
                         let _ = reply.send(state);
                     }
+                    BankrollMsg::SyncTotalBankroll(amount) => {
+                        manager.sync_total_bankroll(amount);
+                    }
                     BankrollMsg::ResetDaily => {
                         manager.reset_daily();
                     }
@@ -490,6 +512,10 @@ impl BankrollHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.tx.send(BankrollMsg::GetRiskState { platform_a, platform_b, market_id, reply: reply_tx }).await;
         reply_rx.await.expect("Bankroll actor died")
+    }
+
+    pub async fn sync_total_bankroll(&self, amount: Decimal) {
+        let _ = self.tx.send(BankrollMsg::SyncTotalBankroll(amount)).await;
     }
 
     pub async fn reset_daily(&self) {

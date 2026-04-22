@@ -293,7 +293,8 @@ impl CircuitBreakers {
         }
 
         if !trips.is_empty() {
-            warn!(count = trips.len(), "Circuit breakers tripped");
+            let types: Vec<&str> = trips.iter().map(|t| t.breaker_type.as_str()).collect();
+            warn!(count = trips.len(), breakers = ?types, "Circuit breakers tripped");
         }
         trips
     }
@@ -303,6 +304,13 @@ impl CircuitBreakers {
         self.halt_resume_at = None;
         self.consecutive_failures = 0;
         info!("Trading halt reset");
+    }
+
+    /// Reset only the consecutive-failure counter without touching the halt state
+    /// or the exec_failures VecDeque. Used on startup to prevent CB7 from firing
+    /// immediately due to failures that occurred in a previous session.
+    pub fn reset_consecutive_failures(&mut self) {
+        self.consecutive_failures = 0;
     }
 
     /// Explicitly pause or resume trading via manual Telegram command

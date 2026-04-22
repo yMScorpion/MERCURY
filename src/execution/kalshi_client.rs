@@ -45,6 +45,22 @@ struct KalshiOrderResponse {
 #[derive(Deserialize)]
 struct KalshiOrder {
     order_id: String,
+    // Kalshi API v2: prices as dollar strings e.g. "0.2700"
+    #[serde(default)]
+    yes_price_dollars: String,
+    #[serde(default)]
+    no_price_dollars: String,
+    // Kalshi API v2: counts as fixed-point strings e.g. "14.00"
+    #[serde(default)]
+    fill_count_fp: String,
+    #[serde(default)]
+    remaining_count_fp: String,
+    #[serde(default)]
+    initial_count_fp: String,
+    // Kalshi API v2: fees in dollars
+    #[serde(default)]
+    taker_fees_dollars: String,
+    // Old API integer fallbacks (kept for backward compat)
     #[serde(default)]
     yes_price: i64,
     #[serde(default)]
@@ -181,15 +197,48 @@ impl PlatformOrderClient for KalshiClient {
         });
 
         if let Some(order) = body.order {
-            let filled_count = order.count - order.remaining_count;
-            let filled = filled_count > 0;
-            let fill_price = Decimal::from(order.yes_price.max(order.no_price)) / Decimal::from(100);
-            // CRIT-5 FIX: Centralize fee math to ensure consistency with spread engine
-            let total_fee = crate::feeds::normalizer::kalshi_fee(fill_price, Decimal::from(filled_count), crate::feeds::normalizer::OrderType::Taker);
+            // Prefer new API v2 fixed-point string fields; fall back to old integer fields
+            let filled_count: Decimal = if !order.fill_count_fp.is_empty() {
+                order.fill_count_fp.parse().unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::from((order.count - order.remaining_count).max(0))
+            };
+            let filled = filled_count > Decimal::ZERO;
+
+            // New API: yes_price_dollars / no_price_dollars as dollar strings e.g. "0.2700"
+            // Old API fallback: yes_price / no_price as integer cents
+            // Final fallback: use the submitted limit price (FOK fill price == limit price or better)
+            let fill_price = {
+                let yes_d: Decimal = order.yes_price_dollars.parse().unwrap_or(Decimal::ZERO);
+                let no_d: Decimal = order.no_price_dollars.parse().unwrap_or(Decimal::ZERO);
+                let from_new_api = yes_d.max(no_d);
+                if from_new_api > Decimal::ZERO {
+                    from_new_api
+                } else {
+                    let old_cents = order.yes_price.max(order.no_price);
+                    if old_cents > 0 {
+                        Decimal::from(old_cents) / Decimal::from(100)
+                    } else if filled {
+                        price  // submitted limit price — correct for FOK: fill ≤ limit price
+                    } else {
+                        Decimal::ZERO
+                    }
+                }
+            };
+
+            // Use API-reported taker fees when available; otherwise compute
+            let total_fee = {
+                let api_fee: Decimal = order.taker_fees_dollars.parse().unwrap_or(Decimal::ZERO);
+                if api_fee > Decimal::ZERO {
+                    api_fee
+                } else {
+                    crate::feeds::normalizer::kalshi_fee(fill_price, filled_count, crate::feeds::normalizer::OrderType::Taker)
+                }
+            };
             Ok(OrderResult {
                 filled,
                 fill_price: crate::types::Usd(fill_price),
-                fill_size: crate::types::Contracts(Decimal::from(filled_count)),
+                fill_size: crate::types::Contracts(filled_count),
                 fee: crate::types::Usd(total_fee),
                 order_id: order.order_id,
                 error: if !filled { Some("Order not filled".into()) } else { None },
@@ -221,6 +270,125 @@ impl PlatformOrderClient for KalshiClient {
 }
 
 impl KalshiClient {
+    /// Submit an IOC (Immediate-Or-Cancel) SELL order for unwinds.
+    /// Unlike FOK, IOC fills whatever volume is available immediately and cancels the rest.
+    /// This prevents total failure on thin books where the full position can't fill at once.
+    pub async fn submit_ioc_sell(
+        &self,
+        market_id: &str,
+        side: Side,
+        size: crate::types::Contracts,
+    ) -> Result<OrderResult> {
+        let count = size.0.floor().to_i64().unwrap_or(0);
+        if count < 1 {
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
+                order_id: String::new(),
+                error: Some(format!("IOC sell size too small: {}", size.0)),
+            });
+        }
+        let count = count.clamp(1, 10_000);
+
+        // Price floor of 1 cent: accept any resting bid ≥ $0.01
+        let (kalshi_side, yes_price, no_price) = match side {
+            Side::Yes => ("yes".to_string(), Some(1i64), None),
+            Side::No => ("no".to_string(), None, Some(1i64)),
+        };
+
+        tracing::warn!(
+            ticker = market_id,
+            side = %kalshi_side,
+            count,
+            "Submitting Kalshi IOC SELL for unwind (partial fill accepted)"
+        );
+
+        let url = format!("{}/portfolio/orders", self.rest_url);
+        let rest_headers = self.auth.generate_rest_headers("POST", "/trade-api/v2/portfolio/orders")?;
+
+        let req = KalshiOrderRequest {
+            ticker: market_id.to_string(),
+            action: "sell".to_string(),
+            side: kalshi_side,
+            order_type: "limit".to_string(),
+            count,
+            yes_price,
+            no_price,
+            expiration_ts: None,
+            client_order_id: None,
+            time_in_force: Some("immediate_or_cancel".to_string()),
+        };
+
+        let mut http_req = self.http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&req);
+        for (k, v) in rest_headers {
+            http_req = http_req.header(k, v);
+        }
+        let resp = http_req.send().await.context("Kalshi IOC sell submission failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(OrderResult {
+                filled: false,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
+                order_id: String::new(),
+                error: Some(format!("HTTP {}: {}", status, body)),
+            });
+        }
+
+        let body: KalshiOrderResponse = resp.json().await.unwrap_or(KalshiOrderResponse {
+            order: None,
+            error: Some(KalshiError { message: "Failed to decode IOC response".to_string() }),
+        });
+
+        if let Some(order) = body.order {
+            let filled_count: Decimal = if !order.fill_count_fp.is_empty() {
+                order.fill_count_fp.parse().unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::from((order.count - order.remaining_count).max(0))
+            };
+            let filled = filled_count > Decimal::ZERO;
+            let fill_price = {
+                let yes_d: Decimal = order.yes_price_dollars.parse().unwrap_or(Decimal::ZERO);
+                let no_d: Decimal = order.no_price_dollars.parse().unwrap_or(Decimal::ZERO);
+                yes_d.max(no_d)
+            };
+            let total_fee = {
+                let api_fee: Decimal = order.taker_fees_dollars.parse().unwrap_or(Decimal::ZERO);
+                if api_fee > Decimal::ZERO {
+                    api_fee
+                } else {
+                    crate::feeds::normalizer::kalshi_fee(fill_price, filled_count, crate::feeds::normalizer::OrderType::Taker)
+                }
+            };
+            Ok(OrderResult {
+                filled,
+                fill_price: crate::types::Usd(fill_price),
+                fill_size: crate::types::Contracts(filled_count),
+                fee: crate::types::Usd(total_fee),
+                order_id: order.order_id,
+                error: if !filled { Some("IOC sell: no resting bids — naked position remains".into()) } else { None },
+            })
+        } else {
+            let error_msg = body.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".into());
+            Ok(OrderResult {
+                filled: false,
+                fill_price: crate::types::Usd(Decimal::ZERO),
+                fill_size: crate::types::Contracts(Decimal::ZERO),
+                fee: crate::types::Usd(Decimal::ZERO),
+                order_id: String::new(),
+                error: Some(error_msg),
+            })
+        }
+    }
+
     /// Queries the Kalshi API for the actual revenue generated by a settled market position.
     pub async fn fetch_settlement_payout(&self, ticker: &str, quantity: Decimal, avg_entry: Decimal) -> Result<Decimal> {
         let url = format!("{}/portfolio/settlements?ticker={}", self.rest_url, ticker);

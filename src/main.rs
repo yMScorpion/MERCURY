@@ -338,11 +338,17 @@ async fn main() -> Result<()> {
         mercury_config.trading.max_open_positions,
     );
 
-    // M-2 FIX: Recover persistent Circuit Breaker state from recent DB trades
+    // M-2 FIX: Recover persistent Circuit Breaker state from recent DB trades.
+    // We restore the exec_failures/successes VecDeques (for CB6 failure rate calculation)
+    // but do NOT carry over consecutive_failures — that counter is session-scoped.
+    // Replaying it from DB would trip CB7 immediately if the previous session ended on failures.
     if let Ok(recent_trades) = db.get_trades_since(chrono::Utc::now() - chrono::Duration::hours(1)).await {
         for trade in &recent_trades {
             cb_initial.record_execution(trade.status == TradeStatus::Success);
         }
+        // Reset consecutive_failures so CB7 doesn't fire on the first opportunity
+        // due to failures from a previous session.
+        cb_initial.reset_consecutive_failures();
         tracing::info!("Recovered circuit breaker state from {} recent trades", recent_trades.len());
     }
     let circuit_breakers = Arc::new(std::sync::RwLock::new(cb_initial));
@@ -532,6 +538,8 @@ async fn main() -> Result<()> {
         });
     }
 
+    let bankroll_handle = risk::bankroll::BankrollHandle::new(bankroll_manager);
+
     let executor = execution::executor::ExecutionEngine::new(
         opportunity_rx,
         trade_result_tx.clone(),
@@ -552,7 +560,7 @@ async fn main() -> Result<()> {
     // ─── Reconciler ───
     // M-4 FIX: Increased reconciler threshold from $0.10 to $5.00 to prevent false positive fee alerts
     let reconciler = inventory::reconciler::Reconciler::new(
-        db.clone(), alert_tx.clone(), kalshi_for_reconciler, polymarket_for_reconciler, 60, dec!(5.00),
+        db.clone(), alert_tx.clone(), kalshi_for_reconciler, polymarket_for_reconciler, 60, dec!(5.00), bankroll_handle.clone()
     );
     join_set.spawn(reconciler.run());
 
@@ -574,8 +582,11 @@ async fn main() -> Result<()> {
     join_set.spawn(unwind_watchdog.run());
 
     // ─── Health Server ───
+    // Spawned outside join_set intentionally: a bind failure (port already in use)
+    // is non-fatal for trading. The monitoring endpoint failing should never crash
+    // the execution engine or trigger an emergency shutdown.
     let health_metrics = metrics.clone();
-    join_set.spawn(monitoring::health::run_health_server(
+    tokio::spawn(monitoring::health::run_health_server(
         mercury_config.health.port,
         health_metrics,
         mercury_config.trading.stale_data_timeout_ms,
@@ -614,7 +625,10 @@ async fn main() -> Result<()> {
     {
         let config_path = cli.config.clone();
         let cancel_reload = cancel_token.clone();
-        join_set.spawn(async move {
+        // Config watcher uses tokio::spawn (NOT join_set) so that watcher setup
+        // failures (unsupported FS, missing file) do NOT trigger the emergency
+        // shutdown path that join_set task exits normally would.
+        tokio::spawn(async move {
             use notify::{Watcher, RecursiveMode, Event, EventKind};
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
             let mut watcher = match notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
@@ -626,12 +640,12 @@ async fn main() -> Result<()> {
             }) {
                 Ok(w) => w,
                 Err(e) => {
-                    warn!(error = %e, "Failed to create config file watcher");
+                    warn!(error = %e, "Failed to create config file watcher — hot-reload disabled");
                     return;
                 }
             };
             if let Err(e) = watcher.watch(std::path::Path::new(&config_path), RecursiveMode::NonRecursive) {
-                warn!(error = %e, "Failed to watch config file");
+                warn!(error = %e, "Failed to watch config file — hot-reload disabled");
                 return;
             }
             info!("Config hot-reload watcher active on {}", config_path);
@@ -850,7 +864,6 @@ async fn main() -> Result<()> {
 
     // INITIALIZE ACTORS HERE
     let mut market_channels: std::collections::HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<NormalizedTick>> = std::collections::HashMap::new();
-    let bankroll_handle = risk::bankroll::BankrollHandle::new(bankroll_manager);
     let registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
 
     loop {

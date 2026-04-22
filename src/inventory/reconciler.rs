@@ -9,6 +9,7 @@ use crate::db::Database;
 use crate::types::*;
 use crate::execution::kalshi_client::KalshiClient;
 use crate::execution::polymarket_client::PolymarketClient;
+use crate::risk::bankroll::BankrollHandle;
 
 pub struct Reconciler {
     db: Arc<dyn Database>,
@@ -17,6 +18,7 @@ pub struct Reconciler {
     polymarket_client: Option<PolymarketClient>,
     interval: Duration,
     threshold: Decimal,
+    bankroll_handle: BankrollHandle,
 }
 
 impl Reconciler {
@@ -27,8 +29,9 @@ impl Reconciler {
         polymarket_client: Option<PolymarketClient>,
         interval_secs: u64,
         threshold: Decimal,
+        bankroll_handle: BankrollHandle,
     ) -> Self {
-        Self { db, alert_tx, kalshi_client, polymarket_client, interval: Duration::from_secs(interval_secs), threshold }
+        Self { db, alert_tx, kalshi_client, polymarket_client, interval: Duration::from_secs(interval_secs), threshold, bankroll_handle }
     }
 
     pub async fn run(self) {
@@ -74,50 +77,70 @@ impl Reconciler {
             }
         }
 
+        let mut live_balances = std::collections::HashMap::new();
+        for b in &balances {
+            live_balances.insert(b.platform, b.total);
+        }
+
         // Active API Reconciliation (CRITICAL FIX 3-C)
         if let Some(kalshi) = &self.kalshi_client {
-            if let Ok(live) = kalshi.get_balance().await {
-                let db_bal = balances.iter().find(|b| b.platform == Platform::Kalshi).map(|b| b.total).unwrap_or(Decimal::ZERO);
-                if (live - db_bal).abs() > self.threshold {
-                    warn!(live = %live, db = %db_bal, "Kalshi balance mismatch");
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                        severity: "warning".into(),
-                        message: format!("Kalshi Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    });
+            match kalshi.get_balance().await {
+                Ok(live) => {
+                    live_balances.insert(Platform::Kalshi, live);
+                    let db_bal = balances.iter().find(|b| b.platform == Platform::Kalshi).map(|b| b.total).unwrap_or(Decimal::ZERO);
+                    if (live - db_bal).abs() > self.threshold {
+                        warn!(live = %live, db = %db_bal, "Kalshi balance mismatch");
+                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                            severity: "warning".into(),
+                            message: format!("Kalshi Balance Mismatch: API=${live}, DB=${db_bal}"),
+                        });
+                    }
+                    // Always persist the live balance to DB so reports are accurate
+                    let _ = self.db.update_balance(&crate::types::PlatformBalance {
+                        platform: Platform::Kalshi,
+                        available: live,
+                        reserved: Decimal::ZERO,
+                        pending_settlement: Decimal::ZERO,
+                        total: live,
+                        updated_at: chrono::Utc::now(),
+                    }).await;
                 }
-                // Always persist the live balance to DB so reports are accurate
-                let _ = self.db.update_balance(&crate::types::PlatformBalance {
-                    platform: Platform::Kalshi,
-                    available: live,
-                    reserved: Decimal::ZERO,
-                    pending_settlement: Decimal::ZERO,
-                    total: live,
-                    updated_at: chrono::Utc::now(),
-                }).await;
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch Kalshi balance in reconciler");
+                }
             }
         }
 
         if let Some(poly) = &self.polymarket_client {
-            if let Ok(live) = poly.get_balance().await {
-                let db_bal = balances.iter().find(|b| b.platform == Platform::Polymarket).map(|b| b.total).unwrap_or(Decimal::ZERO);
-                if (live - db_bal).abs() > self.threshold {
-                    warn!(live = %live, db = %db_bal, "Polymarket balance mismatch");
-                    let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
-                        severity: "warning".into(),
-                        message: format!("Polymarket Balance Mismatch: API=${live}, DB=${db_bal}"),
-                    });
+            match poly.get_balance().await {
+                Ok(live) => {
+                    live_balances.insert(Platform::Polymarket, live);
+                    let db_bal = balances.iter().find(|b| b.platform == Platform::Polymarket).map(|b| b.total).unwrap_or(Decimal::ZERO);
+                    if (live - db_bal).abs() > self.threshold {
+                        warn!(live = %live, db = %db_bal, "Polymarket balance mismatch");
+                        let _ = self.alert_tx.try_send(AlertMessage::SystemAlert {
+                            severity: "warning".into(),
+                            message: format!("Polymarket Balance Mismatch: API=${live}, DB=${db_bal}"),
+                        });
+                    }
+                    // Always persist the live balance to DB so reports are accurate
+                    let _ = self.db.update_balance(&crate::types::PlatformBalance {
+                        platform: Platform::Polymarket,
+                        available: live,
+                        reserved: Decimal::ZERO,
+                        pending_settlement: Decimal::ZERO,
+                        total: live,
+                        updated_at: chrono::Utc::now(),
+                    }).await;
                 }
-                // Always persist the live balance to DB so reports are accurate
-                let _ = self.db.update_balance(&crate::types::PlatformBalance {
-                    platform: Platform::Polymarket,
-                    available: live,
-                    reserved: Decimal::ZERO,
-                    pending_settlement: Decimal::ZERO,
-                    total: live,
-                    updated_at: chrono::Utc::now(),
-                }).await;
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch Polymarket balance in reconciler");
+                }
             }
         }
+
+        let total_api_bankroll: Decimal = live_balances.values().sum();
+        self.bankroll_handle.sync_total_bankroll(total_api_bankroll).await;
 
         let total_position_value: Decimal = positions.iter()
             .map(|p| p.quantity * p.avg_entry_price)

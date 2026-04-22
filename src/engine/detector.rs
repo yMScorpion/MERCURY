@@ -276,10 +276,15 @@ impl ArbitrageDetector {
                             recommended_size: spread.leg_a_available.min(spread.leg_b_available), 
                             score,
                             detected_at: now_ns(),
-                            // TTL: 500ms gives enough headroom for the async processing chain
-                            // (bankroll actor, Kelly sizing, circuit-breaker lock, capital
-                            // reservation) while still rejecting truly stale prices.
-                            ttl_ms: 500,
+                            // TTL: 2000ms — 500ms was too short. When a burst of ticks arrives
+                            // (e.g. near market resolution), the tokio runtime queues thousands of
+                            // spawned tasks. With a 500ms TTL, every task expired silently before
+                            // being scheduled, resulting in zero executions despite valid spreads.
+                            // 2s gives the async chain (bankroll, Kelly, CB, capital reservation)
+                            // enough headroom on a loaded runtime while still rejecting genuinely
+                            // stale prices. Capital reservation naturally deduplicates the burst —
+                            // only the first task to reserve wins; the rest drop cleanly.
+                            ttl_ms: 2000,
                         });
                     }
                     Err(reason) => {

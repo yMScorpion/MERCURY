@@ -16,4 +16,10 @@ repomix-output.md
 .mcp.json
 kalshi_key.pem
 node_modules/
+.gemini/
+.backups/
+rs-clob-client/
+rs-clob-client.txt
+logs/
+
 

@@ -21,7 +21,7 @@ sol! {
         uint256 nonce;
         uint256 feeRateBps;
         uint8 side;
-        uint8 signingScheme;
+        uint8 signatureType;
     }
 }
 
@@ -41,16 +41,12 @@ impl PolymarketSigner {
             .context("Failed to create wallet from private key")?
             .with_chain_id(Some(chain_id));
 
-        // C-5 FIX: Polymarket CTF Exchange expects this specific salt
-        let salt_bytes = hex::decode("251543d4af9c5b206ce59ec472b535d94726cd55b6bd05eb0ebdc86dfcbac0e3").unwrap_or_default();
-        let salt = alloy::primitives::B256::from_slice(&salt_bytes);
-
         let domain = Eip712Domain::new(
             Some("Polymarket CTF Exchange".into()),
             Some("1".into()),
             Some(U256::from(chain_id)),
             Some(verifying_contract),
-            Some(salt),
+            None,
         );
 
         info!(address = %wallet.address(), chain_id, "Polymarket signer initialized");
@@ -80,8 +76,10 @@ impl PolymarketSigner {
         self.verifying_contract
     }
 
-    /// Sign a Polymarket CLOB order
-    /// Returns the signature as a hex string
+    /// Sign a Polymarket CLOB order.
+    /// Returns the signature as a 0x-prefixed hex string (matching the official SDK).
+    /// When `exchange_override` is Some, the EIP-712 domain uses that contract address
+    /// instead of the default — required for NegRisk markets.
     pub async fn sign_order(
         &self,
         salt: U256,
@@ -96,6 +94,7 @@ impl PolymarketSigner {
         fee_rate_bps: U256,
         side: u8,
         signing_scheme: u8,
+        exchange_override: Option<Address>,
     ) -> Result<String> {
         let order = Order {
             salt,
@@ -109,14 +108,22 @@ impl PolymarketSigner {
             nonce,
             feeRateBps: fee_rate_bps,
             side,
-            signingScheme: signing_scheme,
+            signatureType: signing_scheme,
         };
 
-        // CRITICAL FIX: Alloy typed data signing is CPU-intensive.
-        // Offload ECDSA math to a blocking thread to avoid starving the tokio reactor.
         let wallet = self.wallet.clone();
-        let domain = self.domain.clone();
-        
+        let domain = if let Some(contract) = exchange_override {
+            Eip712Domain::new(
+                Some("Polymarket CTF Exchange".into()),
+                Some("1".into()),
+                Some(U256::from(self.chain_id)),
+                Some(contract),
+                None,
+            )
+        } else {
+            self.domain.clone()
+        };
+
         let signature = tokio::task::spawn_blocking(move || {
             wallet.sign_typed_data_sync(&order, &domain)
         })
@@ -124,6 +131,7 @@ impl PolymarketSigner {
         .context("Spawn blocking failed for ECDSA signature")?
         .context("Failed to sign EIP-712 order")?;
 
+        // SDK uses alloy Signature::to_string() which outputs "0x" + hex
         Ok(format!("0x{}", hex::encode(signature.as_bytes())))
     }
 }

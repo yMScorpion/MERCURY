@@ -53,6 +53,7 @@ struct CryptoRound {
     poly_token_pair: Option<String>,
     poly_question: Option<String>,
     poly_expiration: Option<DateTime<Utc>>,
+    poly_fee_bps: u16,
     kalshi_ticker: Option<String>,
     kalshi_question: Option<String>,
     kalshi_expiration: Option<DateTime<Utc>>,
@@ -145,6 +146,7 @@ impl MarketDiscovery {
                     round.poly_token_pair = Some(pair.0);
                     round.poly_question = Some(pair.1);
                     round.poly_expiration = Some(pair.2);
+                    round.poly_fee_bps = pair.3;
                 }
             }
 
@@ -239,6 +241,7 @@ impl MarketDiscovery {
                     poly_token_pair: None,
                     poly_question: None,
                     poly_expiration: None,
+                    poly_fee_bps: 0,
                     kalshi_ticker: None,
                     kalshi_question: None,
                     kalshi_expiration: None,
@@ -255,7 +258,7 @@ impl MarketDiscovery {
         &self,
         asset: &str,
         round_start_ts: i64,
-    ) -> Option<(String, String, DateTime<Utc>)> {
+    ) -> Option<(String, String, DateTime<Utc>, u16)> {
         let slug = format!("{}-updown-15m-{}", asset, round_start_ts);
         let url = format!("https://gamma-api.polymarket.com/events/slug/{}", slug);
 
@@ -295,6 +298,8 @@ impl MarketDiscovery {
         let mut up_token: Option<String> = None;
         let mut down_token: Option<String> = None;
         let mut expiration: Option<DateTime<Utc>> = None;
+        // takerBaseFee is at market level; take the first non-zero value found.
+        let mut taker_fee_bps: u16 = 0;
 
         for market in markets {
             let outcome = market
@@ -317,6 +322,13 @@ impl MarketDiscovery {
 
             if expiration.is_none() {
                 expiration = parse_expiration_from_market(market);
+            }
+
+            if taker_fee_bps == 0 {
+                taker_fee_bps = market
+                    .get("takerBaseFee")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u16;
             }
         }
 
@@ -342,7 +354,7 @@ impl MarketDiscovery {
             .unwrap_or("Bitcoin Up or Down - 15 Minutes")
             .to_string();
 
-        Some((token_pair, question, exp))
+        Some((token_pair, question, exp, taker_fee_bps))
     }
 
     // ─── Kalshi: find the 15-minute market matching this round ───────────
@@ -435,7 +447,7 @@ impl MarketDiscovery {
                 PlatformMarketInfo {
                     platform: Platform::Polymarket,
                     platform_market_id: token_pair.clone(),
-                    fee_rate_bps: 200,
+                    fee_rate_bps: round.poly_fee_bps,
                     min_order_size: Decimal::ONE,
                     tick_size: Decimal::new(1, 2),
                 },
@@ -557,6 +569,12 @@ impl MarketDiscovery {
             let q_norm = Self::normalize_question(&question);
             let category = categorize_question(&q_norm);
 
+            let taker_fee_bps = item
+                .get("taker_base_fee")
+                .or_else(|| item.get("takerBaseFee"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+
             markets.push(DiscoveredMarket {
                 platform: Platform::Polymarket,
                 platform_market_id: token_pair,
@@ -564,7 +582,7 @@ impl MarketDiscovery {
                 question,
                 expiration,
                 category,
-                fee_rate_bps: 200,
+                fee_rate_bps: taker_fee_bps,
                 min_order_size: Decimal::ONE,
                 tick_size: Decimal::new(1, 2),
             });

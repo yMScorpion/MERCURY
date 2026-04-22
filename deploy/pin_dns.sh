@@ -22,10 +22,10 @@ resolve_and_pin() {
     fi
 }
 
-resolve_and_pin "trading-api.kalshi.com"
+resolve_and_pin "api.elections.kalshi.com"
 resolve_and_pin "clob.polymarket.com"
 resolve_and_pin "ws-subscriptions-clob.polymarket.com"
-# Kalshi WS uses the same host as REST (trading-api.kalshi.com) — already pinned above
+# Kalshi WS uses the same host as REST (api.elections.kalshi.com) — already pinned above
 # Additional external dependencies
 resolve_and_pin "api.coingecko.com"
 resolve_and_pin "api.binance.com"
