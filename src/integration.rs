@@ -444,6 +444,26 @@ mod pipeline_tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_backup_stays_inside_database_backup_root() {
+        let root = std::env::temp_dir().join(format!("mercury-backup-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("backups")).unwrap();
+        std::fs::create_dir_all(root.join("backups-escape")).unwrap();
+        let db = SqliteDb::new(root.join("source.db").to_str().unwrap(), 1, 5000).await.unwrap();
+        let valid = root.join("backups/verified.db");
+        db.backup_to_file(valid.to_str().unwrap()).await.unwrap();
+        assert!(valid.exists());
+        assert!(db.backup_to_file(root.join("outside.db").to_str().unwrap()).await.is_err());
+        assert!(db.backup_to_file(root.join("backups-escape/escape.db").to_str().unwrap()).await.is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("backups-escape"), root.join("backups/link")).unwrap();
+            assert!(db.backup_to_file(root.join("backups/link/escape.db").to_str().unwrap()).await.is_err());
+        }
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // ─── Test 13b: Discovery → Registry → MarketActor → Detector pipeline ───
     //
     // Verifies that a market matched by discovery is correctly registered,

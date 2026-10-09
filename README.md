@@ -14,8 +14,8 @@ MERCURY explores prediction-market integration: feed adapters produce normalized
 
 | Evidence | Result | Reproduce / inspect |
 |---|---:|---|
-| Offline library tests | **78 passed · 0 failed** | `cargo test --lib --locked`; [run record](docs/VERIFICATION.md) |
-| Integration scenarios | **19 test functions** | [integration.rs](src/integration.rs) |
+| Offline library tests | **79 passed · 0 failed** | `cargo test --lib --locked`; [run record](docs/VERIFICATION.md) |
+| Integration scenarios | **20 test functions** | [integration.rs](src/integration.rs) |
 | Platform adapter families | **4** | Polymarket / Kalshi / CDNA / ForecastEx in [feeds](src/feeds/) |
 | Persistent inventory | **SQLite + migrations** | [database layer](src/db/) |
 | Alert format | **Versioned snapshots** | [Telegram snapshots](src/telegram/snapshots/) |
@@ -71,7 +71,11 @@ cargo run --release -- --config config/dry_run.yaml --dry-run
 
 The integration module covers detection, tight-spread rejection, stale data, loss halts, sizing caps, old-sequence rejection, inventory/database round trips, near-expiry gating, path validation and chaos scenarios for concurrent reservations, sentinel ticks, out-of-order updates and settlement. Individual modules add feed parsing, risk checks, snapshots and properties.
 
-The initial local run found one stale Telegram snapshot: the formatter included an opportunity ID and the saved snapshot did not. The expectation was reviewed against the implementation and updated; **all 78 tests then passed**. This correction and the exact reproduction command are recorded in [Verification](docs/VERIFICATION.md).
+The initial local run found one stale Telegram snapshot: the formatter included an opportunity ID and the saved snapshot did not. The expectation was reviewed against the implementation and updated; **all 79 tests then passed**. This correction and the exact reproduction command are recorded in [Verification](docs/VERIFICATION.md).
+
+## Portability correction found by CI
+
+Linux CI revealed that a broad filesystem-prefix check accepted `/tmp/evil.db`, while the original test happened to reject it on macOS because `/tmp` canonicalizes differently. Backup destinations now must stay inside the database’s own `backups/` root, using path-component comparisons. A new regression scenario checks a valid backup, an outside path, a sibling prefix trap and a symlink escape. The final local library suite passes **79 tests**; the same command runs in GitHub Actions.
 
 ## Roadmap
 

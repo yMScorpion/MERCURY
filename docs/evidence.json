@@ -6,12 +6,16 @@
   "command": "cargo test --lib --locked",
   "toolchain": "rustc 1.95.0 (59807616e 2026-04-14)",
   "platform": "macOS x86_64",
-  "passed": 78,
+  "passed": 79,
   "failed": 0,
-  "scope": "Library unit/property/integration/snapshot tests; updated stale opportunity-ID snapshot",
+  "scope": "Library tests after reviewed snapshot and backup-root confinement corrections",
   "limits": [
     "No live orders",
     "No measured trading performance",
     "No published latency/throughput benchmark"
-  ]
+  ],
+  "source_files_sha256": {
+    "src/db/sqlite.rs": "78887752e1a5a267da5236ff8bd79c9051f47d63f286d1b1a01b5e1322e9198e",
+    "src/integration.rs": "4a3393da0aa468e4684657ab7c7e43fae53df6c23cabee11e82edfcd8572fbcd"
+  }
 }

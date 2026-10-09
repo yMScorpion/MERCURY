@@ -17,6 +17,7 @@ use crate::types::*;
 #[derive(Clone)]
 pub struct SqliteDb {
     pool: SqlitePool,
+    backup_root: std::path::PathBuf,
 }
 
 impl SqliteDb {
@@ -60,7 +61,11 @@ impl SqliteDb {
             .execute(&pool)
             .await?;
 
-        Ok(Self { pool })
+        let parent = Path::new(path).parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let backup_root = std::fs::canonicalize(parent)?.join("backups");
+        Ok(Self { pool, backup_root })
     }
 
     /// Perform a final WAL checkpoint. Call during graceful shutdown.
@@ -727,15 +732,13 @@ impl Database for SqliteDb {
         ).map_err(|e| anyhow::anyhow!("Cannot resolve backup directory: {}", e))?;
 
         // Reconstruct the full path using the canonical directory + original filename.
-        // Enforce that the canonical directory is under one of the known safe prefixes
-        // to prevent symlink-based traversal into arbitrary filesystem locations.
-        let allowed_prefixes = ["/opt/mercury", "/tmp", "/home"];
-        let canonical_str = canonical.to_string_lossy();
+        // Compare path components against this database's backup root, not broad
+        // OS prefixes or textual prefixes such as `backups-escape`.
         anyhow::ensure!(
-            allowed_prefixes.iter().any(|prefix| canonical_str.starts_with(prefix)),
-            "Backup directory '{}' is outside allowed paths {:?}",
-            canonical_str,
-            allowed_prefixes,
+            canonical.starts_with(&self.backup_root),
+            "Backup directory '{}' is outside database backup root '{}'",
+            canonical.display(),
+            self.backup_root.display(),
         );
         let filename = std::path::Path::new(dest_path)
             .file_name()
