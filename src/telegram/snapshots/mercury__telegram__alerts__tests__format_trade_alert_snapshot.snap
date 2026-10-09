@@ -1,5 +1,6 @@
 ---
 source: src/telegram/alerts.rs
+assertion_line: 191
 expression: alert
 ---
 ✅ <b>ARBITRAGE #123 — PROFIT</b>
@@ -14,3 +15,4 @@ Fees: $0.5 + $0.1 = $0.6
 💰 <b>Profit: +$5.0</b>
 📊 Bankroll: $1005.0 (+0.005%)
 ⏱️ Execution: 120ms
+🆔 Opp ID: <code>00000000-0000-0000-0000-000000000000</code>

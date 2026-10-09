@@ -1,0 +1,17 @@
+{
+  "project": "MERCURY",
+  "checked_at": "2026-10-09",
+  "baseline_revision": "0b297c3afd9760907e0962f209c45bcb61b71492",
+  "verification_kind": "local-offline-tests",
+  "command": "cargo test --lib --locked",
+  "toolchain": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "platform": "macOS x86_64",
+  "passed": 78,
+  "failed": 0,
+  "scope": "Library unit/property/integration/snapshot tests; updated stale opportunity-ID snapshot",
+  "limits": [
+    "No live orders",
+    "No measured trading performance",
+    "No published latency/throughput benchmark"
+  ]
+}
